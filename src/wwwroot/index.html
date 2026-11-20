@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en" class="art-mono">
+<head>
+<meta charset="utf-8">
+<title>String</title>
+<style>html, body { background: #050506; color: #e9e9ec; }</style>
+<link rel="stylesheet" href="hud.css">
+<link rel="stylesheet" href="string.css">
+<script src="host.js"></script>
+</head>
+<body>
+  <aside id="side">
+    <div class="brand"><svg class="string-logo" viewBox="0 0 34 24" aria-hidden="true"><path class="wire" d="M4 12 Q17 12 30 12"/><circle class="peg" cx="4" cy="12" r="2.4"/><circle class="peg" cx="30" cy="12" r="2.4"/></svg><b>String</b></div>
+    <nav class="nav" id="nav">
+      <button data-go="home" data-icon="home"><span>Home</span></button>
+      <button data-go="songs" data-icon="music"><span>Songs</span><em class="count" id="cSongs"></em></button>
+      <button data-go="albums" data-icon="grid"><span>Albums</span><em class="count" id="cAlbums"></em></button>
+      <button data-go="artists" data-icon="user"><span>Artists</span><em class="count" id="cArtists"></em></button>
+      <button data-go="liked" data-icon="heart"><span>Liked</span><em class="count" id="cLiked"></em></button>
+      <button data-go="stats" data-icon="chart"><span>Stats</span><em class="count" id="cToday"></em></button>
+    </nav>
+    <div class="side-h"><span class="lbl">Playlists</span><button class="icon-btn" id="newPl" title="New playlist" data-icon="plus"></button></div>
+    <div class="pl-list" id="plList"></div>
+    <div class="side-foot" id="sideFoot"></div>
+  </aside>
+
+  <main id="main">
+    <div class="top" id="top">
+      <button class="icon-btn" id="back" title="Back (Alt+Left)" data-icon="back"></button>
+      <button class="icon-btn" id="fwd" title="Forward (Alt+Right)" data-icon="fwd"></button>
+      <label class="search"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></svg><input class="field" id="q" placeholder="Search songs, albums, artists" spellcheck="false" autocomplete="off"></label>
+      <span class="top-title ellip" id="topTitle"></span>
+      <span class="grow"></span>
+      <span class="scan-note" id="scanNote"></span>
+      <button class="icon-btn" id="openSet" title="Library and settings" data-icon="gear"></button>
+      <div class="scan-line" id="scanLine"></div>
+    </div>
+    <div id="scroll"><div id="view"></div></div>
+  </main>
+
+  <footer id="bar">
+    <div class="bar-now" id="now">
+      <div class="art" id="nowArt" title="Now playing (F)"><span class="open-np" data-icon="expand"></span></div>
+      <div class="now-t" id="nowT"><div class="t-title marq" id="nowTitle"><span></span></div><div class="t-sub ellip" id="nowSub"></div></div>
+      <button class="icon-btn like" id="nowLike" title="Like (L)" data-icon="heart"></button>
+    </div>
+    <div class="ctl">
+      <div class="btns">
+        <button class="icon-btn mode" id="shuffle" title="Shuffle (S)" data-icon="shuffle"></button>
+        <button class="icon-btn skip" id="prev" title="Previous (Ctrl+Left)" data-icon="prev"></button>
+        <button class="play-big" id="pp" title="Play / pause (Space)"><svg class="pp" viewBox="0 0 24 24"><path class="a"/><path class="b"/></svg></button>
+        <button class="icon-btn skip" id="next" title="Next (Ctrl+Right)" data-icon="next"></button>
+        <button class="icon-btn mode" id="repeat" title="Repeat (R)" data-icon="repeat"></button>
+      </div>
+      <div class="seek">
+        <span class="tm" id="tCur">0:00</span>
+        <div class="slider" id="seek" title=""><div class="rail"><div class="buf" id="seekBuf"></div><div class="fill" id="seekFill"></div></div><div class="loop-band" id="loopBand" hidden></div><div class="knob" id="seekKnob"></div><div class="tip" id="seekTip"></div></div>
+        <span class="tm" id="tDur">0:00</span>
+        <button class="loop-chip" id="loopChip" hidden title="Looping: click to stop (\)"></button>
+      </div>
+    </div>
+    <div class="side-ctl">
+      <canvas id="mini" width="184" height="60"></canvas>
+      <button class="icon-btn" id="lyrBtn" title="Lyrics (Y)" data-icon="mic"></button>
+      <button class="icon-btn" id="qBtn" title="Queue (Q)" data-icon="queue"></button>
+      <button class="icon-btn" id="mute" title="Mute (M)" data-icon="vol"></button>
+      <div class="slider vol" id="vol"><div class="rail"><div class="fill" id="volFill"></div></div><div class="knob" id="volKnob"></div><div class="tip" id="volTip"></div></div>
+      <button class="icon-btn" id="npBtn" title="Now playing (F)" data-icon="expand"></button>
+    </div>
+  </footer>
+
+  <aside id="queue">
+    <div class="q-h"><h2>Queue</h2><button class="btn sm ghost" id="qClear">Clear</button><button class="icon-btn" id="qClose" data-icon="x"></button></div>
+    <div class="q-body" id="qBody"></div>
+  </aside>
+
+  <section id="np">
+    <div class="np-amb" id="npAmb"></div>
+    <div class="np-top"><div class="seg" id="npMode"><button data-k="record" class="on">Record</button><button data-k="lyrics">Lyrics</button></div><button class="icon-btn" id="npClose" title="Close (Esc)" data-icon="down"></button></div>
+    <div class="np-in">
+      <div class="np-stage" id="npStage">
+        <canvas id="bigviz"></canvas>
+        <div class="disc" id="disc"><div class="spin" id="spin"><div class="art" id="npArt"></div><div class="grooves"></div><div class="hole"></div></div></div>
+      </div>
+      <div class="np-info" id="npInfo"></div>
+      <div class="np-lyrics" id="npLyrics"></div>
+    </div>
+  </section>
+
+  <div id="dropzone">Drop folders or songs to add them</div>
+
+<script src="tags.js"></script>
+<script src="art.js"></script>
+<script src="library.js"></script>
+<script src="player.js"></script>
+<script src="viz.js"></script>
+<script src="stats.js"></script>
+<script src="lyrics.js"></script>
+<script src="translate.js"></script>
+<script src="dupes.js"></script>
+<script src="phone.js"></script>
+<script src="string.js"></script>
+<script src="selftest.js"></script>
+</body>
+</html>

@@ -1,0 +1,96 @@
+YOUR MUSIC ON YOUR PHONE
+========================
+
+String itself only runs on Windows. For your phone, three free programs do the job:
+
+  - Navidrome, on your PC: a small music server that shares your music folder.
+  - Tailscale, on your PC and phone: a private link between the two. It works anywhere
+    your phone has internet, and only your own devices are on it.
+  - A music app on the phone: Amperfy on iPhone (free). On Android, Symfonium or Ultrasonic.
+
+Your songs come across with their names and covers. String's likes and playlists don't
+(the phone app keeps its own). What you play on the phone still counts in String's Stats.
+
+It takes about 15 minutes. Do it at home, with the PC on.
+
+
+ON THE PC
+---------
+1. Install Navidrome
+   - Go to  https://github.com/navidrome/navidrome/releases/latest
+   - Under "Assets", download the file that ends in  _windows_amd64_installer.msi , then
+     open it.
+   - When it asks for the music folder, replace C:\Music with the folder your songs are in,
+     for example  C:\Users\YOURNAME\Music . Leave the port at 4533.
+   - Click Yes when Windows asks to allow changes. Navidrome then runs in the background
+     and starts with Windows.
+
+2. Make your Navidrome login
+   - On the PC, open  http://localhost:4533  in your browser.
+   - The first time, it asks you to make a username and password. Your phone will use
+     this login, so remember it.
+
+3. Install Tailscale
+   - Download it from  https://tailscale.com/download  (Windows), install it, and sign in
+     with Google, Microsoft, Apple or GitHub. It's free for personal use.
+   - Find your PC's Tailscale name: click the Tailscale icon by the clock (it may be
+     hidden under the ^ arrow), or open  https://login.tailscale.com/admin/machines .
+     It's usually your PC's name in small letters. These steps call it PCNAME.
+
+4. Let your phone in (one command)
+   - Click Start, type  PowerShell , right-click "Windows PowerShell" and choose
+     "Run as administrator".
+   - Paste this whole line and press Enter:
+
+New-NetFirewallRule -DisplayName "Navidrome (Tailscale only)" -Direction Inbound -Protocol TCP -LocalPort 4533 -RemoteAddress 100.64.0.0/10 -Action Allow
+
+   - This lets in only addresses from Tailscale's range (100.64.x.x to 100.127.x.x),
+     which is where your phone shows up while Tailscale is on. Home Wi-Fi and the
+     internet use other addresses. Don't forward any ports on your router: you don't
+     need to, and it would open Navidrome to the internet.
+
+
+ON AN IPHONE
+------------
+5. Install "Tailscale" from the App Store. Sign in with the SAME account as on the PC,
+   allow it to add a VPN configuration, and switch it on.
+   (iPhones list it as a VPN. It only carries traffic between your own devices; your
+   normal browsing and apps don't go through it.)
+
+6. Install "Amperfy Music" from the App Store (free; its description mentions Ampache
+   and Subsonic). Log in with:
+     Server:    http://PCNAME:4533      (with http:// at the start, not https)
+     Username and password: your Navidrome login from step 2
+
+   Quick check if it won't connect: in Safari, open  http://PCNAME:4533 . You should see
+   Navidrome's page. Type the http:// part, or Safari searches Google instead.
+
+7. Download songs to play without internet (Amperfy calls this "caching"):
+   - Library tab > Albums, Artists or Playlists > press and hold one > Download.
+   - Downloaded songs show "Cached". They play anywhere, even with the PC off.
+
+
+ON ANDROID
+----------
+Same idea: install Tailscale from the Play Store and sign in with the same account. Then
+get a music app that works with Navidrome (a "Subsonic" app), such as Symfonium (paid,
+very good) or Ultrasonic (free). Server  http://PCNAME:4533 , and your Navidrome login.
+
+
+GOOD TO KNOW
+------------
+- Streaming needs the PC on and awake. While the PC sleeps or is off, only downloaded
+  songs play.
+- After the PC restarts, Tailscale connects once you sign in to Windows. To have it
+  connect even before you sign in, right-click the Tailscale icon and turn on
+  "Run unattended" (under Preferences).
+- Distance doesn't matter: it works anywhere your phone has internet, on Wi-Fi or mobile
+  data. Streaming uses roughly 1 MB of data per minute.
+- With Tailscale switched off on the phone, only downloaded songs play.
+- New songs show up on the phone by themselves a few minutes after they land in your
+  music folder. In Amperfy, pull down on the library to refresh it.
+- Phone plays appear in String's Stats as "on your phone": String picks them up shortly
+  after it opens, and every few minutes while it's open. A play counts once the phone
+  app reports it to Navidrome, which apps do partway through a song or at its end, so
+  quick skips usually don't count. If you make more than one Navidrome account, pick
+  yours on String's Stats page first.

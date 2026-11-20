@@ -1,0 +1,14 @@
+String includes these components from other people. Their licences are in this folder.
+
+.NET runtime                        MIT licence, .NET Foundation and Contributors
+                                    dotnet-LICENSE.txt, dotnet-THIRD-PARTY-NOTICES.txt
+Windows Desktop runtime (WPF)       MIT licence, .NET Foundation and Contributors
+                                    WindowsDesktop-LICENSE.txt
+Microsoft Edge WebView2 SDK         Microsoft's licence: WebView2-LICENSE.txt, WebView2-NOTICE.txt
+Microsoft.Data.Sqlite               MIT licence, .NET Foundation and Contributors
+                                    (the same terms as dotnet-LICENSE.txt)
+SQLitePCLRaw                        Apache License 2.0, SourceGear (Eric Sink): Apache-2.0.txt
+                                    https://github.com/ericsink/SQLitePCL.raw
+SQLite                              public domain: https://sqlite.org/copyright.html
+Windows SDK projection for .NET     Microsoft.Windows.SDK.NET.dll: https://aka.ms/WinSDKLicenseURL
+                                    WinRT.Runtime.dll (C#/WinRT): MIT licence, Microsoft Corporation

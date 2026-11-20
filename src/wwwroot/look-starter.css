@@ -1,0 +1,60 @@
+/* ==========================================================================================
+   Your look for String
+   ------------------------------------------------------------------------------------------
+   This file loads after String's own styles, so whatever you write here wins. It lives in
+   your look folder, which String's updates never touch, and String shows every change as
+   soon as you save this file.
+
+   Pictures and fonts go in this same folder. Use them by file name, like url(logo.png).
+
+   Everything below is switched off: each example is wrapped in comment marks, a line that
+   starts with slash-star-dashes above it and a star-slash line below it. To use one, delete
+   those two lines, then save.
+
+   Broke something? Turn off "Use my look.css" (the gear at the top: Library and settings),
+   or rename this file, and String looks like itself again.
+   ========================================================================================== */
+
+
+/* --- The highlight colour: buttons, glows, the playing bar. Three numbers: red green blue ---
+:root { --hi: 212 175 55 !important; }
+*/
+
+
+/* --- The dark surfaces: the background, panels and raised parts ---
+:root {
+  --bg: #12060a !important;
+  --bg2: #16080c !important;
+  --panel: #1a0a0f !important;
+  --panel2: #200c12 !important;
+  --raised: #2a1018 !important;
+}
+*/
+
+
+/* --- The text colours ---
+:root {
+  --text: #f4ead2 !important;
+  --muted: #b8a98a !important;
+}
+*/
+
+
+/* --- Your own logo instead of String's (put logo.png in this folder) ---
+.brand > * { display: none; }
+.brand { height: 96px; background: url(logo.png) left center / contain no-repeat content-box; }
+*/
+
+
+/* --- A picture behind the pages (put background.jpg in this folder) ---
+#main { background: url(background.jpg) center / cover no-repeat; }
+*/
+
+
+/* --- Your own font (put myfont.ttf in this folder) ---
+@font-face { font-family: "My font"; src: url(myfont.ttf); }
+:root {
+  --ui: "My font", "Segoe UI", sans-serif !important;
+  --hud: "My font", "Segoe UI", sans-serif !important;
+}
+*/

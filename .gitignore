@@ -1,0 +1,11 @@
+# builds and test output
+app/
+app-new/
+bin/
+obj/
+test-runs/
+/release/
+/share/
+# a developer's own notes
+CLAUDE.md
+CLAUDE.local.md

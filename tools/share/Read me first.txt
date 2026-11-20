@@ -1,0 +1,98 @@
+STRING - your own songs, played like a streaming app
+====================================================
+
+String plays the music files on your PC (MP3, M4A, FLAC, Opus, OGG, WAV and more) with
+Home, Songs, Albums, Artists, Liked songs, playlists, a queue, lyrics and listening stats.
+No ads and no account. It plays your song files where they are and doesn't change them.
+(The one exception is your choice: Find duplicates can move copies you pick to the
+Recycle Bin, after asking you.)
+
+It needs a 64-bit Windows 10 or 11 PC (on an ARM PC: Windows 11). Usually there's nothing
+else to install. The one part it borrows from Windows, WebView2, is on almost every PC; if
+yours lacks it, the installer says so and fetches it from Microsoft.
+
+
+INSTALL (about a minute)
+------------------------
+1. Right-click String.zip, choose "Extract All...", then "Extract".
+   (Opening the zip without extracting it won't work.)
+
+2. In the folder that opens, double-click "Install String".
+
+3. Windows may warn you, because String isn't signed with a paid certificate:
+     - "Windows protected your PC": click "More info", then "Run anyway".
+     - "The publisher could not be verified": click "Run".
+
+4. String opens by itself. Click "Add a folder" and pick the folder your songs are in.
+   You can add more folders later, or drag them onto the window.
+
+String installs for your Windows account only (no admin needed), with a shortcut in the
+Start menu and on the desktop. Afterwards you can delete String.zip and the extracted folder.
+
+
+GOOD TO KNOW
+------------
+- Your likes, playlists and stats are saved in %LOCALAPPDATA%\String, with a daily copy in
+  Documents\String Backup.
+- Keys: Space play/pause, Ctrl+Left/Right previous/next, L like, Q queue, F Now Playing,
+  Y lyrics, / search.
+- Settings are behind the gear at the top (Library and settings).
+- Lyrics come from a .lrc file next to the song or from the song itself. String asks you
+  before it looks anything up online.
+- Discord "Listening to": the gear > Discord. It walks you through the one-time setup.
+- Translating lyrics (T in the lyrics view) needs Ollama (ollama.com) and a model on your
+  PC. It's optional; everything else works without it.
+- Listening on your phone: see "Phone setup.txt".
+
+
+MAKE IT YOUR OWN
+----------------
+String can wear your own look: colours, a logo, a background picture, a font.
+  1. Click the gear at the top (Library and settings). Under "Look", next to
+     "Your own look", click Open folder.
+  2. A folder opens with look.css in it, full of examples. Open it in Notepad (or any
+     editor), switch on the parts you want, change the colours, and save. String
+     changes straight away.
+  3. Pictures and fonts go in the same folder.
+That folder is yours: updates never touch it. If something ends up looking broken, turn
+off "Use my look.css" in the same place, and String looks like itself again.
+
+Already changed String's own files? Updates keep those too (see below), but moving your
+changes into look.css is the safest way: then no update can ever undo them.
+
+
+UPDATING
+--------
+String checks for a newer version once a day. When there is one, the gear > Updates
+says so: click Install. String downloads it, checks that it really is a String release,
+then closes and opens again, updated. (To stop the daily check, turn it off there.)
+You can also install a newer String.zip by hand: do the same steps as above.
+Either way, your likes, playlists and stats stay.
+
+Made String your own by changing its files (colours, pictures, the logo)? Updates keep
+those changes. Before anything is replaced, a copy of every file you changed or added goes
+to a "String edits" folder next to String's own (the installer shows exactly where).
+If the update changed the same file too:
+  - CSS, pictures and fonts: yours stays. The update's version is saved in a second folder
+    next to your copy, "(the update's versions)", in case you want to see what changed.
+  - Anything else (code): String uses the update's version, because an old one could break
+    it. Yours is in the copy, so you can redo your change.
+
+
+UNINSTALLING
+------------
+Settings > Apps > Installed apps > String > Uninstall. It asks whether to keep your likes,
+playlists and stats. Your song files are never touched, and changes you made to String's
+own files are copied to the "String edits" folder first.
+
+String's own parts come with their licences, in the "licenses" folder where it's installed.
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+- "Smart App Control blocked part of this app": some new Windows 11 PCs have Smart App
+  Control on. It blocks programs Microsoft can't vouch for, which usually includes
+  unsigned ones like String, and it has no "Run anyway". If it blocks String, String
+  can't run while it's on (it's under Windows Security > App & browser control).
+- The installer says WebView2 is missing: it downloads Microsoft's installer for it. Run
+  that, then open String from the Start menu.

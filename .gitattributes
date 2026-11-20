@@ -1,0 +1,2 @@
+# Store and restore every file byte for byte, with no line-ending changes.
+* -text
