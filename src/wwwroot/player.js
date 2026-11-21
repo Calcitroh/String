@@ -2,28 +2,37 @@
    pause and play, a Spotify-style queue (songs you queue yourself play before the rest of the album or playlist),
    shuffle, repeat, play counts, Windows media controls, and presence.json in the data folder (what's playing, for a
    Discord helper later).
-   The queue lives in N.S.queue: { items: [{ id, m }], at, pos, ctx, orig, shuffle, repeat }; m = 1 for songs queued by hand. */
+   The queue lives in N.S.queue. Items have { id, m }; m = 1 for songs queued by hand. */
 (function () {
   'use strict';
   const N = window.N;
   const L = N.lib;
-  const P = N.player = { playing: false };
+  const P = N.player = { playing: false, history: [] };
   let ctx = null, mix = null, master = null, analyser = null, routed = false;
   let A = 0;                 // the deck that's playing
   let xf = null;             // a crossfade under way: { from, timer }
-  let errors = 0, counted = false, preloadedFor = '', lastPosSave = 0, token = 0;
+  let errors = 0, counted = false, preloadedFor = '', lastPosSave = 0, token = 0, continuation = null;
   const decks = [deck(), deck()];
   const Q = () => N.S.queue;
 
   function deck() {
     const el = new Audio();
     el.preload = 'auto';
-    const d = { el, gain: null, id: '', lastT: null };   // lastT: where the last tick was, for listening time
+    const d = { el, gain: null, id: '', lastT: null, started: false };
     el.addEventListener('timeupdate', () => onTime(d));
     el.addEventListener('ended', () => onEnded(d));
     el.addEventListener('error', () => onError(d));
     // every (re)start of the sound refreshes Discord's time bar and the media controls: a repeat, a resume after a stall
-    el.addEventListener('playing', () => { if (d === decks[A]) { errors = 0; N.emit('time'); session(); presence(); } });
+    el.addEventListener('playing', () => {
+      if (d !== decks[A] || !P.playing || !d.id || d.id !== P.current()?.id) return;
+      d.started = true;
+      if (P.history[0] !== d.id) {
+        P.history.unshift(d.id);
+        if (P.history.length > 80) P.history.length = 80;
+        N.emit('history');
+      }
+      errors = 0; N.emit('time'); session(); presence();
+    });
     el.addEventListener('loadedmetadata', () => { if (d === decks[A]) N.emit('time'); });
     el.addEventListener('seeked', () => { d.lastT = el.currentTime; if (d === decks[A]) N.emit('time'); });
     return d;
@@ -83,6 +92,7 @@
   function load(d, t) {
     d.id = t.id;
     d.lastT = null;
+    d.started = false;
     d.el.src = belt.native.mediaUrl(t.path);
   }
   function silence(d) {
@@ -92,11 +102,13 @@
     d.id = '';
   }
   async function go(d) {
+    const mine = token;
     await graph();
+    if (mine !== token || d !== decks[A] || !P.playing) return false;
     if (routed && ctx.state !== 'running') ctx.resume().catch(() => { });
-    try { await d.el.play(); return true; }
+    try { await d.el.play(); return mine === token; }
     catch (e) {
-      if (e && e.name === 'AbortError') return false;
+      if (mine !== token || (e && e.name === 'AbortError')) return false;
       if (e && e.name === 'NotAllowedError') { P.playing = false; changed('state'); N.emit('blocked'); }
       return false;
     }
@@ -104,21 +116,38 @@
   const changed = (...evs) => { evs.forEach(ev => N.emit(ev)); session(); presence(); };
 
   /* ---------- the queue ---------- */
-  const playable = id => { const t = L.get(id); return t && !t.unplayable; };
+  const playable = id => { const t = L.get(id); return t && !t.unplayable && !N.S.hidden?.[id]; };
+  // A prepared autoplay list becomes editable and saved only when playback reaches it.
+  const queueEnd = () => continuation ? continuation.at : Q().items.length;
+  P.queueItems = () => continuation ? Q().items.slice(0, continuation.at) : Q().items;
+  // The latest list keeps its original order. Older lists keep their boundaries and contexts for Previous.
+  function listRange(i) {
+    const q = Q(), latest = q.listStart || 0;
+    let end = queueEnd();
+    if (i >= latest || !q.past?.length) return { start: latest, end, ctx: q.ctx };
+    end = latest;
+    for (let k = q.past.length - 1; k >= 0; k--) {
+      const list = q.past[k];
+      if (i >= list.start) return { ...list, end };
+      end = list.start;
+    }
+    return { start: 0, end, ctx: null };
+  }
+  P.context = (i = Q().at) => listRange(i).ctx;
+
   function nextIndex(from = Q().at) {
-    const q = Q(), n = q.items.length;
-    for (let k = 1; k <= n; k++) {
-      let i = from + k;
-      if (i >= n) { if (q.repeat !== 'all') return -1; i -= n; }
+    const q = Q(), wrap = q.repeat === 'all';
+    const { start, end } = wrap ? listRange(from) : { start: 0, end: queueEnd() };
+    for (let i = from + 1; i < end; i++) if (playable(q.items[i].id)) return i;
+    if (wrap) for (let i = start; i <= from && i < end; i++) {
       if (playable(q.items[i].id)) return i;
     }
     return -1;
   }
   function prevIndex() {
-    const q = Q(), n = q.items.length;
-    for (let k = 1; k <= n; k++) {
-      let i = q.at - k;
-      if (i < 0) { if (q.repeat !== 'all') return -1; i += n; }
+    const q = Q();
+    for (let i = q.at - 1; i >= 0; i--) if (playable(q.items[i].id)) return i;
+    if (q.repeat === 'all' && q.at >= 0) for (let i = listRange(q.at).end - 1; i >= q.at; i--) {
       if (playable(q.items[i].id)) return i;
     }
     return -1;
@@ -131,6 +160,7 @@
     if (!q.items[i]) return;
     const t = L.get(q.items[i].id);
     if (!t) return;
+    discardContinuation();
     endCrossfade();
     q.at = i;
     q.pos = from;
@@ -152,7 +182,7 @@
   P.duration = () => { const el = decks[A].el, t = P.current(); return isFinite(el.duration) && el.duration > 0 ? el.duration : t ? t.duration || 0 : 0; };
   P.buffered = () => { const el = decks[A].el; try { return el.buffered.length ? el.buffered.end(el.buffered.length - 1) : 0; } catch { return 0; } };
   P.analyser = () => analyser;
-  P.upcoming = () => { const q = Q(); return q.items.slice(q.at + 1).map((x, k) => ({ ...x, i: q.at + 1 + k })); };
+  P.upcoming = () => { const q = Q(); return q.items.slice(q.at + 1, queueEnd()).map((x, k) => ({ ...x, i: q.at + 1 + k })); };
 
   // play these songs (an album, a playlist, the search results…) starting at index `start`; -1 starts anywhere (shuffle)
   P.playIds = (ids, startAt = 0, from = null) => {
@@ -160,6 +190,7 @@
     ids = given.filter(playable);
     if (!ids.length) return;
     const q = Q();
+    discardContinuation();
     // the clicked row counts in the list as shown: songs that can't play are left out before it, so the same song
     // starts (or, if that one can't play, the next one that can)
     if (startAt >= 0 && startAt < given.length) startAt = Math.min(given.slice(0, startAt).filter(playable).length, ids.length - 1);
@@ -171,6 +202,8 @@
     q.items = base.slice(0, at + 1).map(id => ({ id, m: 0 })).concat(manual, base.slice(at + 1).map(id => ({ id, m: 0 })));
     q.orig = ids.slice();
     q.ctx = from;
+    q.listStart = 0;
+    q.past = [];
     if (from) {
       const S = N.S;
       S.recent = [{ ...from, at: Date.now() }, ...(S.recent || []).filter(r => !(r.kind === from.kind && r.key === from.key))].slice(0, 16);
@@ -209,13 +242,117 @@
   };
   P.toggle = () => P.playing ? P.pause() : P.play();
 
+  function pickContinuation() {
+    const q = Q(), cur = P.current(), curId = cur ? cur.id : '', c = P.context(), shuf = !!q.shuffle;
+    const recent = new Set(q.items.slice(Math.max(0, q.at - 30), q.at + 1).map(x => x.id));
+    const pickFrom = (list, curKey) => {
+      const idx = list.findIndex(x => x.key === curKey);
+      const ordered = list.slice(idx + 1).concat(list.slice(0, Math.max(0, idx)));
+      const others = ordered.map(item => ({ item, ids: item.ids.filter(playable) })).filter(x => x.ids.length);
+      if (!others.length) return null;
+      if (shuf) {
+        const fresh = others.filter(x => x.ids.some(id => !recent.has(id)));
+        const pool = fresh.length ? fresh : others;
+        return pool[Math.floor(Math.random() * pool.length)];
+      }
+      return others[0];
+    };
+    if (c && c.kind === 'album' && L.albums && L.albums.size) {
+      const albums = N.sortedAlbums ? N.sortedAlbums() : [...L.albums.values()];
+      const next = pickFrom(albums, c.key);
+      if (next) {
+        const ids = shuf ? shuffled(next.ids.slice()) : next.ids.slice();
+        return { ids, orig: next.ids.slice(), ctx: { kind: 'album', key: next.item.key, name: next.item.name } };
+      }
+    }
+    if (c && c.kind === 'artist' && L.artists && L.artists.size) {
+      const artists = N.sortedArtists ? N.sortedArtists() : [...L.artists.values()];
+      const next = pickFrom(artists, c.key);
+      if (next) {
+        const ids = shuf ? shuffled(next.ids.slice()) : next.ids.slice();
+        return { ids, orig: next.ids.slice(), ctx: { kind: 'artist', key: next.item.key, name: next.item.name } };
+      }
+    }
+    const allLib = (N.ctxIds ? N.ctxIds({ kind: 'songs', key: '' }) : (L.all || [])).filter(playable);
+    if (c && c.kind === 'songs' && allLib.some(id => id !== curId)) {
+      const ids = shuf
+        ? [...shuffled(allLib.filter(id => id !== curId)), ...allLib.filter(id => id === curId)]
+        : (allLib[0] === curId ? [...allLib.slice(1), allLib[0]] : allLib.slice());
+      return { ids, orig: allLib.slice(), ctx: { kind: 'songs', key: '', name: 'All songs' } };
+    }
+    if (allLib.some(id => id !== curId)) {
+      const inList = new Set((c && ['liked', 'pl', 'search', 'album', 'artist'].includes(c.kind) ? (q.orig || []) : []).concat(curId ? [curId] : []));
+      const outside = allLib.filter(id => !inList.has(id));
+      if (outside.length) {
+        const ak = cur && cur.artistKey;
+        const sameArtist = ak ? outside.filter(id => (L.get(id) || {}).artistKey === ak) : [];
+        const others = ak ? outside.filter(id => (L.get(id) || {}).artistKey !== ak) : outside;
+        const ordered = (shuf ? shuffled(sameArtist) : sameArtist).concat(shuf ? shuffled(others) : others);
+        return { ids: ordered, orig: ordered.slice(), ctx: { kind: 'songs', key: '', name: 'All songs' } };
+      }
+      const list = (Array.isArray(q.orig) && q.orig.length ? q.orig : allLib).filter(playable);
+      if (list.some(id => id !== curId)) {
+        const ids = shuf
+          ? [...shuffled(list.filter(id => id !== curId)), ...list.filter(id => id === curId)]
+          : (list[0] === curId ? [...list.slice(1), list[0]] : list.slice());
+        return { ids, orig: list.slice(), ctx: c || { kind: 'songs', key: '', name: 'All songs' } };
+      }
+    }
+    return null;
+  }
+  const canContinue = () => N.S.set?.autoplay !== false && (!Q().repeat || Q().repeat === 'off') && !P.loop();
+  function discardContinuation() {
+    if (!continuation) return;
+    Q().items.length = continuation.at;
+    continuation = null;
+    silence(decks[1 - A]);
+    preloadedFor = '';
+  }
+  function successor() {
+    if (continuation && !canContinue()) discardContinuation();
+    const i = nextIndex();
+    if (i >= 0 || !canContinue()) return i;
+    const q = Q();
+    if (continuation) {
+      for (let k = continuation.at; k < q.items.length; k++) if (playable(q.items[k].id)) return k;
+      discardContinuation();
+    }
+    const next = pickContinuation();
+    if (!next) return -1;
+    continuation = { ...next, at: q.items.length };
+    q.items = q.items.concat(next.ids.map(id => ({ id, m: 0 })));
+    return continuation.at;
+  }
+  // Promote a prepared list only when its first playable song takes over.
+  function advance(i, handover = start) {
+    if (!continuation || i < continuation.at) return handover(i);
+    const q = Q(), next = continuation;
+    continuation = null;
+    const keepFrom = Math.max(0, q.at - 199);
+    const listStart = q.at + 1 - keepFrom;
+    q.past = [...(q.past || []), { start: q.listStart || 0, ctx: q.ctx }]
+      .flatMap((list, k, lists) => (lists[k + 1]?.start ?? q.at + 1) > keepFrom
+        ? [{ ...list, start: Math.max(0, list.start - keepFrom) }] : []);
+    q.items = q.items.slice(keepFrom, q.at + 1).concat(q.items.slice(next.at));
+    q.at = listStart - 1;
+    q.listStart = listStart;
+    q.orig = next.orig;
+    q.ctx = next.ctx;
+    if (next.ctx && ['album', 'artist', 'pl'].includes(next.ctx.kind)) {
+      const S = N.S;
+      S.recent = [{ ...next.ctx, at: Date.now() }, ...(S.recent || []).filter(r => !(r.kind === next.ctx.kind && r.key === next.ctx.key))].slice(0, 16);
+    }
+    return handover(listStart + i - next.at);
+  }
+
   P.next = (user = true) => {
     const q = Q();
     if (!q.items.length) return;
     if (!user && q.repeat === 'one') { P.seek(0); return; }
-    const i = nextIndex();
-    if (i < 0) { stopAtEnd(); return; }
-    start(i, { play: true });
+    const i = successor();
+    if (i >= 0) { advance(i); return; }
+    if (user && canContinue() && playable(P.current()?.id)) { P.seek(0); if (!P.playing) P.play(); return; }
+    stopAtEnd();
   };
   P.prev = () => {
     if (P.time() > 3.5 || !Q().items.length) { P.seek(0); return; }
@@ -223,7 +360,7 @@
     if (i < 0) { P.seek(0); return; }
     start(i, { play: true });   // like Next (and Spotify): moving to another song plays it
   };
-  P.jump = i => { if (Q().items[i] && playable(Q().items[i].id)) start(i, { play: true }); };
+  P.jump = i => { if (i < queueEnd() && Q().items[i] && playable(Q().items[i].id)) start(i, { play: true }); };
   P.seek = sec => {
     endCrossfade();
     const d = decks[A], dur = P.duration();
@@ -250,54 +387,88 @@
 
   P.setShuffle = on => {
     const q = Q();
+    discardContinuation();
     q.shuffle = !!on;
     if (q.at >= 0 && q.items.length) {
-      const head = q.items.slice(0, q.at + 1), after = q.items.slice(q.at + 1), manual = after.filter(x => x.m);
-      let rest;
-      if (on) rest = shuffled(after.filter(x => !x.m));
-      else {
-        const cur = head[head.length - 1].id, k = q.orig.indexOf(cur);
-        rest = (k >= 0 ? q.orig.slice(k + 1) : q.orig.filter(id => id !== cur)).filter(id => L.tracks.has(id)).map(id => ({ id, m: 0 }));
+      const { start, end } = listRange(q.at), after = q.items.slice(q.at + 1, end), cur = q.items[q.at].id;
+      const orig = q.at >= (q.listStart || 0) ? (q.orig || []) : q.items.slice(start, end).filter(x => !x.m).map(x => x.id);
+      const k = orig.indexOf(cur);
+      let ids;
+      if (on) {
+        ids = orig.length ? orig.filter((id, i) => i !== k && playable(id)) : after.filter(x => !x.m).map(x => x.id);
+        shuffled(ids);
+      } else {
+        ids = orig.slice(k + 1).filter(id => L.get(id) && !N.S.hidden?.[id]);
       }
-      q.items = head.concat(manual, rest);
+      const rest = ids.map(id => ({ id, m: 0 }));
+      after.forEach((item, i) => { if (item.m) rest.splice(i, 0, item); });
+      editUpcoming(q.at + 1, after.length, rest);
       preloadedFor = '';
     }
     N.emit('queue'); N.emit('modes'); N.save();
   };
-  P.cycleRepeat = () => { const q = Q(); q.repeat = q.repeat === 'off' ? 'all' : q.repeat === 'all' ? 'one' : 'off'; preloadedFor = ''; N.emit('modes'); N.save(); };
+  P.cycleRepeat = () => { const q = Q(); discardContinuation(); q.repeat = q.repeat === 'off' ? 'all' : q.repeat === 'all' ? 'one' : 'off'; preloadedFor = ''; N.emit('modes'); N.save(); };
+  P.setAutoplay = on => { N.S.set.autoplay = on; if (!on) discardContinuation(); N.save(); };
+
+  function editUpcoming(at, count, items = []) {
+    const q = Q(), start = q.listStart || 0;
+    const shift = i => i > q.at && i >= at ? Math.max(at, i - count) + items.length : i;
+    q.listStart = q.past?.length ? shift(start) : 0;
+    q.past?.forEach(list => { list.start = shift(list.start); });
+    q.items = q.items.slice(0, at).concat(items, q.items.slice(at + count));
+  }
 
   // "Play next": right after this song. "Add to queue": after the other songs queued by hand
   P.playNext = ids => insert(ids, false);
   P.addToQueue = ids => insert(ids, true);
   function insert(ids, after) {
     ids = ids.filter(playable);
-    if (!ids.length) return;
+    if (!ids.length) return ids;
+    discardContinuation();
     const q = Q();
     const items = ids.map(id => ({ id, m: 1 }));
     let i = q.at + 1;
     if (after) while (q.items[i] && q.items[i].m) i++;
-    q.items.splice(i, 0, ...items);
+    editUpcoming(i, 0, items);
     preloadedFor = '';
     N.emit('queue'); N.save();
+    return ids;
   }
   P.removeAt = i => {
     const q = Q();
-    if (i <= q.at || !q.items[i]) return;
-    q.items.splice(i, 1);
+    if (i <= q.at || i >= queueEnd() || !q.items[i]) return;
+    discardContinuation();
+    const item = q.items[i];
+    if (!item.m && i >= (q.listStart || 0)) {
+      const k = q.orig?.indexOf(item.id) ?? -1;
+      if (k >= 0) q.orig.splice(k, 1);
+    }
+    editUpcoming(i, 1);
     preloadedFor = '';
     N.emit('queue'); N.save();
   };
   P.move = (from, to) => {
     const q = Q();
-    if (from <= q.at || to <= q.at || !q.items[from]) return;
-    const [it] = q.items.splice(from, 1);
-    q.items.splice(to > from ? to - 1 : to, 0, it);
+    if (from <= q.at || from >= queueEnd() || to <= q.at || !q.items[from]) return;
+    discardContinuation();
+    const [item] = q.items.splice(from, 1);
+    q.items.splice(to > from ? to - 1 : to, 0, item);
     preloadedFor = '';
     N.emit('queue'); N.save();
   };
   P.clearQueue = () => {
     const q = Q();
-    q.items = q.items.filter((x, k) => k <= q.at || !x.m);
+    discardContinuation();
+    const lists = [...(q.past || []), { start: q.listStart || 0 }];
+    let removed = 0, l = 0;
+    q.items = q.items.filter((x, k) => {
+      while (lists[l]?.start === k) lists[l++].start -= removed;
+      if (k <= q.at || !x.m) return true;
+      removed++;
+      return false;
+    });
+    while (l < lists.length) lists[l++].start -= removed;
+    q.listStart = lists.at(-1).start;
     preloadedFor = '';
     N.emit('queue'); N.save();
   };
@@ -308,14 +479,16 @@
     const el = d.el, dur = el.duration, t = el.currentTime, q = Q();
     q.pos = t;
     heard(d, t);
-    if (!counted && t > Math.min(30, (isFinite(dur) ? dur : 60) * .5)) { counted = true; countPlay(d.id); }
+    if (P.playing && d.started && !counted && t > Math.min(30, (isFinite(dur) ? dur : 60) * .5)) { counted = true; countPlay(d.id); }
     if (Date.now() - lastPosSave > 15000) { lastPosSave = Date.now(); N.save(); }
     if (P.loop()) { loopCheck(); return; }   // a looped song never runs out: no preload, no crossfade
     if (!isFinite(dur) || !P.playing || q.repeat === 'one' || xf) return;
-    const left = dur - t, ni = nextIndex();
+    const left = dur - t, fade = routed ? +N.S.set.fade || 0 : 0;
+    if (left >= Math.max(20, fade)) return;
+    const ni = successor();
     if (ni < 0) return;
-    const nid = q.items[ni].id, fade = routed ? +N.S.set.fade || 0 : 0;
-    if (fade > 0 && dur > fade * 2 + 4 && left <= fade && left > .4) { crossfade(ni, left); return; }
+    const nid = q.items[ni].id;
+    if (fade > 0 && dur > fade * 2 + 4 && left <= fade && left > .4) { advance(ni, i => crossfade(i, left)); return; }
     if (left < 20 && preloadedFor !== nid) {
       const o = decks[1 - A];
       if (o.id !== nid) { load(o, L.get(nid)); o.el.pause(); }
@@ -351,6 +524,7 @@
     if (a === 0) a = null;
     N.S.loops = N.S.loops || {};
     if (a == null && b == null) delete N.S.loops[t.id]; else N.S.loops[t.id] = { a, b };
+    if (P.loop()) discardContinuation();
     N.save();
     loopWatch();
     N.emit('loop');
@@ -389,7 +563,7 @@
 
   function onEnded(d) {
     if (xf && d === decks[xf.from]) { endCrossfade(); return; }
-    if (d !== decks[A]) return;
+    if (d !== decks[A] || !P.playing) return;
     if (P.loop()) { const e = loopEnds(); heard(d, d.el.duration); P.seek(e.a); go(d); return; }   // a loop to the very end
     if (Q().repeat === 'one') {
       // the same song again: Discord's time bar must start over too, or the helper sees the old one run out and clears
@@ -398,24 +572,23 @@
       changed('time');
       return;
     }
-    const ni = nextIndex();
-    if (ni < 0) { stopAtEnd(); return; }
-    start(ni, { play: true });
+    P.next(false);
   }
   function crossfade(ni, left) {
     const q = Q(), from = A, to = 1 - A, t = L.get(q.items[ni].id), o = decks[to];
     if (o.id !== t.id) load(o, t);
     else if (o.el.currentTime > .05) o.el.currentTime = 0;
     gainNow(o, 0);
-    go(o);
-    ramp(o, 1, left * .8);
-    ramp(decks[from], 0, left);
     xf = { from, timer: setTimeout(endCrossfade, (left + .8) * 1000) };
     A = to;
     q.at = ni;
     q.pos = 0;
     counted = false;
     preloadedFor = '';
+    token++;
+    go(o);
+    ramp(o, 1, left * .8);
+    ramp(decks[from], 0, left);
     changed('track', 'queue');
     N.save();
   }
@@ -435,7 +608,8 @@
     if (t) t.unplayable = true;
     N.emit('error', t);
     if (++errors > 4) { P.playing = false; changed('state'); return; }
-    setTimeout(() => P.next(false), 350);
+    const mine = token;
+    setTimeout(() => { if (mine === token && P.playing) P.next(false); }, 350);
   }
 
   function countPlay(id) {

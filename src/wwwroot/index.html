@@ -28,7 +28,7 @@
     <div class="top" id="top">
       <button class="icon-btn" id="back" title="Back (Alt+Left)" data-icon="back"></button>
       <button class="icon-btn" id="fwd" title="Forward (Alt+Right)" data-icon="fwd"></button>
-      <label class="search"><svg viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></svg><input class="field" id="q" placeholder="Search songs, albums, artists" spellcheck="false" autocomplete="off"></label>
+      <label class="search"><svg viewBox="0 0 24 24"><circle cx="10.25" cy="10.25" r="6"/><path d="M14.75 14.75l5 5"/></svg><input class="field" id="q" placeholder="Search songs, albums, artists" spellcheck="false" autocomplete="off"></label>
       <span class="top-title ellip" id="topTitle"></span>
       <span class="grow"></span>
       <span class="scan-note" id="scanNote"></span>
@@ -55,7 +55,7 @@
       <div class="seek">
         <span class="tm" id="tCur">0:00</span>
         <div class="slider" id="seek" title=""><div class="rail"><div class="buf" id="seekBuf"></div><div class="fill" id="seekFill"></div></div><div class="loop-band" id="loopBand" hidden></div><div class="knob" id="seekKnob"></div><div class="tip" id="seekTip"></div></div>
-        <span class="tm" id="tDur">0:00</span>
+        <button type="button" class="tm" id="tDur" aria-label="Show time left" aria-pressed="false" title="Show time left">0:00</button>
         <button class="loop-chip" id="loopChip" hidden title="Looping: click to stop (\)"></button>
       </div>
     </div>
@@ -70,7 +70,7 @@
   </footer>
 
   <aside id="queue">
-    <div class="q-h"><h2>Queue</h2><button class="btn sm ghost" id="qClear">Clear</button><button class="icon-btn" id="qClose" data-icon="x"></button></div>
+    <div class="q-h"><div class="seg" id="qTab"><button data-k="queue" class="on">Queue</button><button data-k="recent">Recent</button></div><span class="grow"></span><button class="btn sm ghost" id="qClear">Clear</button><button class="icon-btn" id="qClose" data-icon="x"></button></div>
     <div class="q-body" id="qBody"></div>
   </aside>
 

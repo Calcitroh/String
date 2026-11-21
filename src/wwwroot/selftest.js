@@ -52,7 +52,7 @@
       await sleep(300);
       await waitFor(() => !L.scanning && L.tracks.size >= 8, 20000);
       check('8 songs found', L.tracks.size === 8, L.tracks.size);
-      check('2 albums', L.albums.size === 2, [...L.albums.values()].map(a => `${a.name} / ${a.artist}`));
+      check('3 albums', L.albums.size === 3, [...L.albums.values()].map(a => `${a.name} / ${a.artist}`));
       const sw = [...L.albums.values()].find(a => a.name === 'Synthetic Weather');
       check('album in track order', !!sw && sw.ids.map(id => L.get(id).T).join('|') === 'Glass Orbit|Low Tide|Northern Static', sw && sw.ids.map(id => L.get(id).T));
       const notags = L.get(lower('Loose\\098. no tags at all.mp3')), loose = L.get(lower('Loose\\Downloaded Thing [Ab12Cd34Ef5].mp3'));
@@ -582,6 +582,67 @@
       const noneR = await belt.native.updateCheck();
       check('updates: nothing released yet is just nothing new', noneR.published && !noneR.newer && !noneR.latest, noneR);
       US.done = null; US.busy = false; US.msg = '';
+
+      /* icon centering, autoplay, time left, list filter and Recent */
+      const centered = id => {
+        const b = document.getElementById(id), s = b && b.querySelector('svg');
+        if (!b || !s) return false;
+        const br = b.getBoundingClientRect(), sr = s.getBoundingClientRect();
+        const ink = s.getBBox(), vb = s.viewBox.baseVal;
+        return Math.abs((sr.left + sr.width / 2) - (br.left + br.width / 2)) <= .6 && Math.abs((sr.top + sr.height / 2) - (br.top + br.height / 2)) <= .6 &&
+          ink.width > 0 && ink.height > 0 && Math.abs(ink.x + ink.width / 2 - vb.x - vb.width / 2) <= 1.8 && Math.abs(ink.y + ink.height / 2 - vb.y - vb.height / 2) <= 1.8;
+      };
+      check('icons: buttons center their icons cleanly', ['newPl', 'back', 'fwd', 'openSet', 'shuffle', 'prev', 'pp', 'next', 'repeat', 'qBtn', 'npBtn'].every(centered));
+      const singleAlbum = L.albums.get(ogg.albumKey), order = N.sortedAlbums();
+      const nextAlbum = order[(order.indexOf(singleAlbum) + 1) % order.length];
+      const albumCtx = { kind: 'album', key: singleAlbum.key, name: singleAlbum.name };
+      const playingId = id => waitFor(() => P.current()?.id === id && P.playing && P.time() > .25, 5000);
+      P.clearQueue();
+      N.S.set.autoplay = true; N.S.queue.repeat = 'off'; N.S.queue.shuffle = false;
+      P.playIds(singleAlbum.ids, 0, albumCtx);
+      const albumStarted = await playingId(ogg.id);
+      P.next(true);
+      const albumSkipped = await playingId(nextAlbum.ids[0]);
+      check('skipping a one-song album starts playback in the next album', singleAlbum.ids.length === 1 && albumStarted && albumSkipped && P.context()?.key === nextAlbum.key, { title: title(), time: P.time(), ctx: P.context() });
+      const oldFade = N.S.set.fade;
+      N.S.set.fade = 2;
+      P.playIds(singleAlbum.ids, 0, albumCtx);
+      await playingId(ogg.id);
+      P.seek(P.duration() - 1.7);
+      const faded = await waitFor(() => P.crossfading() && P.current()?.id === nextAlbum.ids[0] && P.time() > .25, 5000);
+      check('autoplay crossfades into the next album', faded, { title: title(), time: P.time() });
+      N.S.set.fade = oldFade;
+      const allSongs = N.ctxIds({ kind: 'songs', key: '' });
+      const nextLiked = allSongs.find(id => id !== ogg.id && L.get(id).artistKey === ogg.artistKey);
+      P.playIds([ogg.id], 0, { kind: 'liked', key: '', name: 'Liked songs' });
+      const likedStarted = await playingId(ogg.id);
+      P.next(true);
+      const likedSkipped = await playingId(nextLiked);
+      check('skipping a one-song Liked list starts playback of another song', likedStarted && likedSkipped, { title: title(), time: P.time() });
+      P.playIds(allSongs, allSongs.length - 1, { kind: 'songs', key: '', name: 'All songs' });
+      const lastStarted = await playingId(allSongs.at(-1));
+      P.next(true);
+      const songsSkipped = await playingId(allSongs[0]);
+      check('skipping the last song in Songs starts playback at the top', lastStarted && songsSkipped, { title: title(), time: P.time() });
+      const timeButton = document.getElementById('tDur'), seek = document.getElementById('seek'), beforeSeek = seek.getBoundingClientRect();
+      timeButton.focus();
+      timeButton.click();
+      const afterSeek = seek.getBoundingClientRect();
+      check('duration toggles remaining time without moving or resizing the seek bar', timeButton.tagName === 'BUTTON' && document.activeElement === timeButton &&
+        timeButton.getAttribute('aria-pressed') === 'true' && /^-/.test(timeButton.textContent) && beforeSeek.left === afterSeek.left && beforeSeek.width === afterSeek.width, timeButton.textContent);
+      timeButton.click();
+      U.go('songs'); await sleep(400);
+      const lf = document.querySelector('#view [data-lf]');
+      lf.value = 'low tide'; lf.dispatchEvent(new Event('input')); await sleep(200);
+      check('QOL: in-list filter narrows Songs', document.querySelectorAll('#view .tr').length === 1);
+      document.querySelector('#view [data-lf-x]').click(); await sleep(200);
+      check('QOL: clearing the filter restores all songs', document.querySelectorAll('#view .tr').length >= 8);
+      U.openQueue(); await sleep(200);
+      document.querySelector('#qTab [data-k="recent"]').click(); await sleep(200);
+      check('QOL: Queue drawer Recent tab lists played songs', document.querySelectorAll('#qBody [data-rec]').length > 0);
+      document.querySelector('#qTab [data-k="queue"]').click();
+      U.closeQueue();
+      P.pause();
 
       /* a save the disk refuses (a full or locked drive): the change is kept and tried again, and closing String waits,
          says why, and offers to stay open; once the disk works the change reaches state.json */

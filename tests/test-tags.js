@@ -33,7 +33,7 @@ function makeMedia() {
   ff([...src(24), ...pic, '-c:a', 'libmp3lame', '-b:a', '160k', '-id3v2_version', '3', ...meta({ ...sw, title: 'Glass Orbit', track: '1/3', genre: 'Electronic' }), M('glass orbit.mp3')]);
   ff([...src(18), ...pic, '-c:a', 'flac', ...meta({ ...sw, title: 'Low Tide', track: '2', LYRICS: LYRICS_SYNCED }), M('low tide.flac')]);
   ff([...src(15), ...pic, '-c:a', 'aac', '-b:a', '128k', ...meta({ ...sw, title: 'Northern Static', track: '3/3', lyrics: LYRICS_PLAIN }), M('northern static.m4a')]);
-  ff([...src(12), '-c:a', 'libvorbis', ...meta({ title: 'Ogg Song', artist: 'Vorbis Band', album: 'Album One', tracknumber: '1' }), M('Album One/01 ogg song.ogg')]);
+  ff([...src(12), '-c:a', 'libvorbis', ...meta({ title: 'Ogg Song', artist: 'Vorbis Band', album: 'Single Sessions', tracknumber: '1' }), M('Album One/01 ogg song.ogg')]);
   ff([...src(11), '-c:a', 'libopus', '-b:a', '96k', ...meta({ title: 'Opus Song', artist: 'Vorbis Band', album: 'Album One', tracknumber: '2' }), M('Album One/02 opus song.opus')]);
   ff([...src(9), '-c:a', 'pcm_s16le', M('Loose/Some Artist - Plain Wave.wav')]);
   ff([...src(10), '-c:a', 'libmp3lame', '-b:a', '128k', '-id3v2_version', '4', ...meta({ title: 'Downloaded Thing', artist: 'Uploader Name', lyrics: LYRICS_MP3 }), M('Loose/Downloaded Thing [Ab12Cd34Ef5].mp3')]);
@@ -52,7 +52,7 @@ const EXPECT = {
   'glass orbit.mp3': { title: 'Glass Orbit', artist: 'Test Signal', album: 'Synthetic Weather', albumArtist: 'Test Signal', track: 1, year: 2024, genre: 'Electronic', duration: 24, art: 'image/png' },
   'low tide.flac': { title: 'Low Tide', album: 'Synthetic Weather', track: 2, year: 2024, duration: 18, art: 'image/png' },
   'northern static.m4a': { title: 'Northern Static', artist: 'Test Signal', albumArtist: 'Test Signal', track: 3, year: 2024, duration: 15, art: 'image/png' },
-  '01 ogg song.ogg': { title: 'Ogg Song', artist: 'Vorbis Band', album: 'Album One', track: 1, duration: 12, art: null },
+  '01 ogg song.ogg': { title: 'Ogg Song', artist: 'Vorbis Band', album: 'Single Sessions', track: 1, duration: 12, art: null },
   '02 opus song.opus': { title: 'Opus Song', track: 2, duration: 11, art: null },
   'Some Artist - Plain Wave.wav': { title: '', duration: 9, art: null },
   'Downloaded Thing [Ab12Cd34Ef5].mp3': { title: 'Downloaded Thing', artist: 'Uploader Name', duration: 10, art: null },

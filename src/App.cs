@@ -1206,11 +1206,11 @@ public sealed partial class MainWindow : Window
             img.Freeze();
             return img;
         }
-        glyphPlay = Glyph("M4.5 2.5 L13.5 8 L4.5 13.5 Z");
+        glyphPlay = Glyph("M5 2.5 L13.5 8 L5 13.5 Z");
         glyphPause = Glyph("M4 2.5 H7 V13.5 H4 Z M9 2.5 H12 V13.5 H9 Z");
-        var prev = new ThumbButtonInfo { ImageSource = Glyph("M3 2.5 H5 V13.5 H3 Z M13.5 2.5 V13.5 L5.5 8 Z"), Description = "Previous" };
+        var prev = new ThumbButtonInfo { ImageSource = Glyph("M2.75 2.5 H4.75 V13.5 H2.75 Z M13.25 2.5 V13.5 L5.25 8 Z"), Description = "Previous" };
         thumbPlay = new ThumbButtonInfo { ImageSource = glyphPlay, Description = "Play" };
-        var next = new ThumbButtonInfo { ImageSource = Glyph("M11 2.5 H13 V13.5 H11 Z M2.5 2.5 V13.5 L10.5 8 Z"), Description = "Next" };
+        var next = new ThumbButtonInfo { ImageSource = Glyph("M11.25 2.5 H13.25 V13.5 H11.25 Z M2.75 2.5 V13.5 L10.75 8 Z"), Description = "Next" };
         thumbActions = new Action[]
         {
             () => Post(new { kind = "media", action = "prev" }),

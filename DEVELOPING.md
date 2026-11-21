@@ -60,7 +60,14 @@ Dark and monochrome on purpose: contrast and weight do the work colour would do.
   - `player.js`: two decks (gapless hand-over, crossfade, fades), the queue, presence.json, listening ticks, and the
     loop (`N.S.loops[track id] = { a, b }`: set by right-clicking the seek bar or `[` `]`, remembered per song,
     checked every 30 ms while playing, a 40 ms sound dip at the jump, the heard time counted up to the loop's end; at
-    least a second long, and a shorter saved one counts as none; a looped song never preloads or crossfades).
+    least a second long, and a shorter saved one counts as none; a looped song never preloads or crossfades). At the
+    end of a list play goes on (not with Repeat on, a loop, or `set.autoplay === false`): the next album or artist in
+    their page order, Songs from the top, and after Liked, a playlist or a search the library's other songs (same
+    artist first). That list is picked near the end of the last song (`continuation`, held in memory and never
+    saved) so preload, gapless and crossfade work across it, and joins the queue when it starts. `q.listStart` is where
+    the list now playing begins and `q.past` the earlier lists' starts and contexts: Repeat All repeats only the list
+    now playing, Previous can still go back. `P.context(i)` is the list a queue place belongs to. Hidden songs never
+    play. `P.history` is this run's last 80 songs that really started (the queue's Recent tab).
   - `lyrics.js`: lyrics for the song playing: a .lrc next to it, then the song's own, then LRCLIB (only after the
     person's yes, `set.lyricsOnline`), kept in `lyrics\` in the data folder for good. Be gentle with LRCLIB (it runs
     on donations): a song is asked about once (`asked` in its cache file), "nothing found" again only after 30 days,
@@ -84,7 +91,9 @@ Dark and monochrome on purpose: contrast and weight do the work colour would do.
     whole song in Stats at the time it was played, under String's names when String has the file. A moment after
     start, every 5 min, and when the window comes back; `set.phoneStats === false` stops it.
   - `viz.js` the visualizers, `art.js` covers, `string.js` the screens, `hud.css` the HUD look (tints Mono / Arc /
-    Ember), `string.css`, `selftest.js`.
+    Ember), `string.css`, `selftest.js`. The filter on Songs, Liked and playlists keeps its text while the same list
+    redraws and clears when you leave it; a filtered list keeps `positions` (each shown row's place in the whole
+    list), so Delete, menus and playing act on the rows shown, and a playlist can't be reordered while filtered.
 - `presence\`: the Discord helper `string-presence.exe` (published into `app-new\presence\`). It follows
   `presence.json` and talks to Discord's `discord-ipc-N` pipe with the person's own application ID: activity type 2,
   `status_display_type` from the setting, at most one update per 4.2 s, cleared on pause and when a stale song's time

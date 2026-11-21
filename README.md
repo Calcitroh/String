@@ -3,10 +3,12 @@
 Your own songs, played like a streaming app. No ads, no accounts, no cloud: String plays the music files in the
 folders you pick, where they are, and doesn't change them. Dark and monochrome, for Windows 10 and 11.
 
-- **Library:** Home, Songs, Albums, Artists, Liked, playlists and search. Add folders in Library (the gear at the top)
-  or drop them on the window.
-- **Playing:** a queue (songs you add play first), shuffle, repeat, gapless or crossfaded songs, media keys, taskbar
-  buttons, and Now Playing with a spinning record and a spectrum ring that moves with the music.
+- **Library:** Home, Songs, Albums, Artists, Liked, playlists and search. Songs, Liked and playlists have a filter box.
+  Add folders in Library (the gear at the top) or drop them on the window.
+- **Playing:** a queue (songs you add play first; drag songs onto the queue button) with a Recent tab, shuffle, repeat,
+  gapless or crossfaded songs, media keys, taskbar buttons, and Now Playing with a spinning record and a spectrum ring
+  that moves with the music. When a list ends, play goes on with the next album or more of your songs (Settings can
+  turn that off). Click a song's length to see the time left.
 - **Lyrics:** the lyrics button (or Y). Synced lyrics light up line by line; click a line to go there. They come from a
   .lrc file next to the song, the song's own lyrics, or LRCLIB online (only if you say yes; each song is looked up once
   and kept). **Translate** (or T) puts each line's translation under it, made on your PC by a model in
