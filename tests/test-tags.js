@@ -97,6 +97,18 @@ const EXPECT = {
       if (!art || Buffer.compare(b, Buffer.from(art.bytes)) !== 0) { fails++; console.log('   FAIL art offsets do not match readArt'); }
     }
   }
-  if (!only) console.log(`\n${checks - fails} of ${checks} checks passed`);
+  if (!only) {
+    const mp3 = fs.readFileSync(path.join(MEDIA, 'Loose', '098. no tags at all.mp3'));
+    for (const padding of [0, 12288]) {
+      const file = Buffer.concat([Buffer.alloc(padding), mp3]);
+      let fetched = 0;
+      const tags = await T.readTags((o, n) => { fetched += n; return file.subarray(o, o + n); }, file.length);
+      checks++;
+      if (Math.abs(tags.duration - 8) > .15 || (!padding && fetched > 16384)) {
+        fails++; console.log('   FAIL MPEG sync search', { padding, duration: tags.duration, fetched });
+      }
+    }
+    console.log(`\n${checks - fails} of ${checks} checks passed`);
+  }
   process.exit(fails ? 1 : 0);
 })();

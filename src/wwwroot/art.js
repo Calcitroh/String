@@ -6,7 +6,7 @@
   'use strict';
   const N = window.N = window.N || {};
   const SIZES = { sm: 176, md: 420, lg: 960 };
-  const LIMIT = { sm: 600, md: 120, lg: 24 };
+  const LIMIT = { sm: 128, md: 40, lg: 4 };
   const cache = { sm: new Map(), md: new Map(), lg: new Map() };
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -98,35 +98,71 @@
     const a = await StringTags.readArt(N.rangeReader(url), t.size);
     return a ? new Blob([a.bytes], { type: a.mime }) : null;
   }
-  // a square picture of side px, centre-cropped; jpeg blob
+  // Only two full-size bitmaps at a time, even when a grid of covers comes into view.
+  const decoders = [Promise.resolve(), Promise.resolve()];
+  let nextDecoder = 0;
+  function thumbnail(blob, px) {
+    const slot = nextDecoder;
+    nextDecoder = 1 - slot;
+    const task = decoders[slot].then(() => shrink(blob, px));
+    decoders[slot] = task.then(() => {}, () => {});
+    return task;
+  }
   async function shrink(blob, px) {
-    let bmp;
-    try { bmp = await createImageBitmap(blob); } catch { return null; }
-    const s = Math.min(bmp.width, bmp.height);
-    if (!s) { bmp.close(); return null; }
-    const out = Math.min(px, s);
-    const c = new OffscreenCanvas(out, out), g = c.getContext('2d');
-    g.imageSmoothingQuality = 'high';
-    g.drawImage(bmp, (bmp.width - s) / 2, (bmp.height - s) / 2, s, s, 0, 0, out, out);
-    bmp.close();
-    return c.convertToBlob({ type: 'image/jpeg', quality: .88 });
+    const bmp = await createImageBitmap(blob);
+    let c;
+    try {
+      const s = Math.min(bmp.width, bmp.height), out = Math.min(px, s);
+      if (!out) return null;
+      c = new OffscreenCanvas(out, out);
+      const g = c.getContext('2d');
+      g.imageSmoothingQuality = 'high';
+      g.drawImage(bmp, (bmp.width - s) / 2, (bmp.height - s) / 2, s, s, 0, 0, out, out);
+    } finally { bmp.close(); }
+    try { return await c.convertToBlob({ type: 'image/jpeg', quality: .88 }); }
+    finally { c.width = 0; }
   }
 
-  const inflight = new Map();
-  function url(t, size = 'sm') {
+  const inflight = new Map(), signatures = new Map();
+  async function readPicture(src) {
+    const blob = await rawBlob(src);
+    if (!blob) return null;
+    let key = src.key;
+    // Songs often embed identical covers. Share a thumbnail only for identical picture bytes.
+    if (src.track && globalThis.crypto?.subtle) {
+      const hash = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+      key = 'pic:' + Array.from(new Uint8Array(hash), b => b.toString(16).padStart(2, '0')).join('');
+    }
+    return { key, blob };
+  }
+  function recent(m, key) {
+    const p = m.get(key);
+    m.delete(key); m.set(key, p);
+    return p;
+  }
+  async function url(t, size = 'sm') {
     const src = source(t);
-    if (!src) return Promise.resolve(null);
-    const m = cache[size], key = src.key;
-    if (m.has(key)) { const v = m.get(key); m.delete(key); m.set(key, v); return v; }
-    const p = (async () => {
-      // one fetch of the raw picture serves every size asked for at the same time
-      let raw = inflight.get(key);
-      if (!raw) { raw = rawBlob(src).catch(() => null); inflight.set(key, raw); raw.finally(() => setTimeout(() => inflight.delete(key), 2000)); }
-      const b = await raw;
-      if (!b) return null;
-      const small = await shrink(b, SIZES[size]);
-      return small ? URL.createObjectURL(small) : null;
-    })().catch(() => null);
+    if (!src) return null;
+    const m = cache[size], known = signatures.get(src.key) || src.key;
+    if (m.has(known)) return recent(m, known);
+    let read = inflight.get(src.key);
+    if (!read) {
+      read = { result: readPicture(src).catch(() => null), cancelled: false };
+      inflight.set(src.key, read);
+    }
+    const picture = await read.result;
+    if (read.cancelled) return null;
+    if (inflight.get(src.key) === read) {
+      inflight.delete(src.key);
+      if (picture && src.track) {
+        signatures.set(src.key, picture.key);
+        if (signatures.size > 2048) signatures.delete(signatures.keys().next().value);
+      }
+    }
+    if (!picture) return null;
+    const key = picture.key;
+    if (m.has(key)) return recent(m, key);
+    const p = thumbnail(picture.blob, SIZES[size]).then(b => b && URL.createObjectURL(b)).catch(() => null);
     m.set(key, p);
     while (m.size > LIMIT[size]) {
       const [k, old] = m.entries().next().value;
@@ -138,6 +174,11 @@
   // forget a track's picture (after Edit info changes it)
   function forget(t) {
     const src = source(t);
+    if (src) {
+      signatures.delete(src.key);
+      const read = inflight.get(src.key);
+      if (read) { read.cancelled = true; inflight.delete(src.key); }
+    }
     for (const m of Object.values(cache)) for (const k of [...m.keys()]) {
       if (!((src && k === src.key) || k.startsWith('e:' + t.id + ':'))) continue;
       const old = m.get(k);
@@ -148,19 +189,26 @@
   }
 
   /* ---------- the DOM side: <div class="art" data-art="<track id>"> fills itself when it scrolls into view ---------- */
-  function html(t, seed, label, size = 'sm', cls = '') {
+  function html(t, seed, label, size = 'sm', cls = '', lazyPattern = false) {
     const small = size === 'sm' && !/\bbig\b/.test(cls);
-    return `<div class="art ${cls}"${t ? ` data-art="${esc(t.id)}" data-size="${size}"` : ''}>${gen(seed, label, small)}</div>`;
+    const lazy = lazyPattern && t && io;
+    const pattern = lazy ? ` data-seed="${esc(seed)}" data-label="${esc(label)}"` : '';
+    return `<div class="art ${cls}"${t ? ` data-art="${esc(t.id)}" data-size="${size}"` : ''}${pattern}>${lazy ? '' : gen(seed, label, small)}</div>`;
   }
   const io = 'IntersectionObserver' in window ? new IntersectionObserver(es => {
     for (const e of es) if (e.isIntersecting) { io.unobserve(e.target); load(e.target); }
   }, { rootMargin: '400px 0px' }) : null;
   async function load(el) {
+    if (!el.isConnected) return;
+    if (el.hasAttribute('data-seed')) {
+      el.insertAdjacentHTML('afterbegin', gen(el.dataset.seed, el.dataset.label, false));
+      delete el.dataset.seed; delete el.dataset.label;
+    }
     const id = el.dataset.art, t = N.lib && N.lib.tracks.get(id);
     if (!t || el.dataset.loaded === id) return;
     el.dataset.loaded = id;
     const u = await url(t, el.dataset.size || 'sm');
-    if (!u || el.dataset.art !== id) return;
+    if (!u || !el.isConnected || el.dataset.art !== id) return;
     let img = el.querySelector('img');
     if (!img) { img = document.createElement('img'); img.alt = ''; img.decoding = 'async'; img.draggable = false; el.appendChild(img); }
     img.onload = () => img.classList.add('in');

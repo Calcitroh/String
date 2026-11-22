@@ -165,13 +165,30 @@ public sealed partial class MainWindow : Window
         StateChanged += (_, _) =>
         {
             if (WindowState != WindowState.Minimized) lastState = WindowState;
-            bool nowHidden = WindowState == WindowState.Minimized;
-            if (nowHidden != hidden) { hidden = nowHidden; Post(new { kind = hidden ? "hide" : "show" }); }
+            UpdateVisibility();
         };
+        IsVisibleChanged += (_, _) => UpdateVisibility();
         SourceInitialized += (_, _) => StyleTitleBar();
         Loaded += async (_, _) => { if (!initStarted) { initStarted = true; await InitAsync(); } };
         Closing += OnClosing;
         Closed += (_, _) => KillAll();
+    }
+
+    void UpdateVisibility()
+    {
+        bool nowHidden = WindowState == WindowState.Minimized || !IsVisible;
+        if (hidden == nowHidden) return;
+        hidden = nowHidden;
+        // The WPF control forwards visibility changes to its WebView2 controller.
+        if (web.CoreWebView2 is { } core) SetMemoryTarget(core);
+        web.Visibility = hidden ? Visibility.Hidden : Visibility.Visible;
+        Post(new { kind = hidden ? "hide" : "show" });
+    }
+
+    void SetMemoryTarget(CoreWebView2 core)
+    {
+        try { core.MemoryUsageTargetLevel = hidden ? CoreWebView2MemoryUsageTargetLevel.Low : CoreWebView2MemoryUsageTargetLevel.Normal; }
+        catch (NotImplementedException) { }   // Older runtimes still hide the view.
     }
 
     static string? Arg(string[] args, string name)
@@ -184,7 +201,9 @@ public sealed partial class MainWindow : Window
     {
         try
         {
-            env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(dataDir, "webview"));
+            // Muted playback still needs its 30 ms loop timer when the window is hidden.
+            var options = new CoreWebView2EnvironmentOptions("--disable-background-timer-throttling --js-flags=--optimize-for-size");
+            env = await CoreWebView2Environment.CreateAsync(null, Path.Combine(dataDir, "webview"), options);
             await web.EnsureCoreWebView2Async(env);
         }
         catch (Exception ex)
@@ -193,6 +212,7 @@ public sealed partial class MainWindow : Window
             return;
         }
         var core = web.CoreWebView2;
+        if (hidden) SetMemoryTarget(core);
         var s = core.Settings;
         s.IsStatusBarEnabled = false;
         s.IsZoomControlEnabled = false;
@@ -520,6 +540,7 @@ public sealed partial class MainWindow : Window
             {
                 case "hello":
                     Post(new { kind = "hello", smoke });
+                    if (hidden) Post(new { kind = "hide" });
                     if (!loaded) { loaded = true; if (smoke) _ = RunSmokeAsync(); }
                     break;
                 case "load":
@@ -934,6 +955,10 @@ public sealed partial class MainWindow : Window
                 }
                 return true;
             }
+            case "smokeMinimise":
+                if (!smoke) throw new NotSupportedException("Only in a smoke test");
+                WindowState = Flag("on") ? WindowState.Minimized : lastState;
+                return null;
             case "smokeClick":
             {
                 // self-tests only: a real mouse click (DevTools protocol), so the page gets the activation a person's click gives

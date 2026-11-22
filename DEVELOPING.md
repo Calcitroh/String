@@ -33,6 +33,12 @@ Dark and monochrome on purpose: contrast and weight do the work colour would do.
   - The `*.old` files a developer update left (in use while it ran) are deleted at start: only those
     `install-update.ps1` listed in `app\update-old.txt`.
   - `--smoke-test` runs the page's self-test off-screen (below).
+  - **Hidden or minimised:** the host hides the WebView2 control (so Chromium stops drawing), sets its
+    `MemoryUsageTargetLevel` to Low until it's shown again, and tells the page (`hide` / `show`): the visualizers, the
+    seek bar, the lyrics and every CSS animation (`:root.string-hidden`) stop. The browser runs with
+    `--disable-background-timer-throttling` (a hidden page's timers are otherwise slowed to once a minute after five
+    minutes unless it's audibly playing, and muted playback still needs the 30 ms loop check and its hand-overs) and
+    `--js-flags=--optimize-for-size` (the page's JavaScript takes about a third of the memory).
 - **Your own look:** the host serves `<data>\look\` at `/_look/[v<n>/]<file>` (css, pictures, fonts only; never
   outside the folder or through a link inside it; each file read whole and closed, so an editor's save never finds it
   held; a missing look.css is an empty sheet), watches it (and the data folder for the look folder itself appearing or
@@ -90,7 +96,11 @@ Dark and monochrome on purpose: contrast and weight do the work colour would do.
     `scrobbles` table is its play history; each new play (`S.phone.after` = the last play number counted) becomes the
     whole song in Stats at the time it was played, under String's names when String has the file. A moment after
     start, every 5 min, and when the window comes back; `set.phoneStats === false` stops it.
-  - `viz.js` the visualizers, `art.js` covers, `string.js` the screens, `hud.css` the HUD look (tints Mono / Arc /
+  - `viz.js` the visualizers: drawn only while String is in view and music plays, or while the bars fall and the
+    record coasts to a stop after a pause; the audio mixer (Web Audio) sleeps after a pause's fade and wakes on play.
+    `art.js` covers: thumbnails per size (176, 420, 960 px), identical embedded pictures share one (SHA-256 of the
+    bytes), at most two full-size pictures decoded at a time, album and artist cards past the first 24 draw their
+    stand-in pattern only when scrolled near. `string.js` the screens, `hud.css` the HUD look (tints Mono / Arc /
     Ember), `string.css`, `selftest.js`. The filter on Songs, Liked and playlists keeps its text while the same list
     redraws and clears when you leave it; a filtered list keeps `positions` (each shown row's place in the whole
     list), so Delete, menus and playing act on the rows shown, and a playlist can't be reordered while filtered.
@@ -159,6 +169,7 @@ node tests\test-player-regressions.js
 node tests\test-presence.js
 node tests\test-profile-recovery.js
 powershell -File tests\run-selftest.ps1
+powershell -File tests\measure.ps1 [-LongHidden]
 powershell -File install-update.ps1
 ```
 
@@ -171,6 +182,12 @@ powershell -File install-update.ps1
   never a real Discord, and fake Apple and Deezer searches), `fake-lrclib.js`, `fake-ollama.js`, `fake-navidrome.js`
   (a WAL SQLite file with Navidrome's three tables, made with node:sqlite), `fake-github.js` (releases signed with a
   key of its own: a good one, a tampered one, one that lies about its version, an older one, none).
+- `measure.ps1` (needs app-new; `-Build <folder>` measures another build, e.g. a release to compare against): a
+  library of 1,200 short songs with full-size covers (`measure-library.js`, FFmpeg) and a copy of the build whose
+  self-test is `measure-page.js`, run with `--smoke-test`: visible and playing, paused, minimised and playing, then
+  after opening every album. `test-runs\measure-<time>\processes.csv` has each process's private working set (MiB,
+  median of three samples) and CPU (100% = one logical processor). `-LongHidden` adds five minutes minimised with
+  a muted loop: rerun it after changing WebView2's settings.
 - `run-selftest.ps1`: the in-window self-test against the fakes, each run in its own `test-runs\selftest-<time>\`,
   muted and off-screen, with `results.txt` and a screenshot per step; it closes itself and exits 0 only on a finished
   run ending "N passed, 0 failed". It plants a small probe add-on (and a broken one, and one naming files outside its
@@ -237,3 +254,7 @@ and `-NoStart`, and `tests\run-selftest.ps1 -Exe <installed copy>`.
   on a different time than the one under the pointer.
 - Scripts an add-on adds after the page loads run only once the page's own scripts have (String waits for
   DOMContentLoaded before adding them), so they always find `N.addons` and `N.ui`.
+- A visualizer drawn with requestAnimationFrame runs at the screen's refresh rate: on a 240 Hz screen that is 240
+  frames a second, most of String's processor use while it's visible and playing.
+- A WebView2 inside a minimised WPF window keeps drawing unless the control is hidden, and a hidden, muted page has
+  its timers throttled (see "Hidden or minimised" above).

@@ -260,6 +260,8 @@ async function run() {
     Audio: class extends FakeAudio { constructor() { super(); this.duration = 120; decks.push(this); } },
     AudioContext: class {
       state = 'running';
+      async suspend() { this.state = 'suspended'; }
+      async resume() { this.state = 'running'; }
       createGain() { return { gain: gain(), connect: () => ({ connect() {} }) }; }
       createAnalyser() { return {}; }
       createMediaElementSource() { return { connect: () => ({ connect() {} }) }; }
@@ -416,7 +418,7 @@ async function run() {
       player: { current: () => null, context: () => null, queueItems: () => ui.N.S.queue === aq ? a.queueItems() : ui.N.S.queue.items,
         playIds(ids, i) { playedFrom.push([Array.from(ids), i]); } } },
     belt: { icon: () => '<svg></svg>', load: () => new Promise(() => {}), save() {}, toast: msg => toastsShown.push(msg),
-      onLook() {}, onUpdate() {}, onShow() {}, onFlush() {}, onCloseBlocked() {}, onMedia() {} },
+      onLook() {}, onUpdate() {}, onShow() {}, onHide() {}, onFlush() {}, onCloseBlocked() {}, onMedia() {} },
     document, addEventListener: (name, fn) => { globalEvents[name] = fn; }, matchMedia: () => ({ matches: true }),
     StringStats: { calendarDay: () => 0 }, innerWidth: 800, innerHeight: 600,
   });

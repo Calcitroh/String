@@ -7,7 +7,6 @@
    Works in the page (window.StringTags) and in Node (module.exports), where tests\test-tags.js checks it. */
 (function (root) {
   'use strict';
-  const BLOCK = 65536;
   const dec = enc => { try { return new TextDecoder(enc); } catch { return new TextDecoder('utf-8'); } };
   const U8 = dec('utf-8'), L1 = dec('windows-1252'), LE16 = dec('utf-16le'), BE16 = dec('utf-16be');
   const GENRES = ('Blues|Classic Rock|Country|Dance|Disco|Funk|Grunge|Hip-Hop|Jazz|Metal|New Age|Oldies|Other|Pop|R&B|Rap|Reggae|' +
@@ -17,24 +16,18 @@
     'Southern Rock|Comedy|Cult|Gangsta|Top 40|Christian Rap|Pop/Funk|Jungle|Native American|Cabaret|New Wave|Psychedelic|Rave|' +
     'Showtunes|Trailer|Lo-Fi|Tribal|Acid Punk|Acid Jazz|Polka|Retro|Musical|Rock & Roll|Hard Rock').split('|');
 
-  /* ---------- reading: 64 KB blocks, cached, so many small reads near each other cost one request ---------- */
+  /* ---------- nearby fields share a small read; large fields are read in one request ---------- */
   function reader(read, size) {
-    const blocks = new Map();
-    const block = i => {
-      if (!blocks.has(i)) blocks.set(i, Promise.resolve(read(i * BLOCK, Math.min(BLOCK, size - i * BLOCK))).then(b => b instanceof Uint8Array ? b : new Uint8Array(b)));
-      return blocks.get(i);
-    };
+    let start = 0, data = new Uint8Array(0);
     async function bytes(o, n) {
       o = Math.max(0, Math.floor(o)); n = Math.max(0, Math.min(Math.floor(n), size - o));
-      const out = new Uint8Array(n);
-      let done = 0;
-      while (done < n) {
-        const p = o + done, i = Math.floor(p / BLOCK), b = await block(i), off = p - i * BLOCK, k = Math.min(b.length - off, n - done);
-        if (k <= 0) break;
-        out.set(b.subarray(off, off + k), done);
-        done += k;
+      if (!n) return new Uint8Array(0);
+      if (o < start || o + n > start + data.length) {
+        const b = await read(o, Math.min(size - o, Math.max(8192, n)));
+        start = o;
+        data = b instanceof Uint8Array ? b : new Uint8Array(b);
       }
-      return done === n ? out : out.subarray(0, done);
+      return data.subarray(o - start, o - start + n);
     }
     return { size, bytes };
   }
@@ -213,7 +206,11 @@
     return { v1, layer, kbps, rate, spf, mono: ch === 3, len };
   }
   async function mpeg(r, start, t) {
-    const b = await r.bytes(start, 65536);
+    // Most audio starts right after its tags. Keep the full sync search for leading junk.
+    let b = await r.bytes(start, 4096);
+    const first = frameHeader(b, 0);
+    if (!first || first.len < 24 || first.len + 4 > b.length || !frameHeader(b, first.len))
+      b = await r.bytes(start, 65536);
     for (let i = 0; i + 4 < b.length; i++) {
       const h = frameHeader(b, i);
       if (!h || h.len < 24) continue;

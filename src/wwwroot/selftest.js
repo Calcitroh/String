@@ -17,6 +17,11 @@
     const waitFor = async (fn, ms = 8000) => { const end = Date.now() + ms; while (Date.now() < end) { try { if (fn()) return true; } catch { } await sleep(100); } return false; };
     const step = async (name, ms = 700) => { st.step = name; await sleep(ms); };
     const title = () => (P.current() || {}).T;
+    const minimise = async on => {
+      await belt.native.smokeMinimise(on);
+      check(on ? 'WebView hidden on minimise' : 'WebView visible on restore',
+        await waitFor(() => belt.visible === !on && document.hidden === on));
+    };
     try {
       await N.boot;
       const paths = await belt.native.paths();
@@ -65,6 +70,8 @@
       await waitFor(() => document.querySelectorAll('#view .art img.in').length > 0, 5000);
       await step('home', 1200);
       check('covers shown', document.querySelectorAll('#view .art img.in').length > 0, document.querySelectorAll('#view .art img.in').length);
+      const pictures = await Promise.all(['glass orbit.mp3', 'low tide.flac', 'Album One\\01 ogg song.ogg'].map(p => N.art.url(L.get(lower(p)), 'sm')));
+      check('identical embedded covers share a thumbnail and a different cover keeps its own', pictures.every(Boolean) && pictures[0] === pictures[1] && pictures[1] !== pictures[2]);
       U.go('songs'); await step('songs', 1100);
       check('8 song rows', document.querySelectorAll('#view .tr').length === 8, document.querySelectorAll('#view .tr').length);
       U.go('albums'); await step('albums', 1000);
@@ -159,6 +166,27 @@
       const cv = document.getElementById('bigviz'), px = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
       let lit = 0; for (let i = 3; i < px.length; i += 16) if (px[i] > 0) lit++;
       check('ring drawn', lit > 100, lit);
+      const ambient = document.getElementById('npAmb');
+      const motion = el => getComputedStyle(el).animationPlayState;
+      P.pause();
+      const coastFrom = N.viz.frames;
+      await sleep(300);
+      check('the record coasts to a stop after pause, not dead still', N.viz.running() && N.viz.frames > coastFrom + 3);
+      await waitFor(() => !N.viz.running());
+      const still = N.viz.frames;
+      await sleep(350);
+      check('paused record and background stay still', still === N.viz.frames && motion(ambient) === 'paused');
+      check('paused mixer sleeps after the fade', await waitFor(() => P.audio().state === 'suspended', 1200));
+      await P.play();
+      check('record, mixer and background resume', await waitFor(() => N.viz.frames > still + 3 && P.audio().state === 'running' && N.viz.level() > .01) && motion(ambient) === 'running');
+      await minimise(true);
+      try {
+        const hiddenFrame = N.viz.frames;
+        const wire = document.querySelector('.string-logo .wire');
+        await sleep(300);
+        check('hidden record and wire stay still', !N.viz.running() && hiddenFrame === N.viz.frames && motion(wire) === 'paused');
+      } finally { await minimise(false); }
+      check('restoring resumes the record and wire', await waitFor(() => N.viz.running()) && motion(document.querySelector('.string-logo .wire')) === 'running');
       U.closeNP();
 
       /* lyrics: inside the file (Low Tide, synced), in a .lrc next to it (Plain Wave), and online (Glass Orbit, from the
@@ -261,6 +289,15 @@
       check('the loop holds between its ends', jumped && lo >= 2.8 && hi <= 6.4 && title() === 'Glass Orbit', { lo, hi, jumped, title: title() });
       const heardL1 = smL.range(todayL.from, todayL.to).total;
       check('looped time counts as listening time', heardL1 - heardL0 > 3.6, heardL1 - heardL0);
+      await minimise(true);
+      const originalSeek = P.seek, jumps = [];
+      try {
+        P.seek = sec => { jumps.push(P.time()); return originalSeek(sec); };
+        const heardBefore = smL.range(todayL.from, todayL.to).total;
+        await waitFor(() => jumps.length >= 2, 7500);
+        check('muted hidden loops land at their boundary', jumps.length >= 2 && jumps.every(t => Math.abs(t - P.loop().b) < .12), jumps);
+        check('listening ticks while hidden', smL.range(todayL.from, todayL.to).total - heardBefore > 2.8);
+      } finally { P.seek = originalSeek; await minimise(false); }
       const band = document.getElementById('loopBand'), chip = document.getElementById('loopChip');
       check('the bar shows the loop, and a chip its times', !band.hidden && !chip.hidden && /0:0[23]–0:0[56]/.test(chip.textContent), chip.textContent);
       const sb1 = document.getElementById('seek').getBoundingClientRect();
@@ -608,9 +645,25 @@
       N.S.set.fade = 2;
       P.playIds(singleAlbum.ids, 0, albumCtx);
       await playingId(ogg.id);
-      P.seek(P.duration() - 1.7);
-      const faded = await waitFor(() => P.crossfading() && P.current()?.id === nextAlbum.ids[0] && P.time() > .25, 5000);
-      check('autoplay crossfades into the next album', faded, { title: title(), time: P.time() });
+      await minimise(true);
+      try {
+        P.seek(P.duration() - 4);
+        const startFade = performance.now();
+        const faded = await waitFor(() => P.crossfading() && P.current()?.id === nextAlbum.ids[0], 5000);
+        const elapsed = (performance.now() - startFade) / 1000;
+        check('autoplay crossfades into the next album on time while hidden', faded && elapsed >= 1.85 && elapsed < 2.5, { title: title(), elapsed });
+        await waitFor(() => !P.crossfading());
+        const presence = JSON.parse(await belt.native.readText(pdir + '\\presence.json'));
+        check('hidden crossfade updates the presence time and title', presence.state === 'playing' && presence.title === title() && Math.abs(presence.startedAt - (Date.now() - P.time() * 1000)) < 1500);
+        N.S.set.fade = 0;
+        P.playIds(singleAlbum.ids, 0, albumCtx);
+        await playingId(ogg.id);
+        P.seek(P.duration() - 2.5);
+        const startHandover = performance.now();
+        const advanced = await waitFor(() => P.current()?.id === nextAlbum.ids[0] && P.time() > .05, 4000);
+        const delay = (performance.now() - startHandover) / 1000 - P.time() - 2.5;
+        check('hidden gapless playback hands over to the preloaded album', advanced && Math.abs(delay) < .25 && !P.crossfading(), { delay });
+      } finally { await minimise(false); }
       N.S.set.fade = oldFade;
       const allSongs = N.ctxIds({ kind: 'songs', key: '' });
       const nextLiked = allSongs.find(id => id !== ogg.id && L.get(id).artistKey === ogg.artistKey);

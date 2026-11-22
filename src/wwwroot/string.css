@@ -186,6 +186,9 @@ body.playing .disc-logo { animation: spin 3.4s linear infinite; }
 .eq i:nth-child(3) { animation-duration: 1.15s; animation-delay: -.6s; }
 .eq i:nth-child(4) { animation-duration: .9s; animation-delay: -.15s; }
 body:not(.playing) .eq i { animation-play-state: paused; }
+.scan-line:not(.on)::after, #np:not(.open) .np-amb,
+body:not(.playing) :is(.np-amb, .disc-hero, .reactor i, .dc-status .dot.on) { animation-play-state: paused; }
+:root.string-hidden *, :root.string-hidden ::before, :root.string-hidden ::after { animation-play-state: paused !important; }
 
 /* like heart */
 .like svg { transition: transform .3s var(--spring); }

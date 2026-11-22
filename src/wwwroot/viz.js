@@ -1,6 +1,6 @@
 /* String visualizer: one animation loop for the small spectrum in the player bar and the fluid ring round the record in
-   Now Playing. It runs only while something can be seen moving (the tab in front, music playing or still settling),
-   so String minimized costs nothing. Everything is drawn in the tint colour. */
+   Now Playing. It runs only while something can be seen moving (String in view, music playing or still settling after
+   a pause), so String minimized or paused costs nothing. Everything is drawn in the tint colour. */
 (function () {
   'use strict';
   const N = window.N;
@@ -54,7 +54,7 @@
     const now = performance.now();
     if (playing && bass > .28 && bass > bassAvg * 1.32 && now - lastBeat > 230) { lastBeat = now; pulse = 1; V.beats++; emit(); }
     pulse = Math.max(0, pulse - dt * 3.2);
-    // the record: turns while playing, coasts to a stop on pause
+    // the record: turns while playing, coasts to a stop on pause (the analyser isn't read then: the mixer may be asleep)
     spinV += ((playing ? 40 : 0) - spinV) * Math.min(1, dt * (playing ? 1.6 : .9));
     spin = (spin + spinV * dt) % 360;
   }
@@ -195,7 +195,7 @@
     // after a pause: the bars fall, and in Now Playing the record coasts to a stop and the last sparks fade
     const settling = energy > .002 || (want.big && (pulse > 0 || parts.length > 0 || spinV > .5));
     if ((playing || settling) && (want.mini || want.big)) raf = requestAnimationFrame(frame);
-    else if (!playing) { if (want.mini) drawMini(c); }
+    else if (!playing && want.mini) drawMini(c);
   }
   V.running = () => !!raf;
   V.level = () => energy;

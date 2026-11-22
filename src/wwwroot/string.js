@@ -293,6 +293,7 @@
   }
   function draw() {
     closeMenu();
+    if (chartWatch) { chartWatch.disconnect(); chartWatch = null; }
     lists.forEach(l => l.destroy());
     lists = [];
     renderToken++;
@@ -512,8 +513,8 @@
       `<div class="cover">${o.art}<button class="play-big fab" data-play title="Play">${PP}</button></div>` +
       `<div class="t" title="${attr(o.title)}">${esc(o.title)}</div><div class="s">${esc(o.sub || '')}</div></div>`;
   }
-  const albumCard = (a, i) => card({ i, open: 'album/' + enc(a.key), ctx: { kind: 'album', key: a.key }, art: ART.html(a.cover, a.key, a.name, 'md'), title: a.name, sub: [a.artist, a.year || ''].filter(Boolean).join(' · ') });
-  const artistCard = (r, i) => card({ i, round: true, open: 'artist/' + enc(r.key), ctx: { kind: 'artist', key: r.key }, art: ART.html(r.cover, 'artist:' + r.key, r.name, 'md'), title: r.name, sub: plural(r.ids.length, 'song') });
+  const albumCard = (a, i) => card({ i, open: 'album/' + enc(a.key), ctx: { kind: 'album', key: a.key }, art: ART.html(a.cover, a.key, a.name, 'md', '', i >= 24), title: a.name, sub: [a.artist, a.year || ''].filter(Boolean).join(' · ') });
+  const artistCard = (r, i) => card({ i, round: true, open: 'artist/' + enc(r.key), ctx: { kind: 'artist', key: r.key }, art: ART.html(r.cover, 'artist:' + r.key, r.name, 'md', '', i >= 24), title: r.name, sub: plural(r.ids.length, 'song') });
   const trackCard = (t, i, rowIds, ctx) => card({ i, ctx: { kind: 'track', key: t.id, list: rowIds, from: ctx }, art: ART.html(t, t.albumKey || t.id, t.B || t.T, 'md'), title: t.T, sub: t.A || 'Unknown artist' });
   function wireCards(root) {
     root.addEventListener('click', e => {
@@ -823,8 +824,6 @@
       if (id === curId()) { P.toggle(); return; }
       P.playIds(topIds, Math.max(0, topIds.indexOf(id)), { kind: 'recent', key: 'top-' + kind, name: 'Top songs, ' + periodName });
     }));
-    // one watcher for the chart's width at a time (each drawing used to leave one behind)
-    if (chartWatch) { chartWatch.disconnect(); chartWatch = null; }
     if (window.ResizeObserver) { let w = chart.clientWidth; chartWatch = new ResizeObserver(() => { if (chart.isConnected && Math.abs(chart.clientWidth - w) > 4 && !S().statsTable) { w = chart.clientWidth; chartBars(chart, p, vals); } }); chartWatch.observe(chart); }
     statsDrawn = Date.now();
   }
@@ -1673,20 +1672,23 @@
   // the seek bar and times: every frame while visible and playing, else on demand
   let seekDrag = null, tickRaf = 0;
   function tickNow(once) {
+    if (!canDraw()) return;
     const dur = P.duration(), cur = seekDrag ? seekDrag.frac * dur : P.time(), f = dur ? Math.min(1, cur / dur) : 0;
     $('#seekFill').style.width = f * 100 + '%';
     $('#seekKnob').style.left = f * 100 + '%';
     $('#seekBuf').style.width = (dur ? Math.min(1, P.buffered() / dur) : 0) * 100 + '%';
-    $('#tCur').textContent = mmss(cur);
+    setTimeText($('#tCur'), mmss(cur));
     const left = dur ? Math.max(0, dur - cur) : 0;
     const timeLeft = !!S().set.timeLeft, tDur = $('#tDur'), pressed = String(timeLeft);
-    tDur.textContent = dur ? (timeLeft ? '-' + mmss(left) : mmss(dur)) : '0:00';
+    setTimeText(tDur, dur ? (timeLeft ? '-' + mmss(left) : mmss(dur)) : '0:00');
     if (tDur.getAttribute('aria-pressed') !== pressed) tDur.setAttribute('aria-pressed', pressed);
     $('#bar').style.setProperty('--prog', (f * 100).toFixed(2) + '%');
-    if (np.open) { const s = $('#npSeek'); if (s) s.textContent = `${mmss(cur)} / ${mmss(dur)}`; }
+    if (np.open) { const s = $('#npSeek'); if (s) setTimeText(s, `${mmss(cur)} / ${mmss(dur)}`); }
     if (!once) tickRaf = 0;
     if (!tickRaf && P.playing && belt.visible !== false) tickRaf = requestAnimationFrame(() => { tickRaf = 0; tickNow(false); });
   }
+  function setTimeText(el, text) { if (el.textContent !== text) el.textContent = text; }
+  function canDraw() { return belt.visible !== false && !document.hidden; }
   function slider(el, { onMove, onDone, tip }) {
     const frac = e => { const r = el.getBoundingClientRect(); return Math.max(0, Math.min(1, (e.clientX - r.left) / r.width)); };
     el.addEventListener('pointerdown', e => {
@@ -1994,10 +1996,10 @@
     else { N.translate.stop(); $('#npLyrics').classList.remove('show-tr'); trStatus(''); }
   }
   // which line is being sung, every frame while the lyrics are in view and the music plays
-  function lyWake() { if (!LY.raf && np.open && np.mode === 'lyrics' && LY.res && LY.res.synced) LY.raf = requestAnimationFrame(lyTick); }
+  function lyWake() { if (canDraw() && !LY.raf && np.open && np.mode === 'lyrics' && LY.res && LY.res.synced) LY.raf = requestAnimationFrame(lyTick); }
   function lyTick() {
     LY.raf = 0;
-    if (!np.open || np.mode !== 'lyrics' || !LY.res || !LY.res.synced || LY.id !== curId()) return;
+    if (!canDraw() || !np.open || np.mode !== 'lyrics' || !LY.res || !LY.res.synced || LY.id !== curId()) return;
     const i = N.lyrics.lineAt(LY.res.lines, P.time() + .15);
     if (i !== LY.idx) lySet(i);
     if (P.playing && belt.visible !== false) LY.raf = requestAnimationFrame(lyTick);
@@ -2186,11 +2188,24 @@
   }
   // listening time ticks in every few seconds while a song plays; the Stats page is drawn again at most every 20 s, and
   // not while the pointer is on it or one of its controls (the phone account list) is in use
-  N.on('stats', () => {
+  function refreshStats() {
+    if (!canDraw()) return;
     statsToday();
     if (route() === 'stats' && Date.now() - statsDrawn > 20000 && !$('#view .chart:hover, #view .stat-cols:hover, #view select:focus, #view .stat-phone:hover')) render({ keep: true });
-  });
-  belt.onShow(() => { tickNow(true); N.viz.wake(); N.phone.sync(true); if (Date.now() - L.lastScan > 10 * 60e3 && (S().roots.length || S().files.length) && !L.scanning) rescan(); });
+  }
+  N.on('stats', refreshStats);
+  function syncDrawing() {
+    document.documentElement.classList.toggle('string-hidden', !canDraw());
+    if (canDraw()) { tickNow(true); lyWake(); refreshStats(); }
+    else {
+      cancelAnimationFrame(tickRaf); tickRaf = 0;
+      cancelAnimationFrame(LY.raf); LY.raf = 0;
+    }
+  }
+  belt.onHide(syncDrawing);
+  belt.onShow(syncDrawing);
+  document.addEventListener('visibilitychange', syncDrawing);
+  belt.onShow(() => { N.phone.sync(true); if (Date.now() - L.lastScan > 10 * 60e3 && (S().roots.length || S().files.length) && !L.scanning) rescan(); });
   belt.onFlush(() => N.save());
   // closing found changes that couldn't be saved (a full or locked disk): say so, and let you choose
   belt.onCloseBlocked(async why => {

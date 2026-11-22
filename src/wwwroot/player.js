@@ -9,6 +9,7 @@
   const L = N.lib;
   const P = N.player = { playing: false, history: [] };
   let ctx = null, mix = null, master = null, analyser = null, routed = false;
+  let suspending = null;
   let A = 0;                 // the deck that's playing
   let xf = null;             // a crossfade under way: { from, timer }
   let errors = 0, counted = false, preloadedFor = '', lastPosSave = 0, token = 0, continuation = null;
@@ -101,15 +102,20 @@
     try { d.el.load(); } catch { }
     d.id = '';
   }
+  function suspendMixer() {
+    if (routed && !P.playing && !suspending && ctx.state === 'running')
+      suspending = ctx.suspend().catch(() => {}).finally(() => { suspending = null; });
+  }
   async function go(d) {
     const mine = token;
     await graph();
+    if (suspending) await suspending;
     if (mine !== token || d !== decks[A] || !P.playing) return false;
     if (routed && ctx.state !== 'running') ctx.resume().catch(() => { });
     try { await d.el.play(); return mine === token; }
     catch (e) {
       if (mine !== token || (e && e.name === 'AbortError')) return false;
-      if (e && e.name === 'NotAllowedError') { P.playing = false; changed('state'); N.emit('blocked'); }
+      if (e && e.name === 'NotAllowedError') { P.playing = false; suspendMixer(); changed('state'); N.emit('blocked'); }
       return false;
     }
   }
@@ -238,7 +244,11 @@
     const d = decks[A], mine = ++token;
     if (!routed) { d.el.pause(); return; }
     ramp(d, 0, .16);
-    setTimeout(() => { if (mine === token && !P.playing) d.el.pause(); }, 180);
+    setTimeout(() => {
+      if (mine !== token || P.playing) return;
+      d.el.pause();
+      suspendMixer();
+    }, 180);
   };
   P.toggle = () => P.playing ? P.pause() : P.play();
 
@@ -376,6 +386,7 @@
     P.playing = false;
     token++;
     d.el.pause();
+    suspendMixer();
     Q().pos = 0;
     try { d.el.currentTime = 0; } catch { }
     changed('state', 'time');
@@ -607,7 +618,7 @@
     const t = L.get(d.id);
     if (t) t.unplayable = true;
     N.emit('error', t);
-    if (++errors > 4) { P.playing = false; changed('state'); return; }
+    if (++errors > 4) { P.playing = false; suspendMixer(); changed('state'); return; }
     const mine = token;
     setTimeout(() => { if (mine === token && P.playing) P.next(false); }, 350);
   }

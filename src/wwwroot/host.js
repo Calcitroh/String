@@ -310,6 +310,7 @@
     smokeClick: (x, y) => nat('smokeClick', { x, y }),
     smokeDrop: (paths, x = 200, y = 200) => nat('smokeDrop', { paths, x, y }),
     smokeThumb: i => nat('smokeThumb', { i }),
+    smokeMinimise: on => nat('smokeMinimise', { on }),
     // String's own updates (Updater.cs): this version and whether it can update itself; what GitHub has; install one
     updateInfo: () => nat('updateInfo'),
     updateCheck: () => nat('updateCheck'),
