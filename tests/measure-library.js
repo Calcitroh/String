@@ -45,4 +45,10 @@ function generate() {
   fs.writeFileSync(path.join(base, 'complete'), '1200 tracks, 100 albums\n');
 }
 generate();
+const lyricFile = path.join(media, 'Album 001', '001.lrc');
+if (!fs.existsSync(lyricFile)) {
+  const lines = Array.from({ length: 25 }, (_, i) =>
+    `[${Math.floor(i * 3 / 60)}:${String(i * 3 % 60).padStart(2, '0')}]Test line ${i + 1}`);
+  fs.writeFileSync(lyricFile, lines.join('\n'));
+}
 console.log(media);

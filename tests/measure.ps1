@@ -1,6 +1,8 @@
 # Publish to app-new first. Results go to test-runs/measure-*/processes.csv and data/*-end.json.
 # Median of three private working set samples in MiB; 100% CPU means one logical processor.
-param([string]$Build = 'app-new', [ValidateRange(5, 20)][int]$Seconds = 10, [switch]$LongHidden)
+# -Trace captures Albums, Now Playing and Lyrics after their process samples (Node 22+).
+param([string]$Build = 'app-new', [ValidateRange(5, 20)][int]$Seconds = 10, [switch]$LongHidden,
+      [switch]$Trace, [ValidateRange(5, 25)][int]$SettleSeconds = 25)
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 $buildDir = (Resolve-Path -LiteralPath $Build).Path
@@ -13,7 +15,8 @@ New-Item -ItemType Directory -Path $data | Out-Null
 $app = Join-Path $run 'app'
 Copy-Item -LiteralPath $buildDir -Destination $app -Recurse
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'measure-page.js') -Destination (Join-Path $app 'wwwroot\selftest.js')
-@{ seconds = $Seconds; longHidden = [bool]$LongHidden } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $data 'measure.json') -Encoding Ascii
+@{ seconds = $Seconds; settleSeconds = $SettleSeconds; longHidden = [bool]$LongHidden } |
+    ConvertTo-Json | Set-Content -LiteralPath (Join-Path $data 'measure.json') -Encoding Ascii
 Add-Type @'
 using System;
 using System.Runtime.InteropServices;
@@ -75,22 +78,28 @@ function Get-Sample($Roles) {
 $start = [Diagnostics.ProcessStartInfo]::new()
 $start.FileName = Join-Path $app 'String.exe'
 $start.UseShellExecute = $false
-$start.Arguments = "--smoke-test --data `"$data`" --out `"$run\out`" --test-media `"$media`" --timeout 700"
+if ($Trace) { $start.EnvironmentVariables['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = '--remote-debugging-port=0' }
+$timeout = if ($LongHidden) { 1000 } else { 700 }
+$start.Arguments = "--smoke-test --data `"$data`" --out `"$run\out`" --test-media `"$media`" --timeout $timeout"
 $p = [Diagnostics.Process]::Start($start)
 $csv = Join-Path $run 'processes.csv'
 try {
-    foreach ($phase in 'playing','paused','minimised','browsed') {
+    foreach ($phase in 'playing','paused','minimised','browsed','albums','record','lyrics') {
         if ($phase -eq 'minimised') { Wait-Marker 'minimise'; [MeasureWindow]::Show($p.Id, 7) }
         if ($phase -eq 'browsed') { Wait-Marker 'restore'; [MeasureWindow]::Show($p.Id, 4) }
         Wait-Marker $phase
-        $roles = Get-Roles
-        $first = Get-Sample $roles
-        Start-Sleep -Milliseconds ($Seconds * 500)
-        $middle = Get-Sample $roles
-        Start-Sleep -Milliseconds ($Seconds * 500)
-        $last = Get-Sample $roles
-        $endRoles = Get-Roles
-        if (Compare-Object @($roles.Keys | Sort-Object) @($endRoles.Keys | Sort-Object)) { throw "Process tree changed during $phase" }
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            $roles = Get-Roles
+            $first = Get-Sample $roles
+            Start-Sleep -Milliseconds ($Seconds * 500)
+            $middle = Get-Sample $roles
+            Start-Sleep -Milliseconds ($Seconds * 500)
+            $last = Get-Sample $roles
+            $endRoles = Get-Roles
+            if (!(Compare-Object @($roles.Keys | Sort-Object) @($endRoles.Keys | Sort-Object))) { break }
+            if ($attempt -eq 2) { throw "Process tree changed twice during $phase" }
+            Write-Output "Process tree changed during $phase. Repeating the sample."
+        }
         foreach ($id in $roles.Keys) {
             $a = $first[$id]; $b = $last[$id]
             if (!$a -or !$middle[$id] -or !$b) { throw "Missing counters for $id" }
@@ -98,6 +107,10 @@ try {
             $memory = @($a.WorkingSetPrivate, $middle[$id].WorkingSetPrivate, $b.WorkingSetPrivate) | Sort-Object
             [pscustomobject]@{ Phase=$phase; PID=$id; Role=$roles[$id]; PrivateMiB=[math]::Round($memory[1] / 1MB, 2); CPU=[math]::Round($cpu, 2) } |
                 Export-Csv -NoTypeInformation -Append -LiteralPath $csv
+        }
+        if ($Trace -and $phase -in 'albums','record','lyrics') {
+            node (Join-Path $PSScriptRoot 'measure-trace.js') $run $phase
+            if ($LASTEXITCODE) { throw "Could not trace $phase" }
         }
         Set-Content -LiteralPath (Join-Path $data "$phase.ack") -Value 'ok'
         Wait-Marker "$phase-end"

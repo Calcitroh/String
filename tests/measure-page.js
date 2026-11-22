@@ -18,22 +18,31 @@ window.smokeTest = async () => {
     const settings = JSON.parse(await belt.native.readText(data + '\\measure.json'));
     const write = (name, obj) => belt.native.writeText(data + '\\' + name + '.json', JSON.stringify(obj));
     const checkpoint = () => ({ playing: P.playing, visible: belt.visible, document: document.visibilityState,
+      route: U.route(), nowPlaying: document.querySelector('#np.open #npMode button.on')?.dataset.k || null,
       frames: viz.frames, time: P.time(), track: P.current()?.id, nodes: document.getElementsByTagName('*').length,
       runningAnimations: document.getAnimations().filter(a => a.playState === 'running').map(a => a.animationName) });
     async function sample(name) {
       if (name !== 'minimised') st.step = name;
       // Give the scan, navigation and their temporary allocations time to settle.
-      await sleep(25000);
+      await sleep(settings.settleSeconds * 1000);
       const begin = checkpoint();
-      if (begin.playing !== (name === 'playing' || name === 'minimised') || begin.visible !== (name !== 'minimised'))
+      const moving = ['playing', 'albums', 'record', 'lyrics', 'minimised'].includes(name);
+      if (begin.playing !== moving || begin.visible !== (name !== 'minimised'))
         throw new Error('Unexpected playback or window state: ' + name);
+      if ((name === 'record' || name === 'lyrics') && begin.nowPlaying !== name ||
+          name === 'albums' && (begin.route !== 'albums' || begin.nowPlaying))
+        throw new Error('Unexpected screen: ' + name);
       await write(name, begin);
       await sleep(settings.seconds * 1000);
-      await wait(() => belt.native.readText(data + '\\' + name + '.ack'), 'sampler did not finish ' + name);
+      await wait(async () => (await belt.native.stat(data + '\\' + name + '.ack')).exists,
+        'sampler did not finish ' + name, 60000);
       const end = checkpoint();
       if (begin.playing !== end.playing || begin.visible !== end.visible || begin.track !== end.track ||
-          (begin.playing && end.time <= begin.time) || (name === 'playing' && begin.frames === end.frames))
+          begin.nowPlaying !== end.nowPlaying || begin.route !== end.route ||
+          (begin.playing && end.time <= begin.time) || (moving && begin.visible && begin.frames === end.frames))
         throw new Error('Phase changed or stalled: ' + name);
+      if (name === 'minimised' && (begin.document !== 'hidden' || end.document !== 'hidden' || begin.frames !== end.frames))
+        throw new Error('Minimised window drew a frame');
       await write(name + '-end', end);
     }
     N.S.muted = true;
@@ -67,6 +76,16 @@ window.smokeTest = async () => {
     }
     go('albums');
     await sample('browsed');
+    P.seek(0);
+    await P.play();
+    await sample('albums');
+    U.openNP('record'); P.seek(0);
+    await sample('record');
+    U.openNP('lyrics'); P.seek(0);
+    await wait(() => document.querySelector('#lyScroll.synced .ll.on'), 'synced lyrics missing');
+    await sample('lyrics');
+    U.closeNP();
+    P.pause();
     if (settings.longHidden) {
       await P.play();
       P.setLoop(2, 3);

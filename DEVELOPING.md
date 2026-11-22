@@ -169,7 +169,7 @@ node tests\test-player-regressions.js
 node tests\test-presence.js
 node tests\test-profile-recovery.js
 powershell -File tests\run-selftest.ps1
-powershell -File tests\measure.ps1 [-LongHidden]
+powershell -File tests\measure.ps1 [-LongHidden] [-Trace]
 powershell -File install-update.ps1
 ```
 
@@ -184,10 +184,14 @@ powershell -File install-update.ps1
   key of its own: a good one, a tampered one, one that lies about its version, an older one, none).
 - `measure.ps1` (needs app-new; `-Build <folder>` measures another build, e.g. a release to compare against): a
   library of 1,200 short songs with full-size covers (`measure-library.js`, FFmpeg) and a copy of the build whose
-  self-test is `measure-page.js`, run with `--smoke-test`: visible and playing, paused, minimised and playing, then
-  after opening every album. `test-runs\measure-<time>\processes.csv` has each process's private working set (MiB,
-  median of three samples) and CPU (100% = one logical processor). `-LongHidden` adds five minutes minimised with
-  a muted loop: rerun it after changing WebView2's settings.
+  self-test is `measure-page.js`, run with `--smoke-test`: playing on Songs, on Albums, in Now Playing and in
+  synced Lyrics, then paused, minimised and playing, and after opening every album.
+  `test-runs\measure-<time>\processes.csv` has each process's private working set (MiB, median of three samples)
+  and CPU (100% = one logical processor); `data\<phase>.json` and `<phase>-end.json` hold the visualizer's frame
+  count and time, so frames per second is their difference. `-LongHidden` adds five minutes minimised with a muted
+  loop: rerun it after changing WebView2's settings. `-Trace` (Node 22+) also records a Chromium performance trace of
+  Albums, Now Playing and Lyrics (`measure-trace.js`): per redraw, the time in script, style, layout, paint, raster
+  and the GPU process.
 - `run-selftest.ps1`: the in-window self-test against the fakes, each run in its own `test-runs\selftest-<time>\`,
   muted and off-screen, with `results.txt` and a screenshot per step; it closes itself and exits 0 only on a finished
   run ending "N passed, 0 failed". It plants a small probe add-on (and a broken one, and one naming files outside its
@@ -255,6 +259,11 @@ and `-NoStart`, and `tests\run-selftest.ps1 -Exe <installed copy>`.
 - Scripts an add-on adds after the page loads run only once the page's own scripts have (String waits for
   DOMContentLoaded before adding them), so they always find `N.addons` and `N.ui`.
 - A visualizer drawn with requestAnimationFrame runs at the screen's refresh rate: on a 240 Hz screen that is 240
-  frames a second, most of String's processor use while it's visible and playing.
+  frames a second, most of String's processor use while it's visible and playing. Making each frame cheaper is the
+  lever, never a frame-rate cap. What a frame mostly costs is raster and compositing work in the GPU process, not
+  script: the sidebar's animated wire, the player bar's progress line and the spinning disc each get their own layer
+  (`will-change: transform`, only while playing and visible), so their redraws don't repaint what's behind them. On
+  Albums that halved the processor use; in Now Playing and Lyrics the screen reaches more of the display's frames
+  for about 20 MiB more GPU memory. Caching the whole spinning record as one layer looked softer and was dropped.
 - A WebView2 inside a minimised WPF window keeps drawing unless the control is hidden, and a hidden, muted page has
   its timers throttled (see "Hidden or minimised" above).
