@@ -169,8 +169,47 @@ function CopyText([string]$name, [string]$dest) {
     if ($text -match '[^\x00-\x7F]') { throw "not plain ASCII: $name" }
     [IO.File]::WriteAllText($dest, $text)
 }
+# Read the x64 PE's load-time imports, including the entry points that may be
+# missing from an older version of an otherwise present Windows DLL.
+function PeString($image, [int]$rva) {
+    $reader = $image.GetSectionData($rva).GetReader()
+    while ($reader.ReadByte() -ne 0) { }
+    $length = $reader.Offset - 1
+    $reader.Offset = 0
+    $reader.ReadUTF8($length)
+}
+function NativeImports([string]$path) {
+    $stream = [IO.File]::OpenRead($path)
+    try {
+        $image = [Reflection.PortableExecutable.PEReader]::new($stream)
+        try {
+            $header = $image.PEHeaders.PEHeader
+            if ($header.Magic -ne 'PE32Plus' -or -not $header.ImportTableDirectory.Size) { throw 'Expected an x64 PE with imports.' }
+            $table = $image.GetSectionData($header.ImportTableDirectory.RelativeVirtualAddress).GetReader()
+            while ($true) {
+                $lookup = $table.ReadInt32()
+                $table.Offset += 8 # timestamp and forwarder chain
+                $dllName = $table.ReadInt32()
+                $addresses = $table.ReadInt32()
+                if (-not $dllName) { break }
+                $dll = PeString $image $dllName
+                if (-not $lookup) { $lookup = $addresses }
+                $names = $image.GetSectionData($lookup).GetReader()
+                $symbols = @(while ($entry = $names.ReadInt64()) {
+                    if ($entry -lt 0) { '#' + ($entry -band 0xffff) }
+                    else { PeString $image ([int]$entry + 2) } # skip the hint
+                })
+                if (-not $symbols.Count) { throw "Empty import table for $dll." }
+                "$dll $($symbols -join ' ')"
+            }
+        } finally { $image.Dispose() }
+    } finally { $stream.Dispose() }
+}
 if ($Full) {
     $setup = New-Item -ItemType Directory -Path (Join-Path $app 'setup')
+    $imports = @(NativeImports $exe)
+    if (-not $imports.Count) { throw 'Missing native imports.' }
+    [IO.File]::WriteAllLines((Join-Path $setup.FullName 'imports.txt'), [string[]]$imports)
     foreach ($file in 'install.ps1', 'uninstall.ps1') { CopyText $file (Join-Path $setup.FullName $file) }
     [IO.File]::WriteAllText((Join-Path $setup.FullName 'version.txt'), "$Version`r`n")
     CopyText 'Install String.cmd' (Join-Path $stage 'Install String.cmd')

@@ -33,6 +33,7 @@ fn archive(file: File, version: &str, symlink: bool) -> File {
     let opts = SimpleFileOptions::default();
     let files = [
         ("setup/version.txt", version),
+        ("setup/imports.txt", "kernel32.dll GetLastError"),
         ("String.exe", "fixture"),
         ("setup/install.ps1", FIXTURE_SETUP),
         (
@@ -90,6 +91,25 @@ fn windows_installer_marker_matches_the_verbatim_exe_directory() {
     )
     .unwrap();
     assert!(!updater.installed());
+}
+#[test]
+fn marker_spelling_does_not_select_the_installer_destination() {
+    let tmp = tempdir().unwrap();
+    let install = tmp.path().join("Player");
+    fs::create_dir_all(install.join("setup")).unwrap();
+    let marker = install.join("setup/installed.txt");
+    // Exercise the volume/file ID query even when the host folds case.
+    assert!(directory_id(&install).unwrap() != directory_id(tmp.path()).unwrap());
+    let other_spelling = tmp.path().join("player");
+    fs::write(&marker, other_spelling.to_str().unwrap()).unwrap();
+    let updater = Updater::new(&fs::canonicalize(&install).unwrap(), "2.0").unwrap();
+    // On a case-sensitive volume the alternate spelling is a different directory.
+    if !other_spelling.exists() {
+        fs::create_dir(&other_spelling).unwrap();
+        assert!(!updater.installed());
+    } else {
+        assert_eq!(updater.installed_at().as_deref(), Some(install.as_path()));
+    }
 }
 #[test]
 fn signed_release_feed_end_to_end() {

@@ -55,11 +55,13 @@ function Extract([string]$zip, [string]$version, [string]$folder) {
 $windowsPS = Join-Path ([Environment]::SystemDirectory) 'WindowsPowerShell\v1.0\powershell.exe'
 $local = Join-Path $run 'Local'
 $data = Join-Path $local 'String'
-$keyPath = "HKCU:\Software\StringMigrationTest-$id"
-function Setup([string]$script, [string]$zone, [switch]$Remove, [switch]$Legacy) {
+$testKey = "HKCU:\Software\StringMigrationTest-$id"
+$keyPath = Join-Path $testKey 'String'
+function Setup([string]$script, [string]$zone, [switch]$Remove, [switch]$Legacy, [string]$Refusal) {
     $start = [Diagnostics.ProcessStartInfo]::new($windowsPS)
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
     $start.Environment['LOCALAPPDATA'] = $local
     [void]$start.Environment.Remove('PSModulePath')
     $argsPS = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $script,
@@ -69,16 +71,27 @@ function Setup([string]$script, [string]$zone, [switch]$Remove, [switch]$Legacy)
     foreach ($arg in $argsPS) { $start.ArgumentList.Add($arg) }
     $p = [Diagnostics.Process]::Start($start)
     try {
+        $output = $p.StandardOutput.ReadToEnd()
         $p.WaitForExit()
+        if ($Refusal) {
+            Check ($p.ExitCode -eq 1 -and $output.Contains($Refusal)) "Expected setup to refuse '$Refusal', got exit $($p.ExitCode): $output"
+            return
+        }
         # 1.x can finish installing but report a missing WebView2 runtime. This test never starts 1.x.
-        Check ($p.ExitCode -eq 0 -or ($Legacy -and $p.ExitCode -eq 2)) "Setup exit $($p.ExitCode): $script"
+        Check ($p.ExitCode -eq 0 -or ($Legacy -and $p.ExitCode -eq 2)) "Setup exit $($p.ExitCode): $output"
     } finally { $p.Dispose() }
-    Check (-not (Test-Path -LiteralPath $keyPath)) 'Setup took ownership of the unrelated test Apps key'
+    if ($Remove) { Check (-not (Test-Path -LiteralPath $keyPath)) 'Uninstall left the Apps entry' }
 }
 
 function CheckInstall([string]$zone, [string]$version) {
     $to = Join-Path $zone 'Player'
     $exe = Join-Path $to 'String.exe'
+    Check (Test-Path -LiteralPath $keyPath) "Missing $version Apps entry"
+    $entry = Get-ItemProperty -LiteralPath $keyPath
+    Check ($entry.DisplayName -ceq 'String' -and $entry.InstallLocation -ceq $to) 'Incorrect Apps install location'
+    Check ($entry.DisplayVersion -ceq $version) "Incorrect Apps version: $($entry.DisplayVersion)"
+    $command = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' + (Join-Path $to 'setup\uninstall.ps1') + '"'
+    Check ($entry.UninstallString -ceq $command) "Incorrect Apps uninstall command: $($entry.UninstallString)"
     Check ([IO.File]::ReadAllText((Join-Path $to 'setup\installed.txt')) -ieq $to) "Wrong install marker in $to"
     $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
     Check (($info.ProductVersion -split '\+')[0] -ceq $version) "Wrong exe product version: $($info.ProductVersion)"
@@ -106,103 +119,157 @@ function SameFiles($before, $after, [string]$label) {
     foreach ($name in $before.Keys) { Check ($after[$name] -ceq $before[$name]) "File changed in $label : $name" }
 }
 
+# Model an older machine by adding a missing system import to a small private package.
+# Its executable is inert. Only the installer runs, with the same manifest checks as a release.
+function MissingDependencyPackage([string]$source, [string]$fixture, [string]$import) {
+    $app = Join-Path $fixture 'app'
+    $setup = [IO.Directory]::CreateDirectory((Join-Path $app 'setup')).FullName
+    foreach ($name in 'install.ps1', 'uninstall.ps1', 'version.txt') {
+        [IO.File]::Copy((Join-Path $source "setup\$name"), (Join-Path $setup $name))
+    }
+    [IO.File]::WriteAllText((Join-Path $app 'String.exe'), 'fixture')
+    [IO.File]::WriteAllText((Join-Path $setup 'imports.txt'), $import)
+    $rows = @(foreach ($f in Get-ChildItem -LiteralPath $app -Recurse -File) {
+        "{0}`t{1}`t{2}" -f (Get-FileHash -LiteralPath $f.FullName).Hash, $f.Length, [IO.Path]::GetRelativePath($app, $f.FullName)
+    })
+    [IO.File]::WriteAllLines((Join-Path $setup 'files.txt'), [string[]]($rows + "#end`t$($rows.Count)"))
+    return (Join-Path $setup 'install.ps1')
+}
+
+function CheckPreflight([string]$installer, [string]$zone, [string]$kind) {
+    $to = Join-Path $zone 'Player'
+    [void][IO.Directory]::CreateDirectory((Join-Path $to 'setup'))
+    [IO.File]::WriteAllText((Join-Path $to 'setup\files.txt'), "#end`t0")
+    [IO.File]::WriteAllText((Join-Path $to 'setup\version.txt'), '1.3.1')
+    [IO.File]::WriteAllText((Join-Path $to 'String.exe'), 'old player fixture')
+    $before = Snapshot $to
+    if ($kind -in 'dependency', 'entry point') {
+        $source = Split-Path (Split-Path $installer -Parent) -Parent
+        $import = if ($kind -eq 'dependency') { 'string-test-missing.dll TestEntry' } else { 'icuuc.dll StringTestMissingEntry' }
+        $message = if ($kind -eq 'dependency') { 'Windows could not load string-test-missing.dll' } else { 'icuuc.dll is missing StringTestMissingEntry' }
+        $fixture = MissingDependencyPackage $source (Join-Path $zone 'Package') $import
+        Setup $fixture $zone -Refusal $message
+    } else {
+        $target = [IO.Directory]::CreateDirectory((Join-Path $zone 'Empty')).FullName
+        $link = if ($kind -eq 'parent') { "$zone alias" } else { "$to edits" }
+        $dest = if ($kind -eq 'parent') { $zone } else { $target }
+        [void](New-Item -ItemType Junction -Path $link -Target $dest)
+        try {
+            $via = if ($kind -eq 'parent') { $link } else { $zone }
+            Setup $installer $via -Refusal 'folder link'
+            Check ((Get-ChildItem -LiteralPath $target -Force).Count -eq 0) 'Setup wrote through the edits link'
+        } finally { [IO.Directory]::Delete($link) }
+    }
+    SameFiles $before (Snapshot $to) "original player after $kind refusal"
+}
+
 $old = Join-Path $run '1.x'
 $new = Join-Path $run '2.0'
 Extract $saved '1.3.1' $old
 Extract $NativeZip '2.0.0' $new
 $installer = Join-Path $new 'app\setup\install.ps1'
-$clean = Join-Path $run 'Clean install'
-Setup $installer $clean
-CheckInstall $clean '2.0.0'
-Setup (Join-Path $clean 'Player\setup\uninstall.ps1') $clean -Remove
-Check (-not (Test-Path -LiteralPath (Join-Path $clean 'Player'))) 'Clean uninstall left program files'
-"Clean native install and uninstall passed."
-
-$zone = Join-Path $run 'Upgrade'
-$to = Join-Path $zone 'Player'
-Setup (Join-Path $old 'app\setup\install.ps1') $zone -Legacy
-CheckInstall $zone '1.3.1'
-$original = Snapshot $to
-foreach ($required in 'wwwroot\string.css', 'String.runtimeconfig.json', 'coreclr.dll', 'WebView2Loader.dll') {
-    Check ($original.ContainsKey($required)) "Missing 1.x fixture file $required"
-}
-$fixtures = Join-Path $root 'test-runs\string-media'
-$names = 'glass orbit.mp3', 'low tide.flac', 'northern static.m4a', 'Album One\01 ogg song.ogg', 'Album One\02 opus song.opus'
-if ($names | Where-Object { -not [IO.File]::Exists((Join-Path $fixtures $_)) }) {
-    & node (Join-Path $PSScriptRoot 'test-tags.js')
-    Check ($LASTEXITCODE -eq 0) 'Could not make the tagged test songs'
-}
-$media = Join-Path $run 'Music'
-$songs = @(foreach ($name in $names) {
-    $dest = Join-Path $media $name
-    [void][IO.Directory]::CreateDirectory((Split-Path $dest -Parent))
-    [IO.File]::Copy((Join-Path $fixtures $name), $dest)
-    $dest
-})
-$songFiles = Snapshot $media
-[void][IO.Directory]::CreateDirectory((Join-Path $data 'look'))
-[void][IO.Directory]::CreateDirectory((Join-Path $data 'addons\fixture'))
-$songId = $songs[0].ToLowerInvariant()
-$at = 1577923200000
-$playlist = @{ id = 'saved-list'; name = 'Saved songs'; created = $at; updated = $at; items = @(@{id = $songId; at = $at}) }
-$state = @{ v = 1; files = $songs; liked = @{$songId = $at}; set = @{ phoneStats = $false }; playlists = @($playlist) }
-[IO.File]::WriteAllText((Join-Path $data 'state.json'), ($state | ConvertTo-Json -Depth 6))
-$day = @{ s = 37; h = @(37) + (@(0) * 23); a = @{'0' = 37}; t = @{'0' = 37} }
-$listening = @{ v = 1; artists = @('Test Signal'); tracks = ,@($songId, 'Glass Orbit', 'Test Signal'); days = @{'2020-01-02' = $day} }
-[IO.File]::WriteAllText((Join-Path $data 'listening.json'), ($listening | ConvertTo-Json -Depth 6))
-[IO.File]::WriteAllText((Join-Path $data 'library.json'), '{"v":1,"tracks":[]}')
-[IO.File]::WriteAllText((Join-Path $data 'look\look.css'), '/* personal look */')
-[IO.File]::WriteAllBytes((Join-Path $data 'addons\fixture\sample.bin'), [byte[]](0, 255, 32, 100))
-$before = Snapshot $data
-$css = 'wwwroot\string.css'
-[IO.File]::AppendAllText((Join-Path $to $css), "`r`n/* personal edit */`r`n")
-$edited = (Get-FileHash -LiteralPath (Join-Path $to $css)).Hash
-[IO.File]::WriteAllText((Join-Path $to 'my notes.txt'), 'Kept across the move.')
-
-Setup $installer $zone
-CheckInstall $zone '2.0.0'
-SameFiles $before (Snapshot $data) 'migrated profile'
-$shipped = Snapshot (Join-Path $new 'app')
-$installed = Snapshot $to
-$retired = @($original.Keys | Where-Object { -not $shipped.ContainsKey($_) -and $_ -ne 'setup\installed.txt' })
-foreach ($file in $retired) { Check (-not $installed.ContainsKey($file)) "Retired program file survived: $file" }
-foreach ($dir in 'wwwroot', 'presence', 'runtimes') { Check (-not (Test-Path -LiteralPath (Join-Path $to $dir))) "1.x directory survived: $dir" }
-foreach ($file in $shipped.Keys) { Check ($installed[$file] -ceq $shipped[$file]) "Installed payload differs: $file" }
-$backups = @(Get-ChildItem -LiteralPath "$to edits" -Directory)
-Check ($backups.Count -eq 1) 'Expected one edits backup'
-$savedCss = Join-Path $backups[0].FullName $css
-Check ((Get-FileHash -LiteralPath $savedCss).Hash -ceq $edited) 'Edited CSS was lost'
-Check ([IO.File]::ReadAllText((Join-Path $to 'my notes.txt')) -ceq 'Kept across the move.') 'Personal file was lost'
-"Migrated $($before.Count) profile files. Removed $($retired.Count) retired program files. Verified edited CSS and both shortcuts."
-
-$out = Join-Path $run 'smoke'
-$start = [Diagnostics.ProcessStartInfo]::new((Join-Path $to 'String.exe'))
-$start.UseShellExecute = $false
-foreach ($arg in '--smoke-test', '--data', $data, '--out', $out) { $start.ArgumentList.Add($arg) }
-$p = [Diagnostics.Process]::Start($start)
+$imports = Get-Content -LiteralPath (Join-Path $new 'app\setup\imports.txt')
+Check (($imports -match '^icuuc\.dll .*\bunorm2_normalize\b') -and
+    ($imports -match '^icuin\.dll .*\bucol_open\b')) 'The release is missing the ICU load-time requirements'
 try {
-    if (-not $p.WaitForExit(240000)) { $p.Kill(); $p.WaitForExit(); throw 'Installed smoke test timed out' }
-    $result = Get-Content -LiteralPath (Join-Path $out 'results.json') -Raw | ConvertFrom-Json
-    Check ($p.ExitCode -eq 0 -and $result.passed -eq $true -and $result.checks -contains '01-songs' -and
-        $result.checks -contains '42-settings-updates') "Installed smoke test failed ($($p.ExitCode)): $($result.error)"
-    Check ($result.performance.muted -eq $true -and $result.performance.off_screen -eq $true) 'Smoke did not report muted off-screen playback'
-    "Installed smoke test: $($result.checks.Count) checks passed, $($result.skipped.Count) skipped."
-} finally { $p.Dispose() }
-$reopened = Get-Content -LiteralPath (Join-Path $data 'state.json') -Raw | ConvertFrom-Json -AsHashtable
-Check ($reopened.playlists.id -contains 'saved-list' -and $reopened.liked[$songId] -eq $at) 'Saved playlist or like missing after opening 2.0'
-$history = Get-Content -LiteralPath (Join-Path $data 'listening.json') -Raw | ConvertFrom-Json -AsHashtable
-Check ($history.days['2020-01-02'].s -eq 37) 'Existing listening time missing after opening 2.0'
-$afterSmoke = Snapshot $data
-$uninstaller = Join-Path $to 'setup\uninstall.ps1'
-[IO.File]::AppendAllText($uninstaller, "`r`n# Personal setup note.`r`n")
-$uninstallerHash = (Get-FileHash -LiteralPath $uninstaller).Hash
-Setup $uninstaller $zone -Remove
-SameFiles $afterSmoke (Snapshot $data) 'uninstalled profile'
-SameFiles $songFiles (Snapshot $media) 'song files'
-Check ([IO.File]::Exists((Join-Path $to 'my notes.txt')) -and [IO.File]::Exists($savedCss)) 'Uninstall removed personal files'
-$savedSetup = @(Get-ChildItem -LiteralPath "$to edits" -Recurse -File -Filter 'uninstall.ps1')
-Check ($savedSetup.Count -eq 1 -and (Get-FileHash -LiteralPath $savedSetup[0].FullName).Hash -ceq $uninstallerHash) 'Uninstall lost an edit to its own script'
-foreach ($path in 'Player\String.exe', 'Menu\String.lnk', 'Desktop\String.lnk') {
-    Check (-not (Test-Path -LiteralPath (Join-Path $zone $path))) "Uninstall left $path"
+    foreach ($kind in 'dependency', 'entry point', 'edits', 'parent') {
+        CheckPreflight $installer (Join-Path $run "Preflight $kind") $kind
+    }
+    $clean = Join-Path $run 'Clean install'
+    Setup $installer $clean
+    CheckInstall $clean '2.0.0'
+    Setup (Join-Path $clean 'Player\setup\uninstall.ps1') $clean -Remove
+    Check (-not (Test-Path -LiteralPath (Join-Path $clean 'Player'))) 'Clean uninstall left program files'
+    "Clean native install and uninstall passed."
+
+    $zone = Join-Path $run 'Upgrade'
+    $to = Join-Path $zone 'Player'
+    Setup (Join-Path $old 'app\setup\install.ps1') $zone -Legacy
+    CheckInstall $zone '1.3.1'
+    $original = Snapshot $to
+    foreach ($required in 'wwwroot\string.css', 'String.runtimeconfig.json', 'coreclr.dll', 'WebView2Loader.dll') {
+        Check ($original.ContainsKey($required)) "Missing 1.x fixture file $required"
+    }
+    $fixtures = Join-Path $root 'test-runs\string-media'
+    $names = 'glass orbit.mp3', 'low tide.flac', 'northern static.m4a', 'Album One\01 ogg song.ogg', 'Album One\02 opus song.opus'
+    if ($names | Where-Object { -not [IO.File]::Exists((Join-Path $fixtures $_)) }) {
+        & node (Join-Path $PSScriptRoot 'test-tags.js')
+        Check ($LASTEXITCODE -eq 0) 'Could not make the tagged test songs'
+    }
+    $media = Join-Path $run 'Music'
+    $songs = @(foreach ($name in $names) {
+        $dest = Join-Path $media $name
+        [void][IO.Directory]::CreateDirectory((Split-Path $dest -Parent))
+        [IO.File]::Copy((Join-Path $fixtures $name), $dest)
+        $dest
+    })
+    $songFiles = Snapshot $media
+    [void][IO.Directory]::CreateDirectory((Join-Path $data 'look'))
+    [void][IO.Directory]::CreateDirectory((Join-Path $data 'addons\fixture'))
+    $songId = $songs[0].ToLowerInvariant()
+    $at = 1577923200000
+    $playlist = @{ id = 'saved-list'; name = 'Saved songs'; created = $at; updated = $at; items = @(@{id = $songId; at = $at}) }
+    $state = @{ v = 1; files = $songs; liked = @{$songId = $at}; set = @{ phoneStats = $false }; playlists = @($playlist) }
+    [IO.File]::WriteAllText((Join-Path $data 'state.json'), ($state | ConvertTo-Json -Depth 6))
+    $day = @{ s = 37; h = @(37) + (@(0) * 23); a = @{'0' = 37}; t = @{'0' = 37} }
+    $listening = @{ v = 1; artists = @('Test Signal'); tracks = ,@($songId, 'Glass Orbit', 'Test Signal'); days = @{'2020-01-02' = $day} }
+    [IO.File]::WriteAllText((Join-Path $data 'listening.json'), ($listening | ConvertTo-Json -Depth 6))
+    [IO.File]::WriteAllText((Join-Path $data 'library.json'), '{"v":1,"tracks":[]}')
+    [IO.File]::WriteAllText((Join-Path $data 'look\look.css'), '/* personal look */')
+    [IO.File]::WriteAllBytes((Join-Path $data 'addons\fixture\sample.bin'), [byte[]](0, 255, 32, 100))
+    $before = Snapshot $data
+    $css = 'wwwroot\string.css'
+    [IO.File]::AppendAllText((Join-Path $to $css), "`r`n/* personal edit */`r`n")
+    $edited = (Get-FileHash -LiteralPath (Join-Path $to $css)).Hash
+    [IO.File]::WriteAllText((Join-Path $to 'my notes.txt'), 'Kept across the move.')
+
+    Setup $installer $zone
+    CheckInstall $zone '2.0.0'
+    SameFiles $before (Snapshot $data) 'migrated profile'
+    $shipped = Snapshot (Join-Path $new 'app')
+    $installed = Snapshot $to
+    $retired = @($original.Keys | Where-Object { -not $shipped.ContainsKey($_) -and $_ -ne 'setup\installed.txt' })
+    foreach ($file in $retired) { Check (-not $installed.ContainsKey($file)) "Retired program file survived: $file" }
+    foreach ($dir in 'wwwroot', 'presence', 'runtimes') { Check (-not (Test-Path -LiteralPath (Join-Path $to $dir))) "1.x directory survived: $dir" }
+    foreach ($file in $shipped.Keys) { Check ($installed[$file] -ceq $shipped[$file]) "Installed payload differs: $file" }
+    $backups = @(Get-ChildItem -LiteralPath "$to edits" -Directory)
+    Check ($backups.Count -eq 1) 'Expected one edits backup'
+    $savedCss = Join-Path $backups[0].FullName $css
+    Check ((Get-FileHash -LiteralPath $savedCss).Hash -ceq $edited) 'Edited CSS was lost'
+    Check ([IO.File]::ReadAllText((Join-Path $to 'my notes.txt')) -ceq 'Kept across the move.') 'Personal file was lost'
+    "Migrated $($before.Count) profile files. Removed $($retired.Count) retired program files. Verified edited CSS and both shortcuts."
+
+    $out = Join-Path $run 'smoke'
+    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $to 'String.exe'))
+    $start.UseShellExecute = $false
+    foreach ($arg in '--smoke-test', '--data', $data, '--out', $out) { $start.ArgumentList.Add($arg) }
+    $p = [Diagnostics.Process]::Start($start)
+    try {
+        if (-not $p.WaitForExit(240000)) { $p.Kill(); $p.WaitForExit(); throw 'Installed smoke test timed out' }
+        $result = Get-Content -LiteralPath (Join-Path $out 'results.json') -Raw | ConvertFrom-Json
+        Check ($p.ExitCode -eq 0 -and $result.passed -eq $true -and $result.checks -contains '01-songs' -and
+            $result.checks -contains '42-settings-updates') "Installed smoke test failed ($($p.ExitCode)): $($result.error)"
+        Check ($result.performance.muted -eq $true -and $result.performance.off_screen -eq $true) 'Smoke did not report muted off-screen playback'
+        "Installed smoke test: $($result.checks.Count) checks passed, $($result.skipped.Count) skipped."
+    } finally { $p.Dispose() }
+    $reopened = Get-Content -LiteralPath (Join-Path $data 'state.json') -Raw | ConvertFrom-Json -AsHashtable
+    Check ($reopened.playlists.id -contains 'saved-list' -and $reopened.liked[$songId] -eq $at) 'Saved playlist or like missing after opening 2.0'
+    $history = Get-Content -LiteralPath (Join-Path $data 'listening.json') -Raw | ConvertFrom-Json -AsHashtable
+    Check ($history.days['2020-01-02'].s -eq 37) 'Existing listening time missing after opening 2.0'
+    $afterSmoke = Snapshot $data
+    $uninstaller = Join-Path $to 'setup\uninstall.ps1'
+    [IO.File]::AppendAllText($uninstaller, "`r`n# Personal setup note.`r`n")
+    $uninstallerHash = (Get-FileHash -LiteralPath $uninstaller).Hash
+    Setup $uninstaller $zone -Remove
+    SameFiles $afterSmoke (Snapshot $data) 'uninstalled profile'
+    SameFiles $songFiles (Snapshot $media) 'song files'
+    Check ([IO.File]::Exists((Join-Path $to 'my notes.txt')) -and [IO.File]::Exists($savedCss)) 'Uninstall removed personal files'
+    $savedSetup = @(Get-ChildItem -LiteralPath "$to edits" -Recurse -File -Filter 'uninstall.ps1')
+    Check ($savedSetup.Count -eq 1 -and (Get-FileHash -LiteralPath $savedSetup[0].FullName).Hash -ceq $uninstallerHash) 'Uninstall lost an edit to its own script'
+    foreach ($path in 'Player\String.exe', 'Menu\String.lnk', 'Desktop\String.lnk') {
+        Check (-not (Test-Path -LiteralPath (Join-Path $zone $path))) "Uninstall left $path"
+    }
+    "1.3.1 to 2.0.0 passed. Smoke report: $out\results.json"
+} finally {
+    if (Test-Path -LiteralPath $testKey) { Remove-Item -LiteralPath $testKey -Recurse -Force }
 }
-"1.3.1 to 2.0.0 passed. Smoke report: $out\results.json"
