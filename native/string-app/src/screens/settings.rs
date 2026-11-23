@@ -45,8 +45,10 @@ pub struct State {
     discord_id: Option<String>,
     id_due: Option<Instant>,
     pub how_open: Option<bool>,
-    /// Scroll this row of panels into view once.
-    pub reveal_row: Option<usize>,
+    /// Reveal this panel in whichever row the current window width gives it.
+    reveal_panel: Option<usize>,
+    smoke_language_menu: Option<bool>,
+    smoke_menu_opened: Option<Instant>,
     /// Scroll the Look part of Playback to the top for this many frames (the rows settle their heights meanwhile).
     pub reveal_look: u8,
     numbers: Option<(u64, Numbers)>,
@@ -340,7 +342,6 @@ impl Updates {
     }
 }
 pub fn show(ui: &mut Ui, v: &mut View<'_>) {
-    panel::page_title(ui, "Library", "Folders, playback and look", |_| {});
     let mut st = state();
     let st = &mut *st;
     st.poll(ui.ctx(), v);
@@ -369,11 +370,14 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
-            let w = ui.available_width() - 12.;
+            ui.spacing_mut().item_spacing.y = 0.;
+            super::library::heading(ui, "Library", "Folders, playback and look");
+            ui.add_space(18.);
+            let w = ui.available_width() - 9.;
             let cols = (((w + 18.) / 338.) as usize).clamp(1, panels.len());
             let cw = ((w - 18. * (cols - 1) as f32) / cols as f32).floor();
             for (i, row) in panels.chunks(cols).enumerate() {
-                let id = ui.scope_id().with(("row height", i));
+                let id = ui.scope_id().with(("row height", cols, i));
                 let even: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.);
                 let mut tallest = 0.0_f32;
                 let whole = ui.horizontal_top(|ui| {
@@ -390,16 +394,21 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                         );
                     }
                 });
-                if st.reveal_row == Some(i) && even > 0. {
-                    st.reveal_row = None;
-                    ui.scroll_to_rect(whole.response.rect, Some(Align::Min));
+                if st.reveal_panel.is_some_and(|n| n / cols == i) && even > 0. {
+                    st.reveal_panel = None;
+                    ui.scroll_to_rect_animation(
+                        whole.response.rect,
+                        Some(Align::Min),
+                        egui::style::ScrollAnimation::none(),
+                    );
                 }
                 if tallest != even {
                     ui.data_mut(|d| d.insert_temp(id, tallest));
                     ui.ctx().request_repaint();
                 }
-                ui.add_space(12.);
+                ui.add_space(18.);
             }
+            ui.add_space(12.);
         });
 }
 fn small_icon(ui: &mut Ui, v: &View<'_>, name: &str, title: &str) -> bool {
@@ -417,11 +426,14 @@ fn folders(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
         panel::empty_note(ui, "No folders yet");
     }
     for (i, root) in roots.iter().enumerate() {
+        if i > 0 {
+            ui.add_space(6.);
+        }
         ui.push_id(i, |ui| {
             Frame::new()
                 .fill(panel::black(0.3))
                 .stroke((1., HAIR))
-                .inner_margin(Margin::symmetric(10, 6))
+                .inner_margin(Margin::symmetric(10, 9))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.set_width(ui.available_width());
@@ -455,7 +467,7 @@ fn folders(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
                 });
         });
     }
-    ui.add_space(8.);
+    ui.add_space(14.);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 10.;
         if svc.pickers() {
@@ -529,7 +541,7 @@ fn folders(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
         v.s.set_field("roots", left.into());
         v.scan.requested = true;
     }
-    ui.add_space(16.);
+    ui.add_space(22.);
     let files = v.s.field("files").as_array().map_or(0, Vec::len);
     panel::panel_h(
         ui,
@@ -569,7 +581,36 @@ fn folders(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
     if !svc.pickers() && files == 0 {
         ui.label(mono("A song's path goes in the box above too.", 10.5).color(FAINT));
     }
-    ui.add_space(16.);
+    // Native helpers occupy the library extension slot between Single songs and Duplicates.
+    let mut launch = None;
+    for helper in v.platform.helpers.list() {
+        ui.add_space(22.);
+        panel::panel_h(ui, &helper.name, "", tint);
+        if Btn::new(&helper.title, tint)
+            .icon(&helper.glyph)
+            .sm()
+            .show(ui)
+            .clicked()
+        {
+            launch = Some((helper.id.clone(), helper.name.clone()));
+        }
+    }
+    if let Some((id, name)) = launch {
+        use crate::integration::helpers::Started;
+        match v.platform.helpers.start(&id) {
+            Ok(Started::Started) => v.views.toast.set(format!("Starting {name}…")),
+            Ok(Started::AlreadyOpen(true)) => {}
+            Ok(Started::AlreadyOpen(false)) => {
+                v.views.toast.set(format!("{name} is already open."))
+            }
+            Ok(Started::SelfTest) => v.views.toast.set("Helpers don’t start in a self-test."),
+            Err(e) => {
+                v.platform.log.write("add-ons", format!("{id}: {e}"));
+                v.views.toast.set(format!("{name} couldn’t start: {e}"));
+            }
+        }
+    }
+    ui.add_space(22.);
     panel::panel_h(ui, "Duplicates", "the same song twice", tint);
     if Btn::new("Find duplicates", tint)
         .icon("search")
@@ -584,25 +625,59 @@ fn folders(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
 fn playback(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
     let tint = v.tint;
     panel::panel_h(ui, "Playback", "", tint);
-    let fade = v.s.setting("fade").as_f64().unwrap_or(0.).clamp(0., 12.);
-    let picked = panel::row(ui, "Crossfade between songs", |ui| {
-        let text = if fade > 0. {
-            format!("{fade:.0} s")
-        } else {
+    let mut fade =
+        v.s.setting("fade")
+            .as_f64()
+            .unwrap_or(0.)
+            .clamp(0., 12.)
+            .round() as u32;
+    let changed = panel::row(ui, "Crossfade between songs", |ui| {
+        let text = if fade == 0 {
             "Off".into()
+        } else {
+            format!("{fade} s")
         };
-        ui.allocate_ui_with_layout(vec2(30., 18.), Layout::left_to_right(Align::Center), |ui| {
-            ui.label(mono(&text, 12.).color(MUTED));
-        });
-        let (r, _) = ui.allocate_exact_size(vec2(120., 18.), Sense::hover());
-        ui::rail(ui, r, "Crossfade", fade as f32 / 12., tint).1
+        ui.label(mono(&text, 12.).color(MUTED));
+        let width = (ui.available_width() - 110.).clamp(60., 160.);
+        let slider = ui
+            .scope(|ui| {
+                ui.spacing_mut().slider_width = width;
+                ui.spacing_mut().interact_size.y = 19.;
+                ui.set_opacity(0.);
+                ui.add(
+                    egui::Slider::new(&mut fade, 0..=12)
+                        .step_by(1.)
+                        .show_value(false),
+                )
+            })
+            .inner;
+        let rect = slider.rect;
+        let rail = egui::Rect::from_center_size(rect.center(), vec2(rect.width(), 8.));
+        let p = ui.painter();
+        p.rect(
+            rail,
+            4,
+            egui::Color32::from_gray(61),
+            (1., MUTED),
+            egui::StrokeKind::Inside,
+        );
+        let range = rect.x_range().shrink(rect.height() / 2.5);
+        let x = egui::lerp(range, fade as f32 / 12.);
+        p.rect_filled(rail.with_max_x(x), 4, tint.ink(1.));
+        p.circle_filled(
+            egui::pos2(x, rail.center().y),
+            7.5,
+            if slider.hovered() || slider.has_focus() {
+                egui::Color32::WHITE
+            } else {
+                tint.ink(1.)
+            },
+        );
+        slider.changed()
     });
-    if let Some(f) = picked {
-        let secs = (f * 12.).round() as f64;
-        if secs != fade {
-            v.player.set_crossfade(secs);
-            v.s.set_setting("fade", json!(secs as u32));
-        }
+    if changed {
+        v.player.set_crossfade(fade as f64);
+        v.s.set_setting("fade", json!(fade));
     }
     panel::note(ui, "Off plays songs back to back with no gap.");
     let mut autoplay = v.s.setting("autoplay").as_bool().unwrap_or(true);
@@ -624,62 +699,57 @@ fn playback(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
             .filter(|s| !s.is_empty())
             .unwrap_or("English")
             .to_owned();
-    let mut pick = None;
-    panel::row(ui, "Translate lyrics into", |ui| {
-        egui::ComboBox::from_id_salt("translate into")
-            .width(150.)
-            .wrap_mode(egui::TextWrapMode::Truncate)
-            .selected_text(&lang)
-            .show_ui(ui, |ui| {
-                for l in string_lyrics::LANGUAGES {
-                    if ui.selectable_label(*l == lang, *l).clicked() {
-                        pick = Some(*l);
-                    }
-                }
-            });
+    let langs: Vec<_> = string_lyrics::LANGUAGES
+        .iter()
+        .map(|&lang| (lang, lang))
+        .collect();
+    let (language_field, pick) = panel::row(ui, "Translate lyrics into", |ui| {
+        panel::select::show(ui, "Translate lyrics into", &lang, &langs, tint)
     });
-    if let Some(l) = pick {
-        set(v, "trLang", l.into());
+    if let Some(open) = st.smoke_language_menu.take() {
+        let popup = egui::Popup::default_response_id(&language_field);
+        if open {
+            if !ui.clip_rect().contains_rect(language_field.rect) {
+                language_field.scroll_to_me(Some(Align::Center));
+            }
+            egui::Popup::open_id(ui.ctx(), popup);
+            st.smoke_menu_opened = Some(Instant::now());
+        } else {
+            egui::Popup::close_id(ui.ctx(), popup);
+            st.smoke_menu_opened = None;
+        }
     }
-    let model = v.s.setting("trModel").as_str().unwrap_or("").to_owned();
-    let mut pick = None;
-    panel::row(ui, "Translation model", |ui| {
-        let best = match &st.models {
-            Some(Ok(list)) => format!(
-                "Best downloaded ({})",
-                string_lyrics::pick_model(list).unwrap_or("none yet")
-            ),
-            Some(Err(e)) => format!("Ollama: {e}"),
-            None if model.is_empty() => "Best downloaded (automatic)".into(),
-            None => "Best downloaded".into(),
-        };
-        egui::ComboBox::from_id_salt("translation model")
-            .width(150.)
-            .wrap_mode(egui::TextWrapMode::Truncate)
-            .selected_text(if model.is_empty() { &best } else { &model })
-            .show_ui(ui, |ui| {
-                // The list is asked for when it opens, so a visit to this page never starts Ollama.
-                if st.models.is_none() && st.models_task.is_none() {
-                    st.models_task = Some(Task::run(ui.ctx(), |s| {
-                        s.translation_models().map_err(|e| e.to_string())
-                    }));
-                }
-                if ui.selectable_label(model.is_empty(), &best).clicked() {
-                    pick = Some(String::new());
-                }
-                let listed = st.models.as_ref().and_then(|m| m.as_ref().ok());
-                for m in listed.into_iter().flatten() {
-                    if ui.selectable_label(*m == model, m).clicked() {
-                        pick = Some(m.clone());
-                    }
-                }
-                if !model.is_empty() && listed.is_none_or(|l| !l.contains(&model)) {
-                    let _ = ui.selectable_label(true, &model);
-                }
-            });
+    if let Some(lang) = pick {
+        set(v, "trLang", lang.into());
+    }
+    let model = v.s.setting("trModel").as_str().unwrap_or("");
+    let best = match &st.models {
+        Some(Ok(list)) => format!(
+            "Best downloaded ({})",
+            string_lyrics::pick_model(list).unwrap_or("none yet")
+        ),
+        Some(Err(e)) => format!("Ollama: {e}"),
+        None if model.is_empty() => "Best downloaded (automatic)".into(),
+        None => "Best downloaded".into(),
+    };
+    let mut models = vec![("", best.as_str())];
+    if let Some(Ok(list)) = &st.models {
+        models.extend(list.iter().map(|m| (m.as_str(), m.as_str())));
+    }
+    if !model.is_empty() && !models.iter().any(|(m, _)| *m == model) {
+        models.push((model, model));
+    }
+    let (field, pick) = panel::row(ui, "Translation model", |ui| {
+        panel::select::show(ui, "Translation model", model, &models, tint)
     });
-    if let Some(m) = pick {
-        set(v, "trModel", m.into());
+    // Ask only on interaction. Reopening can discover newly downloaded models or retry a failed read.
+    if (field.gained_focus() || field.clicked()) && st.models_task.is_none() {
+        st.models_task = Some(Task::run(ui.ctx(), |s| {
+            s.translation_models().map_err(|e| e.to_string())
+        }));
+    }
+    if let Some(model) = pick.map(str::to_owned) {
+        set(v, "trModel", model.into());
     }
     panel::note(
         ui,
@@ -689,15 +759,7 @@ fn playback(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
         ui,
         "For songs without lyrics of their own: sends the title, artist, album and length to lrclib.net, a free open lyrics library.",
     );
-    let mut phone = v.s.setting("phoneStats").as_bool().unwrap_or(true);
-    if panel::switch(ui, "Count phone listening", &mut phone, tint) {
-        set(v, "phoneStats", phone.into());
-    }
-    panel::note(
-        ui,
-        "Songs played on your phone through Navidrome on this PC count in Stats, as whole songs.",
-    );
-    ui.add_space(10.);
+    ui.add_space(6.); // The preceding paragraph already supplies 12 of the heading's 18 points.
     if st.reveal_look > 0 {
         st.reveal_look -= 1;
         ui.scroll_to_cursor(Some(Align::Min));
@@ -707,40 +769,46 @@ fn playback(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
     // the person's look.css can set its own tint: shown beside String's three while it's the one drawn
     let custom = matches!(tint, Tint::Custom(_));
     let tints: &[(&str, &str)] = if custom {
-        &[("mono", "Mono"), ("arc", "Arc"), ("ember", "Ember"), ("look", "Look")]
+        &[
+            ("mono", "Mono"),
+            ("arc", "Arc"),
+            ("ember", "Ember"),
+            ("look", "Look"),
+        ]
     } else {
         &[("mono", "Mono"), ("arc", "Arc"), ("ember", "Ember")]
     };
-    let picked = panel::row(ui, "Tint", |ui| {
-        panel::seg(
-            ui,
-            tints,
-            if custom {
-                "look"
-            } else if matches!(now.as_str(), "arc" | "ember") {
-                &now
-            } else {
-                "mono"
-            },
-            tint,
-        )
-    });
+    let picked = panel::segment_row(
+        ui,
+        "Tint",
+        tints,
+        if custom {
+            "look"
+        } else if matches!(now.as_str(), "arc" | "ember") {
+            &now
+        } else {
+            "mono"
+        },
+        tint,
+    );
     if let Some(k) = picked
         && k != "look"
     {
         v.s.set_setting("tint", k.into());
     }
     if custom {
-        panel::note(ui, "Your look.css sets the tint while “Use my look.css” is on.");
-    }
-    let picked = panel::row(ui, "Cover art", |ui| {
-        panel::seg(
+        panel::note(
             ui,
-            &[("mono", "Tinted"), ("colour", "Colour")],
-            if v.mono { "mono" } else { "colour" },
-            tint,
-        )
-    });
+            "Your look.css sets the tint while “Use my look.css” is on.",
+        );
+    }
+    let picked = panel::segment_row(
+        ui,
+        "Cover art",
+        &[("mono", "Tinted"), ("colour", "Colour")],
+        if v.mono { "mono" } else { "colour" },
+        tint,
+    );
     if let Some(k) = picked {
         v.s.set_setting("artMono", (k == "mono").into());
     }
@@ -789,7 +857,7 @@ fn discord(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             panel::lbl(ui, "Application ID");
-            ui.add_space(1.);
+            ui.add_space(7.);
             let w = ui.available_width();
             let text = st.discord_id.get_or_insert_with(|| saved.clone());
             if panel::field(
@@ -814,18 +882,17 @@ fn discord(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
             }
         });
     let shows = v.s.setting("dcShow").as_str().unwrap_or("song").to_owned();
-    let picked = panel::row_below(ui, "Your status line shows", |ui| {
-        panel::seg(
-            ui,
-            &[("song", "Song"), ("artist", "Artist"), ("app", "App name")],
-            if matches!(shows.as_str(), "artist" | "app") {
-                &shows
-            } else {
-                "song"
-            },
-            tint,
-        )
-    });
+    let picked = panel::segment_row(
+        ui,
+        "Your status line shows",
+        &[("song", "Song"), ("artist", "Artist"), ("app", "App name")],
+        if matches!(shows.as_str(), "artist" | "app") {
+            &shows
+        } else {
+            "song"
+        },
+        tint,
+    );
     if let Some(k) = picked {
         set(v, "dcShow", k.into());
     }
@@ -839,10 +906,10 @@ fn discord(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
                 left: 10,
                 right: 10,
                 top: 2,
-                bottom: 8,
+                bottom: 12,
             })
             .show(ui, |ui| {
-                ui.add(Label::new(mono(text, 11.).color(FAINT)).wrap());
+                ui.add(Label::new(mono(text, 11.).line_height(Some(17.)).color(FAINT)).wrap());
             });
     };
     fine(
@@ -931,8 +998,18 @@ fn discord(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
     if !*open {
         return;
     }
-    let plain = |s: &str| RichText::new(s).font(font("UI", 12.5)).color(SECONDARY);
-    let bold = |s: &str| RichText::new(s).font(font("Strong", 12.5)).color(TEXT);
+    let plain = |s: &str| {
+        RichText::new(s)
+            .font(font("UI", 12.5))
+            .line_height(Some(20.))
+            .color(SECONDARY)
+    };
+    let bold = |s: &str| {
+        RichText::new(s)
+            .font(font("Strong", 12.5))
+            .line_height(Some(20.))
+            .color(TEXT)
+    };
     let step = |ui: &mut Ui, n: usize, parts: &mut dyn FnMut(&mut Ui)| {
         ui.horizontal_top(|ui| {
             ui.add_space(12.);
@@ -942,6 +1019,7 @@ fn discord(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
                 parts(ui);
             });
         });
+        ui.add_space(6.);
     };
     step(ui, 1, &mut |ui| {
         ui.label(plain("Open "));
@@ -1129,23 +1207,25 @@ fn numbers(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
     let w = ui.available_width();
     let cols = (((w + 10.) / 130.) as usize).clamp(1, 4);
     let cw = ((w - 10. * (cols - 1) as f32) / cols as f32).floor();
-    for row in cells.chunks(cols) {
+    for (i, row) in cells.chunks(cols).enumerate() {
+        if i > 0 {
+            ui.add_space(10.);
+        }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.;
             for (label, value, sub, size) in row {
                 panel::kpi(ui, cw, label, value, sub, *size);
             }
         });
-        ui.add_space(4.);
     }
-    ui.add_space(8.);
+    ui.add_space(16.);
     ui.add(
         Label::new(
             mono(
                 "Keys: Space play/pause · Ctrl+←/→ previous/next · ←/→ seek · Ctrl+↑/↓ volume · M mute · S shuffle · R repeat · L like · Q queue · F now playing · Y lyrics · [ ] loop start/end · \\ stop the loop · / search",
                 10.5,
             )
-            .color(FAINT),
+            .line_height(Some(16.8)).color(FAINT),
         )
         .wrap(),
     );
@@ -1184,9 +1264,13 @@ pub mod smoke {
     pub fn open(v: &mut View<'_>) {
         crate::ui::edit_info::close();
         v.go(Route::Settings);
+        state().smoke_language_menu = Some(true);
     }
     pub fn ready(v: &mut View<'_>) -> bool {
         v.views.history.current == Route::Settings
+            && state()
+                .smoke_menu_opened
+                .is_some_and(|t| t.elapsed() >= Duration::from_millis(450))
     }
     /// The Updates panel offering a release, and Numbers beside it.
     pub fn updates(v: &mut View<'_>) {
@@ -1201,10 +1285,11 @@ pub mod smoke {
             newer: true,
         });
         st.how_open = Some(false);
-        st.reveal_row = Some(1);
+        st.smoke_language_menu = Some(false);
+        st.reveal_panel = Some(3);
     }
     pub fn updates_ready(_: &mut View<'_>) -> bool {
-        state().reveal_row.is_none()
+        state().reveal_panel.is_none()
     }
     pub fn tidy() {
         let mut st = state();
@@ -1225,7 +1310,10 @@ pub mod smoke {
         let on = v.s.setting("look").as_bool().unwrap_or(true);
         v.views.history.current == Route::Settings
             && state().reveal_look == 0
-            && LOOK_AT.lock().unwrap().is_some_and(|t| t.elapsed() > Duration::from_millis(700))
+            && LOOK_AT
+                .lock()
+                .unwrap()
+                .is_some_and(|t| t.elapsed() > Duration::from_millis(700))
             && crate::theme::look::settled(on)
     }
 }
