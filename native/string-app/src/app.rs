@@ -43,7 +43,7 @@ pub struct App {
     close_after_recycle: bool,
     minimized: bool,
     last: Instant,
-    save_due: Option<Instant>,
+    close_reason: String,
     transport_until: Instant,
 }
 impl App {
@@ -76,7 +76,7 @@ impl App {
             close_after_recycle: false,
             minimized: false,
             last: now,
-            save_due: None,
+            close_reason: String::new(),
             transport_until: now,
         };
         a.open(ctx);
@@ -85,7 +85,8 @@ impl App {
     fn open(&mut self, ctx: &Context) {
         let folder = storage::folder(&self.args.root, self.args.explicit);
         match Storage::open(&folder, ctx) {
-            Ok((store, s)) => {
+            Ok((mut store, s)) => {
+                Self::save_feedback(&self.platform, &mut self.views, &mut store);
                 self.views.history.current =
                     Route::parse(s.field("route").as_str().unwrap_or("home"));
                 if let Some(sm) = &mut self.smoke
@@ -110,36 +111,49 @@ impl App {
             }
         }
     }
+    fn save_feedback(platform: &Platform, views: &mut Views, store: &mut Storage) {
+        for msg in store.feedback.logs.drain(..) {
+            platform.log.write("save", &msg);
+        }
+        for msg in store.feedback.messages.drain(..) {
+            views.toast.set(msg);
+        }
+    }
     fn flush(&mut self) -> bool {
         self.platform.save_placement();
         let deadline = Instant::now() + Duration::from_secs(10);
         if let Some(error) = self.platform.phone.wait(deadline) {
-            self.platform.log.write("phone listening", error);
             if self.platform.phone.busy() {
+                self.close_reason = error;
                 return false;
             }
+            self.platform.log.write("phone listening", &error);
         }
         let Some(rt) = self.runtime.as_mut() else {
             return true;
         };
         let mut s = rt.session.lock().unwrap();
         s.tick(rt.player.status(), true);
-        let r = rt.store.flush_until(&mut s, deadline);
-        for msg in &r.errors {
-            self.platform.log.write("save", msg);
+        if let Some(msg) = self.platform.phone.backup_warning.take() {
+            rt.store.feedback.backup(msg);
         }
+        let r = rt.store.flush_until(&mut s, deadline);
+        self.close_reason = rt.store.feedback.reason.clone().unwrap_or_default();
+        Self::save_feedback(&self.platform, &mut self.views, &mut rt.store);
         !r.failed()
     }
     fn finish(&mut self, ctx: &Context, mut err: Option<String>) {
         if !self.flush() && err.is_none() {
-            err = Some("Final profile save failed.".into());
+            err = Some(self.close_reason.clone());
         }
         if let Some(sm) = &self.smoke
             && let Err(e) = sm.report(err.as_deref())
         {
             err = Some(e.to_string());
         }
-        if let Some(e) = &err {
+        if let Some(e) = &err
+            && e != &self.close_reason
+        {
             self.platform.log.write("close", e);
         }
         self.exit.store(i32::from(err.is_some()), Ordering::Release);
@@ -188,7 +202,7 @@ impl eframe::App for App {
         if let Some(lyrics) = &mut self.views.lyrics {
             lyrics.check_visible(self.views.overlay, self.minimized, s.state.queue.current());
         }
-        s.tick(st, false);
+        rt.store.tick(&mut s, st, Instant::now());
         // Songs moved to the Recycle Bin are merged into the copies kept here, which runs while String is minimised
         // too; a close that waited for them goes on once they are. Paths from `--add` are added here too, so a
         // helper's songs come in while String is minimised.
@@ -248,12 +262,7 @@ impl eframe::App for App {
             self.platform.log.write("player", &msg);
             self.views.toast.set(msg);
         }
-        if let Some(r) = rt.store.poll(&mut s) {
-            for msg in r.errors {
-                self.platform.log.write("save", &msg);
-                self.views.toast.set(msg);
-            }
-        }
+        rt.store.poll(&mut s);
         if self.views.stats.sync_phone(&self.platform.phone.users) {
             self.platform.phone.request();
         }
@@ -265,18 +274,18 @@ impl eframe::App for App {
             ctx,
         ) {
             self.platform.log.write("phone listening", &msg);
+        }
+        if let Some(msg) = self.platform.phone.backup_warning.take() {
+            rt.store.feedback.backup(msg);
+        }
+        if let Some(msg) = self.platform.phone.worker_warning.take() {
             self.views.toast.set(msg);
         }
-        if !self.platform.phone.busy() && (s.state_dirty || s.listening_dirty || s.library_dirty) {
-            let due = *self.save_due.get_or_insert_with(|| {
-                Instant::now() + Duration::from_millis(if st.playing { 5000 } else { 650 })
-            });
-            if Instant::now() >= due {
-                rt.store.schedule(&mut s);
-                self.save_due = None;
-            } else {
-                ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
-            }
+        Self::save_feedback(&self.platform, &mut self.views, &mut rt.store);
+        if !self.platform.phone.busy()
+            && let Some(delay) = rt.store.autosave(&mut s, Instant::now())
+        {
+            ctx.request_repaint_after(delay);
         }
         if self.minimized && st.playing {
             ctx.request_repaint_after(Duration::from_secs(1));
@@ -315,7 +324,10 @@ impl eframe::App for App {
             && let Some(quit) = ui::confirm(
                 &ctx,
                 "Your latest changes aren’t saved",
-                "Keep String open to retry saving, or close and discard the unsaved changes.",
+                &format!(
+                    "{}\n\nKeep String open to retry saving, or close and discard the unsaved changes.",
+                    self.close_reason
+                ),
                 "Close anyway",
             )
         {

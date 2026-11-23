@@ -15,7 +15,11 @@ use string_core::{
 };
 use string_extras::phone::{self, STARTUP_DELAY, SYNC_INTERVAL, SyncResult};
 
-type Reply = Result<Option<SyncResult>, String>;
+struct Imported {
+    report: SyncResult,
+    backup_warning: Option<String>,
+}
+type Reply = Result<Option<Imported>, crate::Error>;
 
 pub struct Phone {
     root: PathBuf,
@@ -26,6 +30,9 @@ pub struct Phone {
     smoke_db: Option<PathBuf>,
     pending: Option<mpsc::Receiver<Reply>>,
     pub users: Vec<(String, String)>,
+    seen_errors: std::collections::HashSet<String>,
+    pub backup_warning: Option<String>,
+    pub worker_warning: Option<String>,
 }
 
 impl Phone {
@@ -39,6 +46,9 @@ impl Phone {
             smoke_db: smoke.then(|| root.join("navidrome.db")),
             pending: None,
             users: vec![],
+            seen_errors: Default::default(),
+            backup_warning: None,
+            worker_warning: None,
         }
     }
     pub fn request(&mut self) {
@@ -63,13 +73,29 @@ impl Phone {
             }
         };
         self.pending = None;
-        result
-            .map(|r| {
-                if let Some(r) = r {
-                    self.users = r.users;
+        self.complete(result)
+    }
+
+    fn complete(&mut self, reply: Reply) -> Option<String> {
+        match reply {
+            Ok(Some(imported)) => {
+                self.users = imported.report.users;
+                self.backup_warning = imported.backup_warning;
+            }
+            Ok(None) => self.requested = true,
+            Err(error) => {
+                let message = error.to_string();
+                if self.seen_errors.insert(message.clone()) {
+                    // A database check has already put its error in Stats. Other worker failures
+                    // (for example a refused live cursor write) still need a visible reason.
+                    if !error.is::<phone::Error>() {
+                        self.worker_warning = Some(message.clone());
+                    }
+                    return Some(message);
                 }
-            })
-            .err()
+            }
+        }
+        None
     }
 
     fn due(&mut self, now: Instant, enabled: bool, minimized: bool) -> bool {
@@ -97,15 +123,11 @@ impl Phone {
         if let Some(rx) = &self.pending {
             match rx.try_recv() {
                 Ok(result) => {
-                    match result {
-                        Ok(Some(r)) => self.users = r.users,
-                        Ok(None) => self.requested = true,
-                        Err(e) => error = Some(e),
-                    }
+                    error = self.complete(result);
                     self.pending = None;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    error = Some("Phone import worker stopped".into());
+                    error = self.complete(Err("Phone import worker stopped".into()));
                     self.pending = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
@@ -124,10 +146,9 @@ impl Phone {
             let root = self.root.clone();
             store.with_profile(move |profile| {
                 let db = db.unwrap_or_else(phone::database_path);
-                let _ = tx.send(
-                    import(profile, &shared, &root, |stage| phone::sync(stage, &db))
-                        .map_err(|e| e.to_string()),
-                );
+                let _ = tx.send(import(profile, &shared, &root, |stage| {
+                    phone::sync(stage, &db)
+                }));
             });
         }
         if enabled && !self.busy() {
@@ -160,7 +181,7 @@ fn import(
     shared: &Shared,
     root: &Path,
     sync: impl FnOnce(&mut Profile) -> Result<SyncResult, phone::Error>,
-) -> Result<Option<SyncResult>, crate::Error> {
+) -> Result<Option<Imported>, crate::Error> {
     // sync writes each page. Stage those writes until the selected account and the live stats agree.
     let temp = tempfile::Builder::new()
         .prefix("phone-import-")
@@ -208,6 +229,7 @@ fn import(
             return Err(e.into());
         }
     };
+    let mut backup_warning = None;
     if stage.listening.value.phone_import().map(|h| &h.after)
         != before.phone_import().map(|h| &h.after)
     {
@@ -220,7 +242,7 @@ fn import(
         replay(&mut imported, &heard);
         profile.listening.value = imported;
         if let Some(e) = profile.listening.save()?.backup_error {
-            s.notices.push_back(format!("Backup of listening: {e}"));
+            backup_warning = Some(format!("Backup of listening: {e}"));
         }
         s.listening.clone_from(&profile.listening.value);
         s.listening_dirty = false;
@@ -230,7 +252,10 @@ fn import(
     if let Some(user) = stage.state.value.fields["set"].get("phoneUser") {
         s.set_setting("phoneUser", user.clone());
     }
-    Ok(Some(report))
+    Ok(Some(Imported {
+        report,
+        backup_warning,
+    }))
 }
 
 #[cfg(test)]
@@ -289,7 +314,7 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        assert_eq!(r.added, 1);
+        assert_eq!(r.report.added, 1);
         let s = session.lock().unwrap();
         assert_eq!(s.setting("volumeOnReturn"), true);
         let disk = folder.open().unwrap();
@@ -337,6 +362,24 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), other);
         assert!(session.lock().unwrap().field("phone").is_null());
     }
+    #[test]
+    fn repeated_database_errors_are_reported_only_once_each() {
+        let (dir, folder, session) = fixture();
+        let ctx = Context::default();
+        let (writer, _) = Storage::open(&folder, &ctx).unwrap();
+        let mut phone = Phone::new(dir.path(), true);
+        let mut logged = vec![];
+        for reason in ["locked", "locked", "missing table", "locked"] {
+            let (tx, rx) = mpsc::channel();
+            tx.send(Err(phone::Error::Io(std::io::Error::other(reason)).into()))
+                .unwrap();
+            phone.pending = Some(rx);
+            logged.extend(phone.poll(false, false, &session, &writer, &ctx));
+        }
+        assert_eq!(logged, ["locked", "missing table"]);
+        assert!(phone.worker_warning.is_none());
+    }
+
     #[test]
     fn schedules_start_interval_restore_and_opt_in() {
         let mut p = Phone::new(Path::new("."), true);

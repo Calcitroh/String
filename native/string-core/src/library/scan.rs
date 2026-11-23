@@ -225,7 +225,8 @@ impl Library {
                 } else {
                     todo.push((f, cover, t.added, Some(retained.len())));
                 }
-            } else if !keep.contains(&id) && !unread.iter().any(|r| id == *r || below(&id, r)) {
+            } else if !keep.contains(&id) && !unread.iter().any(|r| id == *r || below(&id, r))
+                && !t.selected_wide_path_exists(roots, loose) {
                 report.removed += 1;
                 continue;
             }
@@ -272,8 +273,9 @@ impl Library {
                 (slot, t, issue)
             })
             .collect();
-        for (slot, t, issue) in rows {
+        for (slot, mut t, issue) in rows {
             if let Some(i) = slot {
+                t.extra = std::mem::take(&mut retained[i].extra);
                 retained[i] = t;
             } else {
                 retained.push(t);

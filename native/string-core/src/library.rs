@@ -39,17 +39,92 @@ impl Track {
     pub fn id(&self) -> String {
         track_id(&self.path)
     }
+    /// Directory enumeration may skip a name with an unpaired code unit. Check the cached
+    /// name itself before dropping it, including loose files passed in as native wide paths.
+    #[cfg(windows)]
+    fn selected_wide_path_exists(&self, roots: &[PathBuf], loose: &[PathBuf]) -> bool {
+        use crate::data::text;
+        use std::{
+            ffi::OsString,
+            os::windows::ffi::{OsStrExt, OsStringExt},
+        };
+        if !self.path.contains('\0') {
+            return false;
+        }
+        let id = self.id();
+        let key = |p: &PathBuf| match p.to_str() {
+            Some(s) => track_id(s),
+            None => track_id(&text::from_units(
+                &p.as_os_str().encode_wide().collect::<Vec<_>>(),
+            )),
+        };
+        if !loose.iter().any(|p| key(p) == id)
+            && !roots.iter().any(|p| {
+                id.strip_prefix(key(p).trim_end_matches(['\\', '/']))
+                    .is_some_and(|suffix| suffix.starts_with(['\\', '/']))
+            })
+        {
+            return false;
+        }
+        let path = OsString::from_wide(&text::units(&self.path));
+        match std::fs::metadata(path) {
+            Ok(meta) => meta.is_file(),
+            Err(e) => e.kind() != io::ErrorKind::NotFound,
+        }
+    }
+    #[cfg(not(windows))]
+    fn selected_wide_path_exists(&self, _: &[PathBuf], _: &[PathBuf]) -> bool {
+        false
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Library {
     pub v: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "saved_time",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub saved: Option<i64>,
+    #[serde(default, deserialize_with = "cached_tracks")]
     pub tracks: Vec<Track>,
     #[serde(flatten)]
     pub extra: Fields,
     #[serde(skip)]
     scanned: bool,
+}
+
+fn saved_time<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    Ok(Value::deserialize(d)?.as_i64())
+}
+
+fn cached_tracks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Track>, D::Error> {
+    let rows = crate::data::array(Value::deserialize(d)?);
+    let mut tracks = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(path) = row["path"].as_str().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Ok(track) = Track::deserialize(&row) {
+            tracks.push(track);
+        } else {
+            // Keep recognizable fields and extensions even if a drive is currently offline.
+            // readError makes the next scan read this song again regardless of size and mtime.
+            let mut repaired = serde_json::json!({"path":path});
+            for (key, value) in crate::data::object(row) {
+                let mut probe = serde_json::json!({"path":""});
+                probe[&key] = value;
+                if Track::deserialize(&probe).is_ok() {
+                    repaired[&key] = probe[&key].take();
+                }
+            }
+            repaired["readError"] = 1.into();
+            if let Ok(track) = serde_json::from_value(repaired) {
+                tracks.push(track);
+            }
+        }
+    }
+    Ok(tracks)
 }
 impl Default for Library {
     fn default() -> Self {

@@ -24,20 +24,56 @@ struct SavedState {
     fields: Fields,
 }
 impl From<SavedState> for State {
-    fn from(mut saved: SavedState) -> Self {
+    fn from(saved: SavedState) -> Self {
         let mut fields = Self::default().fields;
-        for key in ["set", "sort"] {
-            if let Some(Value::Object(base)) = fields.get_mut(key)
-                && let Some(Value::Object(values)) = saved.fields.remove(key)
-            {
-                base.extend(values);
+        merge_fields(&mut fields, saved.fields);
+        for key in ["roots", "files"] {
+            if let Some(paths) = fields[key].as_array_mut() {
+                paths.retain(Value::is_string);
             }
         }
-        fields.extend(saved.fields);
+        if let Some(playlists) = fields["playlists"].as_array_mut() {
+            playlists.retain(Value::is_object);
+            for playlist in playlists {
+                if !playlist["items"].is_array() {
+                    playlist["items"] = json!([]);
+                }
+                for key in ["id", "name"] {
+                    if playlist.get(key).is_some_and(|v| !v.is_string()) {
+                        playlist[key] = "".into();
+                    }
+                }
+            }
+        }
+        // These optional settings use the absence of a saved value for their individual defaults.
+        if let Some(settings) = fields["set"].as_object_mut() {
+            settings.retain(|key, value| match key.as_str() {
+                "lyricsOnline" | "phoneStats" | "look" | "translate" | "updates"
+                | "iconCreditSeen" => value.is_boolean(),
+                "phoneUser" | "tint" | "trLang" | "trModel" => value.is_string(),
+                _ => true,
+            });
+        }
         Self {
             v: saved.v,
             queue: saved.queue,
             fields,
+        }
+    }
+}
+// The known defaults describe the expected kinds. Preserve extension keys at every level.
+fn merge_fields(base: &mut Fields, saved: Fields) {
+    for (key, value) in saved {
+        match base.get_mut(&key) {
+            Some(Value::Object(fields)) => {
+                if let Value::Object(values) = value {
+                    merge_fields(fields, values);
+                }
+            }
+            Some(default) if std::mem::discriminant(default) != std::mem::discriminant(&value) => {}
+            _ => {
+                base.insert(key, value);
+            }
         }
     }
 }

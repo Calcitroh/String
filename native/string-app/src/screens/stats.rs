@@ -591,7 +591,7 @@ fn rank_row(ui: &mut Ui, v: &mut View<'_>, i: usize, item: &Rank, max: f64) -> b
     }
 }
 struct PhoneSummary {
-    found: bool,
+    show_status: bool,
     note: String,
     users: Vec<(String, String)>,
 }
@@ -613,12 +613,13 @@ impl PhoneSummary {
             };
             note.push_str(&format!(" ? checked {ago}"));
         }
-        if phone["error"].as_str().is_some_and(|s| !s.is_empty()) {
+        let read_failed = phone["error"].as_str().is_some_and(|s| !s.is_empty());
+        if read_failed {
             note.push_str(" ? couldn't read it last time");
         }
         note.push_str(" ?");
         Self {
-            found: phone["found"] == true,
+            show_status: phone["found"] == true || read_failed,
             note,
             users: v.views.stats.phone_users.clone(),
         }
@@ -626,7 +627,7 @@ impl PhoneSummary {
 }
 fn phone(ui: &mut Ui, v: &mut View<'_>, summary: &PhoneSummary) {
     let enabled = v.s.setting("phoneStats") != false;
-    if enabled && !summary.found {
+    if enabled && !summary.show_status {
         return;
     }
     let chosen = v.s.setting("phoneUser").as_str().unwrap_or("").to_owned();

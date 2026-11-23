@@ -11,6 +11,24 @@ use std::{
     path::{Path, PathBuf},
 };
 use tempfile::NamedTempFile;
+pub(crate) mod text;
+use serde_json::{Value, json};
+
+pub(crate) fn object(value: Value) -> crate::Fields {
+    match value {
+        Value::Object(fields) => fields,
+        _ => Default::default(),
+    }
+}
+pub(crate) fn array(value: Value) -> Vec<Value> {
+    match value {
+        Value::Array(rows) => rows,
+        _ => Vec::new(),
+    }
+}
+pub(crate) fn take(fields: &mut crate::Fields, key: &str) -> Value {
+    fields.remove(key).unwrap_or(Value::Null)
+}
 
 pub fn default_data_dir() -> Option<PathBuf> {
     env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("String"))
@@ -21,6 +39,7 @@ mod sealed {
 }
 pub trait Model: sealed::Sealed + Serialize + DeserializeOwned + Default {
     const NAME: &'static str;
+    const CACHE: bool = false;
     fn valid(&self) -> bool;
 }
 impl sealed::Sealed for State {}
@@ -40,6 +59,7 @@ impl Model for Listening {
 impl sealed::Sealed for Library {}
 impl Model for Library {
     const NAME: &'static str = "library";
+    const CACHE: bool = true;
     fn valid(&self) -> bool {
         self.v == 1
     }
@@ -80,8 +100,19 @@ fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 fn decode<T: Model>(bytes: &[u8]) -> io::Result<T> {
-    let value: T = serde_json::from_slice(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes))
-        .map_err(invalid)?;
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let parsed = serde_json::from_slice::<Value>(&text::read_json(bytes)).map_err(invalid)?;
+    let mut fields = object(parsed);
+    // A numeric version for a different format must never be rewritten as version one.
+    if fields
+        .get("v")
+        .and_then(Value::as_f64)
+        .is_some_and(|v| v != 1.)
+    {
+        return Err(invalid("unsupported document version"));
+    }
+    fields.insert("v".into(), json!(1));
+    let value: T = serde_json::from_value(Value::Object(fields)).map_err(invalid)?;
     if !value.valid() {
         return Err(invalid("unsupported document version"));
     }
@@ -109,13 +140,16 @@ impl DataFolder {
     fn path<T: Model>(&self) -> PathBuf {
         self.root.join(format!("{}.json", T::NAME))
     }
-    /// Only absence creates a new model. A locked, malformed or unsupported file is an error.
+    /// An I/O failure blocks every model. Only the rebuildable song cache may have broken JSON.
     pub fn read<T: Model>(&self) -> io::Result<Document<T>> {
         let path = self.path::<T>();
         let result = (|| {
             let bytes = read_existing(&path)?;
             let value = match bytes.as_deref() {
-                Some(b) => decode(b)?,
+                Some(b) => match decode(b) {
+                    Err(_) if T::CACHE => T::default(),
+                    result => result?,
+                },
                 None => T::default(),
             };
             Ok(Document {
@@ -162,10 +196,9 @@ impl DataFolder {
         for entry in fs::read_dir(&days)? {
             let entry = entry?;
             if entry.file_type()?.is_dir()
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|s| s.len() == 10 && NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok())
+                && entry.file_name().to_str().is_some_and(|s| {
+                    s.len() == 10 && NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
+                })
             {
                 kept.push(entry.path());
             }
@@ -236,7 +269,7 @@ impl<T: Model> Document<T> {
                 &mut bytes, Compact,
             ))
             .map_err(invalid)?;
-        Ok(bytes)
+        Ok(text::write_json(bytes))
     }
     pub fn save(&mut self) -> io::Result<SaveResult> {
         let bytes = self.json()?;

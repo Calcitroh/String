@@ -3,9 +3,13 @@
 mod period;
 pub use period::{Period, PeriodKind, Unit};
 
-use crate::Fields;
+use crate::{
+    Fields,
+    data::{array, object, take},
+};
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
 use serde::{Deserialize, Deserializer, Serialize, de::Error};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -33,12 +37,21 @@ pub struct PhoneImport {
     pub extra: Fields,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize)]
+struct Days {
+    #[serde(flatten)]
+    dated: BTreeMap<NaiveDate, Day>,
+    // Keep keys an older importer could write (including invalid phone timestamps) for round trips.
+    #[serde(flatten)]
+    other: Fields,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct Document {
     v: u32,
     tracks: Vec<Track>,
     artists: Vec<String>,
-    days: BTreeMap<NaiveDate, Day>,
+    days: Days,
     #[serde(
         rename = "phoneImport",
         default,
@@ -65,7 +78,7 @@ impl Default for Listening {
                 v: 1,
                 tracks: vec![],
                 artists: vec![],
-                days: BTreeMap::new(),
+                days: Days::default(),
                 phone_import: None,
                 extra: Fields::new(),
             },
@@ -76,17 +89,68 @@ impl Default for Listening {
 }
 impl<'de> Deserialize<'de> for Listening {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let doc = Document::deserialize(d)?;
-        if doc.v != 1 {
+        let mut fields = object(Value::deserialize(d)?);
+        if take(&mut fields, "v").as_f64().is_some_and(|v| v != 1.) {
             return Err(D::Error::custom("unsupported listening version"));
         }
-        for day in doc.days.values() {
-            if day.a.keys().any(|i| *i >= doc.artists.len())
-                || day.t.keys().any(|i| *i >= doc.tracks.len())
-            {
-                return Err(D::Error::custom("listening index outside dictionary"));
+        // Keep dictionary slots stable: dropping one would credit every following song to its neighbor.
+        let saved_artists: Vec<_> = array(take(&mut fields, "artists"))
+            .into_iter()
+            .map(string)
+            .collect();
+        let saved_tracks: Vec<_> = array(take(&mut fields, "tracks"))
+            .into_iter()
+            .map(|row| {
+                let mut cells = array(row).into_iter().map(string);
+                Track(
+                    cells.next().unwrap_or_default(),
+                    cells.next().unwrap_or_default(),
+                    cells.next().unwrap_or_default(),
+                )
+            })
+            .collect();
+        let mut days = Days::default();
+        for (date, value) in object(take(&mut fields, "days")) {
+            let Some(date) = date
+                .parse::<NaiveDate>()
+                .ok()
+                .filter(|parsed| parsed.to_string() == date)
+            else {
+                days.other.insert(date, value);
+                continue;
+            };
+            let mut row = object(value);
+            let mut day = Day::default();
+            day.s = take(&mut row, "s").as_f64().unwrap_or_default();
+            for (hour, value) in day.h.iter_mut().zip(array(take(&mut row, "h"))) {
+                *hour = value.as_f64().unwrap_or_default();
             }
+            day.p = take(&mut row, "p").as_f64();
+            day.a = seconds(take(&mut row, "a"), saved_artists.len());
+            day.t = seconds(take(&mut row, "t"), saved_tracks.len());
+            day.extra = row;
+            days.dated.insert(date, day);
         }
+        let phone_import = match take(&mut fields, "phoneImport") {
+            Value::Object(mut row) => Some(PhoneImport {
+                legacy_after: take(&mut row, "legacyAfter").as_i64().unwrap_or_default(),
+                plays: take(&mut row, "plays").as_u64().unwrap_or_default(),
+                after: object(take(&mut row, "after"))
+                    .into_iter()
+                    .map(|(user, v)| (user, v.as_i64().unwrap_or_default()))
+                    .collect(),
+                extra: row,
+            }),
+            _ => None,
+        };
+        let doc = Document {
+            v: 1,
+            tracks: saved_tracks,
+            artists: saved_artists,
+            days,
+            phone_import,
+            extra: fields,
+        };
         let tracks = doc
             .tracks
             .iter()
@@ -105,6 +169,23 @@ impl<'de> Deserialize<'de> for Listening {
             artists,
         })
     }
+}
+
+fn string(value: Value) -> String {
+    match value {
+        Value::String(s) => s,
+        _ => String::new(),
+    }
+}
+fn seconds(value: Value, dictionary_len: usize) -> BTreeMap<usize, f64> {
+    object(value)
+        .into_iter()
+        .filter_map(|(key, v)| {
+            let index = key.parse::<usize>().ok()?;
+            let secs = v.as_f64()?;
+            (index < dictionary_len).then_some((index, secs))
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -126,7 +207,7 @@ impl Listening {
         self.doc.phone_import = Some(history);
     }
     pub fn days(&self) -> &BTreeMap<NaiveDate, Day> {
-        &self.doc.days
+        &self.doc.days.dated
     }
     pub fn track_count(&self) -> usize {
         self.doc.tracks.len()
@@ -160,7 +241,7 @@ impl Listening {
             self.doc.artists.push(t.2.clone());
             self.doc.artists.len() - 1
         });
-        let day = self.doc.days.entry(when.date()).or_default();
+        let day = self.doc.days.dated.entry(when.date()).or_default();
         day.s += secs;
         day.h[when.hour() as usize] += secs;
         *day.a.entry(ai).or_default() += secs;
@@ -178,7 +259,7 @@ impl Listening {
             return false;
         }
         if let Some(&ti) = self.tracks.get(to) {
-            for d in self.doc.days.values_mut() {
+            for d in self.doc.days.dated.values_mut() {
                 if let Some(s) = d.t.remove(&fi) {
                     *d.t.entry(ti).or_default() += s;
                 }
@@ -193,12 +274,13 @@ impl Listening {
     pub fn first_day(&self) -> Option<NaiveDate> {
         self.doc
             .days
+            .dated
             .iter()
             .find(|(_, d)| d.s > 0.)
             .map(|(k, _)| *k)
     }
     pub fn streak(&self, today: NaiveDate) -> usize {
-        let heard = |d: &NaiveDate| self.doc.days.get(d).is_some_and(|day| day.s >= 60.);
+        let heard = |d: &NaiveDate| self.doc.days.dated.get(d).is_some_and(|day| day.s >= 60.);
         let start = if heard(&today) {
             Some(today)
         } else {
@@ -216,7 +298,7 @@ impl Listening {
         let mut artists = Ranking::default();
         let mut tracks = Ranking::default();
         if from <= to {
-            for day in self.doc.days.range(from..=to).map(|(_, d)| d) {
+            for day in self.doc.days.dated.range(from..=to).map(|(_, d)| d) {
                 total += day.s;
                 phone += day.p.unwrap_or(0.);
                 artists.add(&day.a);

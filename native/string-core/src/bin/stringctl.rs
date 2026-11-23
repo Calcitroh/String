@@ -53,6 +53,21 @@ fn inspect<T: Model>(folder: &DataFolder, summary: impl FnOnce(&T) -> String) ->
         }
     }
 }
+fn open_for_write(
+    folder: &DataFolder,
+    creates_cache: bool,
+) -> io::Result<string_core::data::Profile> {
+    let profile = folder.open()?;
+    if (creates_cache
+        || profile.state.exists()
+        || profile.listening.exists()
+        || profile.library.exists())
+        && let Err(e) = folder.keep_opening_copy()
+    {
+        eprintln!("Could not keep the opening copy: {e}");
+    }
+    Ok(profile)
+}
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args_os().skip(1);
     let cmd = args
@@ -115,13 +130,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "roundtrip" if paths.is_empty() => {
-            let mut p = folder.open()?;
+            let mut p = open_for_write(&folder, false)?;
             rewrite(&folder, &mut p.state)?;
             rewrite(&folder, &mut p.listening)?;
             rewrite(&folder, &mut p.library)?;
         }
         "scan" if !paths.is_empty() => {
-            let mut p = folder.open()?;
+            let mut p = open_for_write(&folder, true)?;
             let mut roots = vec![];
             let mut loose = vec![];
             for arg in paths {
