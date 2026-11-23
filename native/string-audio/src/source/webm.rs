@@ -1,5 +1,5 @@
 //! Matroska's demuxer omits BlockGroup/DiscardPadding and rounds timestamps to track
-//! ticks. Count Opus samples on their own clock and associate tail padding with its track.
+//! ticks. Count Opus samples on their own clock and trim each padded block on its track.
 use super::{Error, NativeSource, next_packet, probe_media};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
@@ -42,7 +42,8 @@ pub(super) fn seek(
     }
     // Cues may be present after the first cluster without a SeekHead pointing to
     // them. Trust the demuxer's actual landing and retry a failed or late seek.
-    if w.cues && ts > 0 {
+    // After an interior trim the playable frame clock can differ from the cue timestamps.
+    if w.cues && !w.padding.interior && ts > 0 {
         let landing = s.format.seek(
             SeekMode::Accurate,
             SeekTo::Timestamp {
@@ -60,11 +61,13 @@ pub(super) fn seek(
         cursor = None;
     }
     if cursor.is_none_or(|at| at > target) || (preroll_start == 0 && start < 0) {
-        let file = &mut s.webm.as_mut().unwrap().file;
+        let w = s.webm.as_mut().unwrap();
+        let file = &mut w.file;
         file.rewind().map_err(decoding)?;
         s.format = probe_media(&Hint::new(), Box::new(file.try_clone().map_err(decoding)?))
             .map_err(decoding)?;
         s.decoder.reset();
+        w.padding.raw = 0;
         cursor = Some(start);
     }
     let mut at = cursor.unwrap();
@@ -102,9 +105,9 @@ pub(super) fn seek(
             continue;
         }
         if codec == CODEC_ID_OPUS {
-            let frames =
-                packet_samples(&packet.data).ok_or_else(|| decoding("invalid Opus packet"))?;
-            at += (frames * u64::from(s.rate) / 48000) as i64;
+            let n = opus_frames(&packet.data, s.rate)?;
+            let (lo, hi) = s.webm.as_mut().unwrap().padding.keep(n);
+            at += (hi - lo) as i64;
         } else {
             let first = packet
                 .data
@@ -136,10 +139,87 @@ pub(super) fn seek(
 
 pub(super) struct Layout {
     pub cues: bool,
-    // Laced blocks defer counting to the demuxer, which splits them into packets.
-    pub samples: Option<u64>,
+    pub samples: u64,
     pub delay_ns: Option<u64>,
-    pub tail_ns: i64,
+    // Ranges on the untrimmed 48 kHz Opus clock, including laced packets.
+    discard: Vec<BlockPadding>,
+}
+
+impl Layout {
+    /// Convert each discard separately to the output frame clock. The
+    /// prefix and suffix of a laced block can span more than one decoded packet.
+    pub(super) fn padding(&self, rate: u32) -> Padding {
+        let scale = |sample: u64| (u128::from(sample) * u128::from(rate) / 48000) as u64;
+        let cuts: Vec<std::ops::Range<u64>> = self
+            .discard
+            .iter()
+            .filter_map(|r| {
+                let count = ns_to_frames(r.nanoseconds.unsigned_abs(), rate);
+                let block = scale(r.first)..scale(r.end);
+                let length = count.min(block.end - block.start);
+                let cut = if r.nanoseconds > 0 {
+                    block.end - length..block.end
+                } else {
+                    block.start..block.start + length
+                };
+                (cut.start < cut.end).then_some(cut)
+            })
+            .collect();
+        let interior = match cuts.as_slice() {
+            [] => false,
+            [cut] => scale(self.samples) != cut.end,
+            _ => true,
+        };
+        Padding {
+            cuts,
+            raw: 0,
+            interior,
+        }
+    }
+}
+
+struct BlockPadding {
+    first: u64,
+    end: u64,
+    nanoseconds: i64,
+}
+
+pub(super) struct Padding {
+    cuts: Vec<std::ops::Range<u64>>,
+    raw: u64,
+    pub(super) interior: bool,
+}
+
+impl Padding {
+    pub(super) fn total(&self) -> u64 {
+        self.cuts.iter().map(|r| r.end - r.start).sum()
+    }
+
+    pub(super) fn before(&self, frame: u64) -> u64 {
+        self.cuts
+            .iter()
+            .take_while(|r| r.start < frame)
+            .map(|r| r.end.min(frame) - r.start)
+            .sum()
+    }
+
+    /// Discard padding belongs to one block. Each packet can therefore overlap
+    /// at most one cut, including when the cut consumes an entire lace.
+    pub(super) fn keep(&mut self, frames: usize) -> (usize, usize) {
+        // The source length already trims a lone terminal cut, including after
+        // a cue seek where the raw packet cursor need not be reconstructed.
+        if !self.interior {
+            return (0, frames);
+        }
+        let start = self.raw;
+        self.raw += frames as u64;
+        let i = self.cuts.partition_point(|r| r.end <= start);
+        match self.cuts.get(i) {
+            Some(r) if r.start <= start => ((r.end.min(self.raw) - start) as usize, frames),
+            Some(r) if r.start < self.raw => (0, (r.start - start) as usize),
+            _ => (0, frames),
+        }
+    }
 }
 
 fn invalid() -> io::Error {
@@ -236,23 +316,75 @@ impl Reader {
         Ok((id, self.pos + size, false))
     }
 
-    fn block(&mut self, end: u64, track: u32, layout: &mut Layout) -> io::Result<bool> {
+    fn count_packet(&mut self, end: u64, samples: &mut u64) -> io::Result<()> {
+        let mut head = [0; 2];
+        let n = (end - self.pos).min(2) as usize;
+        self.bytes(&mut head[..n], end)?;
+        let count = packet_samples(&head[..n]).ok_or_else(invalid)?;
+        *samples = samples.checked_add(count).ok_or_else(invalid)?;
+        Ok(())
+    }
+
+    fn block(&mut self, end: u64, track: u32, layout: &mut Layout) -> io::Result<()> {
         if self.vint(end, false)?.0 != u64::from(track) {
-            return Ok(false);
+            return Ok(());
         }
         let mut fields = [0; 3];
         self.bytes(&mut fields, end)?;
-        if let Some(total) = layout.samples {
-            if fields[2] & 6 == 0 {
-                let mut head = [0; 2];
-                let count = (end - self.pos).min(2) as usize;
-                self.bytes(&mut head[..count], end)?;
-                layout.samples = packet_samples(&head[..count]).and_then(|n| total.checked_add(n));
-            } else {
-                layout.samples = None;
-            }
+        let lacing = (fields[2] >> 1) & 3;
+        if lacing == 0 {
+            return self.count_packet(end, &mut layout.samples);
         }
-        Ok(true)
+        // The lace header specifies all packet sizes except the last.
+        let mut sizes = [0u64; 255];
+        let mut n = [0];
+        self.bytes(&mut n, end)?;
+        let sizes = &mut sizes[..usize::from(n[0])];
+        let count = sizes.len() as u64 + 1;
+        if lacing == 2 && !(end - self.pos).is_multiple_of(count) {
+            return Err(invalid());
+        }
+        let mut previous = 0u64;
+        for size in sizes.iter_mut() {
+            *size = match lacing {
+                1 => {
+                    let mut total = 0;
+                    loop {
+                        self.bytes(&mut n, end)?;
+                        total += u64::from(n[0]);
+                        if n[0] != 255 {
+                            break total;
+                        }
+                    }
+                }
+                2 => (end - self.pos) / count,
+                _ => {
+                    let (v, width) = self.vint(end, false)?;
+                    if previous == 0 {
+                        v
+                    } else {
+                        let bias = (1i64 << (7 * width - 1)) - 1;
+                        previous
+                            .checked_add_signed(v as i64 - bias)
+                            .ok_or_else(invalid)?
+                    }
+                }
+            };
+            if *size == 0 {
+                return Err(invalid());
+            }
+            previous = *size;
+        }
+        for &size in sizes.iter() {
+            let next = self
+                .pos
+                .checked_add(size)
+                .filter(|&n| n <= end)
+                .ok_or_else(invalid)?;
+            self.count_packet(next, &mut layout.samples)?;
+            self.to(next)?;
+        }
+        self.count_packet(end, &mut layout.samples)
     }
 
     fn track_delay(&mut self, end: u64, track: u32) -> io::Result<Option<u64>> {
@@ -285,12 +417,12 @@ impl Reader {
     }
 
     fn group(&mut self, end: u64, track: u32, layout: &mut Layout) -> io::Result<()> {
-        let mut audio = false;
+        let first = layout.samples;
         let mut padding = 0;
         while self.pos < end {
             let (id, next, _) = self.element(end)?;
             match id {
-                BLOCK => audio = self.block(next, track, layout)?,
+                BLOCK => self.block(next, track, layout)?,
                 DISCARD_PADDING if (1..=8).contains(&(next - self.pos)) => {
                     let width = (next - self.pos) as usize;
                     let mut bytes = [0; 8];
@@ -301,8 +433,12 @@ impl Reader {
             }
             self.to(next)?;
         }
-        if audio {
-            layout.tail_ns = padding;
+        if padding != 0 && first != layout.samples {
+            layout.discard.push(BlockPadding {
+                first,
+                end: layout.samples,
+                nanoseconds: padding,
+            });
         }
         Ok(())
     }
@@ -313,7 +449,7 @@ pub(super) fn ns_to_frames(ns: u64, rate: u32) -> u64 {
 }
 
 /// Packet duration at the fixed 48 kHz Opus clock (RFC 6716, section 3.1).
-pub(super) fn packet_samples(data: &[u8]) -> Option<u64> {
+fn packet_samples(data: &[u8]) -> Option<u64> {
     let toc = *data.first()?;
     let config = toc >> 3;
     let frame = match config {
@@ -330,6 +466,11 @@ pub(super) fn packet_samples(data: &[u8]) -> Option<u64> {
     (1..=5760).contains(&samples).then_some(samples)
 }
 
+pub(super) fn opus_frames(data: &[u8], rate: u32) -> Result<usize, Error> {
+    let samples = packet_samples(data).ok_or_else(|| decoding("invalid Opus packet"))?;
+    Ok((samples * u64::from(rate) / 48000) as usize)
+}
+
 pub(super) fn layout(mut file: File, opus_track: Option<u32>) -> io::Result<Layout> {
     let end = file.metadata()?.len();
     file.rewind()?;
@@ -339,9 +480,9 @@ pub(super) fn layout(mut file: File, opus_track: Option<u32>) -> io::Result<Layo
     };
     let mut layout = Layout {
         cues: false,
-        samples: Some(0),
+        samples: 0,
         delay_ns: None,
-        tail_ns: 0,
+        discard: Vec::new(),
     };
     while r.pos < end {
         let (id, segment_end, _) = r.element(end)?;
@@ -395,9 +536,7 @@ pub(super) fn layout(mut file: File, opus_track: Option<u32>) -> io::Result<Layo
                 }
                 if let Some(track) = opus_track {
                     match id {
-                        SIMPLE_BLOCK if r.block(element_end, track, &mut layout)? => {
-                            layout.tail_ns = 0
-                        }
+                        SIMPLE_BLOCK => r.block(element_end, track, &mut layout)?,
                         BLOCK_GROUP => r.group(element_end, track, &mut layout)?,
                         _ => {}
                     }
@@ -538,6 +677,17 @@ mod tests {
         );
 
         let heard = pcm(&joined.0);
+        let joint = reference.len() / 2;
+        let mut source = Source::open(&joined.0).unwrap();
+        assert_eq!(source.info().frames, Some(384312));
+        for at in [joint - 1, joint + 96000, joint + 1, 384311, joint, 0] {
+            source.seek(at as u64).unwrap();
+            let mut sought = Vec::new();
+            let frames = source.read(&mut sought, 512).unwrap();
+            assert_eq!(frames, 512.min(384312 - at));
+            assert!(sought == heard[at * 2..(at + frames) * 2], "seek to {at}");
+        }
+        drop(source);
         let mut bytes = std::fs::read(&joined.0).unwrap();
         // Remove only the first 13.5 ms DiscardPadding, leaving the final trim
         // and all other bytes intact. Each Opus packet in the fixture is 960 frames.
@@ -552,12 +702,58 @@ mod tests {
         bytes[groups[0] + 3..groups[0] + 7].fill(0);
         std::fs::write(&joined.0, bytes).unwrap();
         let mut expected = pcm(&joined.0);
-        let joint = reference.len();
-        expected.drain(joint..joint + 648 * 2);
+        expected.drain(joint * 2..(joint + 648) * 2);
         assert_eq!(heard.len(), expected.len());
         assert!(
             heard == expected,
             "interior padding was removed from the wrong packet"
         );
+    }
+
+    #[test]
+    fn signed_padding_spans_the_laces_of_its_block_only() {
+        let path =
+            Song(std::env::temp_dir().join(format!("string-{}-lace.webm", std::process::id())));
+        // Each block contains 960, 480 and 960 frames. Xiph specifies the
+        // first two byte lengths directly (3, 2), EBML encodes 3 then -1.
+        for lace in [
+            &[4, 2, 0xf8, 0xf0, 0xf8][..],
+            &[2, 2, 3, 2, 0xf8, 0, 0, 0xf0, 0, 0xf8],
+            &[6, 2, 0x83, 0xbe, 0xf8, 0, 0, 0xf0, 0, 0xf8],
+        ] {
+            let mut bytes = vec![0x18, 0x53, 0x80, 0x67, 0xff, 0x1f, 0x43, 0xb6, 0x75, 0xff];
+            let block_len = 3 + lace.len() as u8;
+            for ns in [-25_000_000i32, 25_000_000] {
+                bytes.extend([
+                    0xa0,
+                    0x80 | (block_len + 9),
+                    0xa1,
+                    0x80 | block_len,
+                    0x81,
+                    0,
+                    0,
+                ]);
+                bytes.extend_from_slice(lace);
+                bytes.extend([0x75, 0xa2, 0x84]);
+                bytes.extend(ns.to_be_bytes());
+            }
+            std::fs::write(&path.0, bytes).unwrap();
+            let layout = super::layout(std::fs::File::open(&path.0).unwrap(), Some(1)).unwrap();
+            assert_eq!(layout.samples, 4800);
+            let mut trim = layout.padding(48000);
+            assert_eq!(trim.total(), 2400);
+            assert_eq!(trim.before(312), 312);
+            assert_eq!(
+                [960, 480, 960, 960, 480, 960].map(|frames| trim.keep(frames)),
+                [
+                    (960, 960),
+                    (240, 480),
+                    (0, 960),
+                    (0, 960),
+                    (0, 240),
+                    (960, 960)
+                ]
+            );
+        }
     }
 }
