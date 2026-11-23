@@ -479,6 +479,9 @@ impl Session {
     }
     /// The title becomes the artist and the artist the title. Returns the new pair.
     pub fn swap_names(&mut self, p: &Player, id: &str) -> Option<(String, String)> {
+        if !crate::screens::dupes::can_edit(id) {
+            return None;
+        }
         let song = self.models.by_id.get(id)?;
         let (title, artist) = (song.artist.clone(), song.title.clone());
         if title.is_empty() {

@@ -14,6 +14,8 @@ struct Job {
 #[derive(Default)]
 pub struct Scanner {
     job: Option<Job>,
+    /// An accepted duplicate move must transfer its history before a scan can remove its row.
+    pub(crate) recycling: bool,
     pub requested: bool,
     pub completed: usize,
     reread: HashSet<String>,
@@ -47,6 +49,9 @@ impl Scanner {
     }
     pub fn poll(&mut self, s: &mut Session, ctx: &Context) -> Vec<String> {
         let mut errors = vec![];
+        if self.recycling {
+            return errors;
+        }
         if let Some(j) = &self.job {
             match j.rx.try_recv() {
                 Ok((lib, report)) => {

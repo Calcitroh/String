@@ -1,6 +1,7 @@
 //! The Duplicates page: songs the library has more than once. For each, play the copies, pick the one to keep and
 //! tick the ones to drop, then hide those in String or move them to the Recycle Bin. Either way the kept copy takes
 //! over their likes, plays, loops, listening time and playlist places.
+mod bin;
 mod files;
 use super::settings::plural;
 use crate::{
@@ -24,7 +25,10 @@ use std::{
     path::PathBuf,
     sync::{LazyLock, Mutex, MutexGuard},
 };
-use string_core::{library::Library, state::State as Saved};
+use string_core::{
+    library::{Library, Track},
+    state::State as Saved,
+};
 use string_extras::{
     duplicates::{
         CopyToMerge, Disposition, DuplicateGroup, duplicates, forget_not_same, mark_not_same,
@@ -42,8 +46,19 @@ struct Copy {
     sound: String,
     title: String,
     artist: String,
+    duration: f64,
     size: u64,
     stamp: Option<Stamp>,
+}
+impl Copy {
+    fn unchanged(&self, old: &Self) -> bool {
+        self.stamp.is_some()
+            && self.stamp == old.stamp
+            && self.path == old.path
+            && self.title == old.title
+            && self.artist == old.artist
+            && self.duration == old.duration
+    }
 }
 struct Group {
     found: DuplicateGroup,
@@ -66,10 +81,17 @@ struct Problem {
     ids: Vec<String>,
     reason: String,
 }
-/// How each file of a plan fared on its way to the Recycle Bin.
-struct Moved {
-    checked: Checked,
-    outcomes: Vec<Result<(), String>>,
+#[derive(Default)]
+struct Progress {
+    next: usize,
+    moved: usize,
+    failed: Vec<String>,
+}
+struct Recycling {
+    active: CopyToMerge,
+    original_drop: Track,
+    progress: Progress,
+    task: Task<(Checked, Result<(), String>)>,
 }
 #[derive(Default)]
 pub struct State {
@@ -85,7 +107,8 @@ pub struct State {
     unticked: HashSet<String>,
     reread: HashSet<String>,
     awaiting_scan: bool,
-    recycling: Option<(Basis, Task<Moved>)>,
+    recycling: Option<Recycling>,
+    skipped: Vec<String>,
 }
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
 pub fn state() -> MutexGuard<'static, State> {
@@ -172,9 +195,6 @@ impl State {
         self.ctx = Some(ctx.clone());
         self.look_number += 1;
         self.basis = None;
-        self.groups.clear();
-        self.drop.clear();
-        self.keep.clear();
         let (lib, state) = (s.library.clone(), s.state.clone());
         self.looking = Some((
             basis(s),
@@ -192,8 +212,27 @@ impl State {
         for c in &g.copies {
             self.drop.remove(&c.id);
         }
-        self.drop
-            .extend(g.found.suggested_drops(keep).map(str::to_owned));
+        self.drop.extend(
+            g.found
+                .suggested_drops(keep)
+                .filter(|id| !self.unticked.contains(*id))
+                .map(str::to_owned),
+        );
+    }
+    fn choose_keep(&mut self, group: usize, id: String) {
+        // Even if the group disappears and later returns, this file was explicitly kept.
+        self.unticked.insert(id.clone());
+        self.keep[group] = id;
+        self.tick(group);
+    }
+    fn choose_drop(&mut self, id: String, selected: bool) {
+        if selected {
+            self.unticked.remove(&id);
+            self.drop.insert(id);
+        } else {
+            self.drop.remove(&id);
+            self.unticked.insert(id);
+        }
     }
     fn groups(lib: &Library, state: &Saved) -> Vec<Group> {
         let tracks: HashMap<_, _> = lib.tracks.iter().map(|t| (t.id(), t)).collect();
@@ -234,6 +273,7 @@ impl State {
                             ),
                             title: names.title,
                             artist: names.artist,
+                            duration: t.tags.duration,
                             size: t.size,
                             stamp: Stamp::seen(t),
                         })
@@ -254,13 +294,54 @@ impl State {
             .collect()
     }
     fn take(&mut self, groups: Vec<Group>) {
-        self.groups = groups;
-        self.keep = self.groups.iter().map(|g| g.copies[0].id.clone()).collect();
-        self.drop.clear();
+        let previous = std::mem::replace(&mut self.groups, groups);
+        let keepers = std::mem::take(&mut self.keep);
+        let drops = std::mem::take(&mut self.drop);
+        let mut invalidated = false;
+        let mut old = HashMap::new();
+        for (group, keep) in previous.iter().zip(&keepers) {
+            for c in &group.copies {
+                old.insert(&c.id, (c, keep));
+            }
+        }
         for gi in 0..self.groups.len() {
+            let group = &self.groups[gi];
+            let old_keepers: HashSet<_> = group
+                .copies
+                .iter()
+                .filter_map(|c| old.get(&c.id).map(|(_, k)| *k))
+                .collect();
+            let keeper = group.copies.iter().find(|c| {
+                old_keepers.contains(&c.id)
+                    && old
+                        .get(&c.id)
+                        .is_some_and(|(before, _)| c.unchanged(before))
+            });
+            let reviewed = old_keepers.len() == 1 && keeper.is_some();
+            let keep = &keeper.unwrap_or(&group.copies[0]).id;
+            self.keep.push(keep.clone());
             self.tick(gi);
+            for c in &self.groups[gi].copies {
+                if let Some((before, was_keep)) = old.get(&c.id) {
+                    self.drop.remove(&c.id);
+                    if reviewed
+                        && **was_keep == self.keep[gi]
+                        && c.unchanged(before)
+                        && drops.contains(&c.id)
+                    {
+                        self.drop.insert(c.id.clone());
+                    } else if drops.contains(&c.id) {
+                        invalidated = true;
+                    }
+                } else if !old_keepers.is_empty() && !reviewed {
+                    self.drop.remove(&c.id);
+                }
+            }
         }
         self.drop.retain(|id| !self.unticked.contains(id));
+        if invalidated {
+            services::notice("A reviewed pair changed. Its removal was unticked.");
+        }
     }
     fn changed(&self) -> Problem {
         Problem {
@@ -401,78 +482,131 @@ impl State {
         s.listening_dirty = true;
         s.rebuild();
     }
-    fn recycle(&mut self, checked: Checked, revision: Basis) {
-        self.recycling = Some((
-            revision,
-            Task::run(self.ctx.as_ref().unwrap(), move |s| {
-                checked.recycle(|path| s.recycle(path))
-            }),
-        ));
-    }
-    /// The files that really moved are merged into the copies kept. A copy that was playing hands over to the
-    /// kept one at the same moment of the song.
-    fn recycled(&mut self, revision: Basis, done: Moved, v: &mut View<'_>) {
-        let now = Local::now().timestamp_millis();
-        let svc = services::get();
-        let (mut moved, mut swap, mut failed) = (vec![], false, vec![]);
-        // The shell can take time. If the library changed after Yes, never transfer history
-        // to a different recording, even when Windows already moved its file.
-        let plan = &done.checked.plan;
-        let merge = revision == basis(v.s) || {
-            let tracks: HashMap<_, _> = v.s.library.tracks.iter().map(|t| (t.id(), t)).collect();
-            plan.iter().zip(&done.outcomes).all(|(c, result)| {
-                result.is_err()
-                    || tracks
-                        .get(&c.keep_id)
-                        .zip(tracks.get(&c.drop_id))
-                        .is_some_and(|(k, d)| still_copies(&v.s.state, k, d))
-            })
+    /// Resolve one pair immediately before handing its path to the shell worker.
+    fn matching_drop<'s>(
+        &self,
+        s: &'s Session,
+        copy: &CopyToMerge,
+        removed: Option<&'s Track>,
+    ) -> Option<&'s Track> {
+        let track = |id: &str| {
+            let row = self
+                .groups
+                .iter()
+                .flat_map(|g| &g.copies)
+                .find(|c| c.id == id)?;
+            let t = s
+                .library
+                .tracks
+                .iter()
+                .find(|t| t.path == row.path)
+                .or_else(|| removed.filter(|t| t.path == row.path))?;
+            let names = display_names(&s.state, t);
+            (t.size == row.size
+                && t.tags.duration == row.duration
+                && names.title == row.title
+                && names.artist == row.artist)
+                .then_some(t)
         };
-        for (copy, result) in plan.iter().zip(done.outcomes) {
-            match result {
-                Ok(()) => {
-                    moved.push(copy.drop_id.clone());
-                    if !merge {
-                        continue;
-                    }
-                    swap |= merge_copy(
-                        &mut v.s.state,
-                        &mut v.s.listening,
-                        copy,
-                        Disposition::Recycled,
-                        now,
-                    )
-                    .is_some();
-                    svc.event(Event::Merged {
-                        from: &copy.drop_id,
-                        to: &copy.keep_id,
-                    });
-                }
-                Err(e) => failed.push(e),
+        let (k, d) = (track(&copy.keep_id)?, track(&copy.drop_id)?);
+        still_copies(&s.state, k, d).then_some(d)
+    }
+    fn next_pair(
+        &mut self,
+        checked: &Checked,
+        progress: &mut Progress,
+        s: &Session,
+    ) -> Option<(usize, Track)> {
+        while let Some(copy) = checked.plan.get(progress.next) {
+            let at = progress.next;
+            progress.next += 1;
+            if let Some(drop) = self.matching_drop(s, copy, None) {
+                return Some((at, drop.clone()));
             }
+            self.choose_drop(copy.drop_id.clone(), false);
+            progress.failed.push(format!(
+                "{} no longer matches the reviewed pair and was left in place",
+                copy.path
+            ));
         }
-        if !moved.is_empty() {
-            svc.event(Event::Removed(&moved));
-            v.s.removals += 1;
-            v.s.library.tracks.retain(|t| !moved.contains(&t.id()));
-            v.s.library_dirty = true;
-            v.s.listening_dirty |= merge;
-            v.s.rebuild();
-            v.s.queue_changed(v.player);
-            if swap {
-                v.s.load_current(v.player, v.st.playing, v.st.position);
-            }
-            v.scan.requested = true;
+        None
+    }
+    fn dispatch(&mut self, mut checked: Checked, mut progress: Progress, v: &mut View<'_>) {
+        if let Some((at, original_drop)) = self.next_pair(&checked, &mut progress, v.s) {
+            v.scan.recycling = true;
+            self.recycling = Some(Recycling {
+                active: checked.plan[at].clone(),
+                original_drop,
+                progress,
+                task: Task::run(self.ctx.as_ref().unwrap(), move |s| {
+                    let result = checked.recycle(at, |p| s.recycle(p));
+                    (checked, result.map_err(|e| e.to_string()))
+                }),
+            });
+            return;
         }
-        v.views.toast.set(match failed.first() {
-            _ if !merge => format!("{} moved to the Recycle Bin. The song list changed during the move, so their history and playlists were left alone.", copies(moved.len())),
-            Some(e) => format!(
-                "{} moved to the Recycle Bin; {} couldn't be: {e}",
-                copies(moved.len()),
-                failed.len()
+        v.scan.recycling = false;
+        v.scan.requested |= progress.moved > 0 || !progress.failed.is_empty();
+        let moved = copies(progress.moved);
+        let message = match progress.failed.first() {
+            Some(first) => format!(
+                "{moved} confirmed in the Recycle Bin. {} to review. {first}",
+                copies(progress.failed.len())
             ),
-            None => format!("{} moved to the Recycle Bin", copies(moved.len())),
+            None => format!("{moved} moved to the Recycle Bin"),
+        };
+        self.skipped = progress.failed;
+        v.views.toast.set(message);
+    }
+    fn finish_move(
+        &mut self,
+        copy: &CopyToMerge,
+        original_drop: &Track,
+        result: Result<(), String>,
+        progress: &mut Progress,
+        v: &mut View<'_>,
+    ) {
+        if let Err(error) = result {
+            self.choose_drop(copy.drop_id.clone(), false);
+            v.scan.reread_files(HashSet::from([copy.path.clone()]));
+            progress.failed.push(format!("{}: {error}", copy.path));
+            return;
+        }
+        // The keeper is still guarded and pair edits and scan application are serialized with
+        // this one move. History belongs to the checked IDs even if a scan saw the removal.
+        progress.moved += 1;
+        v.s.removals += 1;
+        if self.matching_drop(v.s, copy, Some(original_drop)).is_none() {
+            self.choose_drop(copy.drop_id.clone(), false);
+            progress.failed.push(format!(
+                "{} moved, but the pair changed. Its history was left in place.",
+                copy.path
+            ));
+            v.scan.reread_files(HashSet::from([copy.path.clone()]));
+            return;
+        }
+        let swap = merge_copy(
+            &mut v.s.state,
+            &mut v.s.listening,
+            copy,
+            Disposition::Recycled,
+            Local::now().timestamp_millis(),
+        )
+        .is_some();
+        let service = services::get();
+        service.event(Event::Merged {
+            from: &copy.drop_id,
+            to: &copy.keep_id,
         });
+        service.event(Event::Removed(std::slice::from_ref(&copy.drop_id)));
+        v.s.library.tracks.retain(|t| t.id() != copy.drop_id);
+        v.s.library_dirty = true;
+        v.s.listening_dirty = true;
+        v.s.rebuild();
+        v.s.queue_changed(v.player);
+        if swap {
+            v.s.load_current(v.player, v.st.playing, v.st.position);
+        }
     }
 }
 /// Once the files are in the Recycle Bin, the copies kept take over their likes, plays and playlist places, whichever
@@ -483,7 +617,7 @@ pub fn settle(v: &mut View<'_>) {
     if let Some((intent, checked)) = st.checked(v.s) {
         match intent {
             Intent::Ask => st.ask = true,
-            Intent::Recycle => st.recycle(checked, basis(v.s)),
+            Intent::Recycle => st.dispatch(checked, Progress::default(), v),
             Intent::Hide => {
                 State::merge_hidden(v.s, &checked.plan);
                 v.s.queue_changed(v.player);
@@ -500,12 +634,31 @@ pub fn settle(v: &mut View<'_>) {
     } else if st.awaiting_scan && !v.scan.requested && !v.scan.running() {
         st.awaiting_scan = false;
     }
-    if let Some((_, task)) = &st.recycling
-        && let Some(done) = task.poll()
+    if let Some(job) = &st.recycling
+        && let Some((checked, result)) = job.task.poll()
     {
-        let (revision, _) = st.recycling.take().unwrap();
-        st.recycled(revision, done, v);
+        let mut job = st.recycling.take().unwrap();
+        st.finish_move(
+            &job.active,
+            &job.original_drop,
+            result,
+            &mut job.progress,
+            v,
+        );
+        st.dispatch(checked, job.progress, v);
     }
+}
+/// Edit info and Swap names can still change other songs, including pending pairs.
+pub(crate) fn can_edit(id: &str) -> bool {
+    let st = state();
+    let busy = st
+        .recycling
+        .as_ref()
+        .is_some_and(|j| j.active.keep_id == id || j.active.drop_id == id);
+    if busy {
+        services::notice("This copy is being moved. Try the edit again when the move finishes.");
+    }
+    !busy
 }
 pub fn recycling() -> bool {
     let st = state();
@@ -529,6 +682,20 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     });
     if again {
         st.look(ui.ctx(), v.s);
+    }
+    if !st.skipped.is_empty() {
+        ui.collapsing(
+            format!("{} to review from the last move", copies(st.skipped.len())),
+            |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(140.)
+                    .show(ui, |ui| {
+                        for reason in &st.skipped {
+                            ui.label(reason);
+                        }
+                    });
+            },
+        );
     }
     if st.ask {
         let (n, bytes) = st.ticked();
@@ -981,17 +1148,8 @@ fn row(ui: &mut Ui, v: &mut View<'_>, st: &mut State, gi: usize, ci: usize) {
     match action {
         Some(0) if current => v.s.toggle(v.player),
         Some(0) => v.s.play_ids(v.player, &[id], 0, Value::Null),
-        Some(1) => {
-            st.keep[gi] = id;
-            st.tick(gi);
-        }
-        Some(2) if drop => {
-            st.drop.remove(&id);
-        }
-        Some(2) => {
-            st.unticked.remove(&id);
-            st.drop.insert(id);
-        }
+        Some(1) => st.choose_keep(gi, id),
+        Some(2) => st.choose_drop(id, !drop),
         Some(3) => {
             let path = PathBuf::from(&c.path);
             services::fire(ui.ctx(), move |s| s.reveal(&path));

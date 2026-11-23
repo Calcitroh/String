@@ -341,6 +341,31 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>, r: Rect) {
         menus::ctx_menu(json!({"kind":"pl","key":id}), at, None);
     }
     if let Some((id, ids)) = dropped {
-        menus::add_to_playlist(v, &id, &ids);
+        drop_songs(v, &id, &ids);
+    }
+}
+
+pub(crate) fn drop_songs(v: &mut View<'_>, playlist: &str, ids: &[String]) {
+    let live: Vec<_> = ids
+        .iter()
+        .filter(|id| v.s.models.by_id.contains_key(*id))
+        .cloned()
+        .collect();
+    if live.is_empty() {
+        v.views
+            .toast
+            .set("The dragged songs are no longer in the library.");
+    } else {
+        menus::add_to_playlist(v, playlist, &live);
+        if live.len() < ids.len()
+            && let Some((message, _)) = &mut v.views.toast.current
+        {
+            let missing = ids.len() - live.len();
+            if missing == 1 {
+                message.push_str(". One song is no longer in the library.");
+            } else {
+                message.push_str(&format!(". {missing} songs are no longer in the library."));
+            }
+        }
     }
 }
