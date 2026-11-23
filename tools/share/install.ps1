@@ -272,6 +272,16 @@ foreach ($dir in @($Menu, $Desktop)) {
     }
     catch { Say "(Windows didn't allow a shortcut in $dir; String works without it.)" }
 }
+# An update can bring a new icon, and Windows keeps drawing a program's old one (shortcuts, Start, the taskbar) until
+# it's told icons changed: the shell's "associations changed" notice, and Windows' own icon cache refresh. Neither
+# changes anything else; a pinned taskbar button's menu can still keep the old icon until Windows restarts.
+try {
+    Add-Type -Namespace StringSetup -Name Shell -MemberDefinition '[DllImport("shell32.dll")] public static extern void SHChangeNotify(int eventId, uint flags, System.IntPtr item1, System.IntPtr item2);'
+    [StringSetup.Shell]::SHChangeNotify(0x08000000, 0x1000, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+catch { }
+$refresh = Join-Path $env:WINDIR 'System32\ie4uinit.exe'
+if (Has $refresh) { try { Start-Process $refresh -ArgumentList '-show' -WindowStyle Hidden -Wait } catch { } }
 
 # Settings > Apps entry, so String can be uninstalled like any other program (never over another program's entry)
 $k = if (Has $AppsKey) { Get-ItemProperty -LiteralPath $AppsKey -ErrorAction SilentlyContinue } else { $null }
