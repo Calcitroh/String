@@ -127,6 +127,11 @@ impl Probe {
                 {
                     return Err("Card play opened the page or lost its album context".into());
                 }
+                if v.s.models.catalog.albums.first().map(|g| g.key.as_str())
+                    != v.s.state.queue.context(None)["key"].as_str()
+                {
+                    return Err("The first album card disagrees with the playback order".into());
+                }
                 self.selected_track = v.s.state.queue.current().map(str::to_owned);
                 self.click(Self::first_card_play(width));
             }
@@ -162,7 +167,7 @@ impl Probe {
                 {
                     return Err("Enter did not play the first search result".into());
                 }
-                v.s.set_field("albumSort", self.original_album_sort.clone());
+                super::albums::set_sort(v, self.original_album_sort.clone());
                 v.s.set_field("sort", self.original_sort.clone());
                 v.s.models.sort_songs(&v.s.state);
                 v.s.generation += 1;

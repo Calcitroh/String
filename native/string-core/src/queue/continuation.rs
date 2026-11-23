@@ -58,6 +58,19 @@ fn songs() -> Value {
     json!({"kind":"songs","key":"","name":"All songs"})
 }
 
+impl Catalog {
+    /// Early native profiles included the separator for a drive-root album directory.
+    pub fn resolve_album_key<'a>(&self, key: &'a str) -> &'a str {
+        if let Some((_, dir)) = key.rsplit_once('\u{1}')
+            && matches!(dir.as_bytes(), [drive, b':', b'\\' | b'/'] if drive.is_ascii_alphabetic())
+            && !self.albums.iter().any(|g| g.key == key)
+        {
+            return &key[..key.len() - 1];
+        }
+        key
+    }
+}
+
 impl Queue {
     fn next_index(&self, lib: &Catalog) -> Option<usize> {
         let ahead = self.ahead();
@@ -130,13 +143,14 @@ impl Queue {
         let mut rng = SmallRng::seed_from_u64(self.revision);
         let ctx = self.context(None);
         let kind = ctx["kind"].as_str().unwrap_or("");
+        let key = ctx["key"].as_str();
         let groups = match kind {
-            "album" => Some(&lib.albums),
-            "artist" => Some(&lib.artists),
+            "album" => Some((&lib.albums, key.map(|k| lib.resolve_album_key(k)))),
+            "artist" => Some((&lib.artists, key)),
             _ => None,
         };
-        if let Some(groups) = groups
-            && let Some(next) = self.pick_group(groups, ctx["key"].as_str(), lib, kind, &mut rng)
+        if let Some((groups, key)) = groups
+            && let Some(next) = self.pick_group(groups, key, lib, kind, &mut rng)
         {
             return Some(next);
         }

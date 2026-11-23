@@ -1,5 +1,5 @@
 use serde_json::Value;
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{cmp::Reverse, collections::HashMap, path::Path, sync::Arc};
 use string_core::{
     library::{Library, Track},
     queue::{Catalog, Group},
@@ -7,7 +7,10 @@ use string_core::{
 };
 use windows::Win32::Globalization::{NormalizationKD, NormalizeString};
 
+mod collation;
 pub type Ids = Arc<[String]>;
+#[cfg(test)]
+mod order_tests;
 pub fn norm(s: &str) -> String {
     let decomposed = if s.is_ascii() {
         s.into()
@@ -62,10 +65,33 @@ fn filename_title(name: &str) -> String {
             s = rest.trim();
         }
     }
-    s.replace('_', " ")
+    let title = s
+        .replace('_', " ")
         .split_whitespace()
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" ");
+    if title.is_empty() {
+        name.to_owned()
+    } else {
+        title
+    }
+}
+
+fn filename_number(name: &str) -> u32 {
+    let js_space = |c: char| c == '\u{feff}' || (c.is_whitespace() && c != '\u{85}');
+    let name = name.trim_start_matches(js_space);
+    let digits = name.bytes().take_while(u8::is_ascii_digit).count();
+    if !(1..=3).contains(&digits) {
+        return 0;
+    }
+    let tail = &name[digits..];
+    let rest = tail.trim_start_matches(js_space);
+    // The separator can be a literal space or punctuation after optional whitespace.
+    if tail[..tail.len() - rest.len()].contains(' ') || rest.starts_with(['-', '.', ')', '_']) {
+        name[..digits].parse().unwrap_or(0)
+    } else {
+        0
+    }
 }
 #[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 pub struct CoverSource {
@@ -93,8 +119,12 @@ pub struct Song {
     pub number: u32,
     pub disc: u32,
     search: String,
+    library_index: usize,
 }
 impl Song {
+    fn track_order(&self) -> u32 {
+        if self.number == 0 { 999 } else { self.number }
+    }
     pub fn matches(&self, normalized_terms: &str) -> bool {
         normalized_terms
             .split_whitespace()
@@ -127,14 +157,81 @@ pub struct Models {
     pub playlists: Vec<Playlist>,
     pub duration: f64,
     pub recent_songs: Vec<String>,
-    pub recent_albums: Vec<usize>,
+    pub album_info: HashMap<String, AlbumInfo>,
+    title_order: Vec<String>,
+    text_keys: HashMap<String, Box<[u8]>>,
+}
+pub struct AlbumInfo {
+    pub artist: String,
+    pub artist_key: String,
+    pub year: u32,
+    pub added: i64,
+    pub duration: f64,
+    pub first: usize,
+}
+
+impl AlbumInfo {
+    // The library's first credit wins a tie. Read it before sorting the tracks on the album.
+    fn from_group(
+        group: &Group,
+        songs: &HashMap<String, Song>,
+        lib: &Library,
+        state: &State,
+    ) -> Self {
+        let first = songs[&group.ids[0]].library_index;
+        let mut names = HashMap::new();
+        let mut year = 0;
+        let mut added = 0;
+        let mut duration = 0.;
+        let edits = state.fields.get("edits");
+        for id in &group.ids {
+            let song = &songs[id];
+            let original = &lib.tracks[song.library_index].tags.album_artist;
+            let edited = edits
+                .and_then(|e| e[id]["artist"].as_str())
+                .is_some_and(|a| !a.is_empty());
+            let credit = if edited || original.is_empty() {
+                &song.artist
+            } else {
+                original
+            };
+            if !credit.is_empty() {
+                names
+                    .entry(credit.as_str())
+                    .or_insert((0usize, Reverse(song.library_index)))
+                    .0 += 1;
+            }
+            year = year.max(song.year);
+            added = added.max(song.added);
+            duration += song.duration;
+        }
+        let primary = names
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .map_or("", |(&name, _)| name);
+        let artist = if names.len() > 2 && lib.tracks[first].tags.album_artist.is_empty() {
+            "Various artists"
+        } else if primary.is_empty() {
+            "Unknown artist"
+        } else {
+            primary
+        };
+        Self {
+            artist: artist.into(),
+            artist_key: norm(primary),
+            year,
+            added,
+            duration,
+            first,
+        }
+    }
 }
 pub struct Playlist {
     pub id: String,
     pub name: String,
     pub ids: Ids,
 }
-fn make(t: &Track, state: &State) -> Song {
+fn make(t: &Track, state: &State, library_index: usize) -> Song {
     let id = t.id();
     let e = state
         .fields
@@ -147,16 +244,14 @@ fn make(t: &Track, state: &State) -> Song {
             .unwrap_or(default)
             .to_owned()
     };
-    let path = Path::new(&t.path);
-    let raw_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let (dir, raw_name) = t.path.rsplit_once(['\\', '/']).unwrap_or(("", &t.path));
     let mut title = tag("title", &t.tags.title);
     if title.is_empty() {
-        title = filename_title(&raw_name)
+        title = filename_title(raw_name)
     }
     let artist = tag("artist", &t.tags.artist);
     let album = tag("album", &t.tags.album);
     let artist_key = norm(&artist);
-    let dir = path.parent().unwrap_or(Path::new("")).to_string_lossy();
     let album_key = if album.is_empty() {
         String::new()
     } else {
@@ -166,7 +261,7 @@ fn make(t: &Track, state: &State) -> Song {
             norm(if e["album"].as_str().is_some_and(|s| !s.is_empty()) {
                 &artist
             } else if t.tags.album_artist.is_empty() {
-                &dir
+                dir
             } else {
                 &t.tags.album_artist
             })
@@ -205,9 +300,14 @@ fn make(t: &Track, state: &State) -> Song {
         year: t.tags.year,
         duration: t.tags.duration,
         format: t.tags.format.to_uppercase(),
-        added: t.added.unwrap_or(t.mtime),
-        number: t.tags.track,
+        added: t.added.unwrap_or(0),
+        number: if t.tags.track == 0 {
+            filename_number(raw_name)
+        } else {
+            t.tags.track
+        },
         disc: t.tags.disc,
+        library_index,
     }
 }
 impl Models {
@@ -215,8 +315,9 @@ impl Models {
         let by_id: HashMap<_, _> = lib
             .tracks
             .iter()
-            .map(|t| {
-                let s = make(t, state);
+            .enumerate()
+            .map(|(i, t)| {
+                let s = make(t, state, i);
                 (s.id.clone(), s)
             })
             .collect();
@@ -244,92 +345,106 @@ impl Models {
                     .push(id.clone());
             }
         }
-        catalog
-            .songs
-            .sort_by_cached_key(|id| norm(&by_id[id].title));
-        for (map, out, album) in [
-            (albums, &mut catalog.albums, true),
-            (artists, &mut catalog.artists, false),
-        ] {
-            *out = map.into_values().collect();
-            out.sort_by_cached_key(|g| (norm(&g.name), g.key.clone()));
-            for g in out {
-                g.ids.sort_by_cached_key(|id| {
-                    let s = &by_id[id];
-                    (
-                        if album { String::new() } else { norm(&s.album) },
-                        s.disc,
-                        if s.number == 0 { 999 } else { s.number },
-                        norm(&s.title),
-                    )
-                });
-            }
+        let album_info: HashMap<_, _> = albums
+            .values()
+            .map(|g| (g.key.clone(), AlbumInfo::from_group(g, &by_id, lib, state)))
+            .collect();
+        let text_keys = collation::keys(
+            by_id
+                .values()
+                .flat_map(|s| [s.title.as_str(), s.artist.as_str(), s.album.as_str()])
+                .chain(album_info.values().map(|a| a.artist.as_str()))
+                .chain(["Unknown artist", "\u{ffff}"]),
+        );
+        catalog.albums = albums.into_values().collect();
+        for g in &mut catalog.albums {
+            g.ids.sort_by_cached_key(|id| {
+                let s = &by_id[id];
+                (s.disc, s.track_order(), &text_keys[&s.title])
+            });
         }
-        let mut recent_songs = catalog.songs.clone();
-        recent_songs.sort_by_key(|id| std::cmp::Reverse(by_id[id].added));
-        recent_songs.truncate(14);
-        let mut recent_albums: Vec<_> = (0..catalog.albums.len()).collect();
-        recent_albums.sort_by_cached_key(|&i| {
-            std::cmp::Reverse(
-                catalog.albums[i]
-                    .ids
-                    .iter()
-                    .map(|id| by_id[id].added)
-                    .max()
-                    .unwrap_or(0),
+        catalog.artists = artists.into_values().collect();
+        catalog.artists.sort_by_cached_key(|g| {
+            (
+                g.key.is_empty(),
+                &text_keys[&g.name],
+                by_id[&g.ids[0]].library_index,
             )
         });
-        recent_albums.truncate(14);
-        let songs = catalog.songs.clone().into();
+        for g in &mut catalog.artists {
+            g.ids.sort_by_cached_key(|id| {
+                let s = &by_id[id];
+                (&text_keys[&s.album], s.track_order(), &text_keys[&s.title])
+            });
+        }
+        catalog.songs.sort_by_cached_key(|id| {
+            let s = &by_id[id];
+            (&text_keys[&s.title], &text_keys[&s.artist])
+        });
+        let mut recent_songs = catalog.songs.clone();
+        recent_songs.sort_by_key(|id| Reverse(by_id[id].added));
+        recent_songs.truncate(14);
+        let title_order = catalog.songs.clone();
         let mut m = Self {
             by_id,
             catalog,
-            songs,
+            title_order,
+            text_keys,
             duration,
             recent_songs,
-            recent_albums,
+            album_info,
             ..Default::default()
         };
+        m.sort_albums(state);
         m.sort_songs(state);
         m.refresh_lists(state);
         m
     }
+    pub fn sort_albums(&mut self, state: &State) {
+        let mode = state.fields.get("albumSort").and_then(Value::as_str);
+        let keys = &self.text_keys;
+        self.catalog.albums.sort_by(|left, right| {
+            let a = &self.album_info[&left.key];
+            let b = &self.album_info[&right.key];
+            let by_name = || keys[&left.name].cmp(&keys[&right.name]);
+            match mode {
+                Some("recent") => b.added.cmp(&a.added),
+                Some("year") => b.year.cmp(&a.year).then_with(by_name),
+                Some("name") => by_name(),
+                _ => keys[&a.artist]
+                    .cmp(&keys[&b.artist])
+                    .then_with(|| a.year.cmp(&b.year))
+                    .then_with(by_name),
+            }
+            .then_with(|| a.first.cmp(&b.first))
+        });
+    }
     pub fn sort_songs(&mut self, state: &State) {
         let sort = state.fields.get("sort").unwrap_or(&Value::Null);
-        let key = sort["key"].as_str().unwrap_or("title");
-        let ordered_text = |s: &str| {
-            if s.is_empty() {
-                String::from("\u{ffff}")
-            } else {
-                norm(s)
+        // Every stable page sort starts from library order (title, then artist).
+        let ids = &mut self.catalog.songs;
+        ids.clone_from(&self.title_order);
+        let keys = &self.text_keys;
+        let missing_last = |name: &str| &keys[if name.is_empty() { "\u{ffff}" } else { name }];
+        match sort["key"].as_str() {
+            Some("artist") => ids.sort_by_cached_key(|id| {
+                let s = &self.by_id[id];
+                (missing_last(&s.artist), &keys[&s.album], s.track_order())
+            }),
+            Some("album") => ids.sort_by_cached_key(|id| {
+                let s = &self.by_id[id];
+                (missing_last(&s.album), s.disc, s.track_order())
+            }),
+            Some("added") => ids.sort_by_cached_key(|id| Reverse(self.by_id[id].added)),
+            Some("duration") => {
+                ids.sort_by(|a, b| self.by_id[a].duration.total_cmp(&self.by_id[b].duration))
             }
-        };
-        self.catalog.songs.sort_by_cached_key(|id| {
-            let s = &self.by_id[id];
-            let (text, n, disc, track) = match key {
-                "added" => (String::new(), i64::MAX.saturating_sub(s.added), 0, 0),
-                "duration" => (String::new(), (s.duration * 1000.) as i64, 0, 0),
-                "album" => (ordered_text(&s.album), 0, s.disc, s.number),
-                "artist" => (
-                    format!("{}\u{1}{}", ordered_text(&s.artist), ordered_text(&s.album)),
-                    0,
-                    s.disc,
-                    s.number,
-                ),
-                _ => (norm(&s.title), 0, 0, 0),
-            };
-            (
-                text,
-                n,
-                disc,
-                if track == 0 { 999 } else { track },
-                norm(&s.title),
-            )
-        });
-        if sort["dir"] == -1 {
-            self.catalog.songs.reverse();
+            _ => {}
         }
-        self.songs = self.catalog.songs.clone().into();
+        if sort["dir"].as_f64().is_some_and(|d| d < 0.) {
+            ids.reverse();
+        }
+        self.songs = ids.clone().into();
     }
     pub fn refresh_lists(&mut self, state: &State) {
         self.liked = self
@@ -400,7 +515,7 @@ impl Models {
             } else {
                 4
             };
-            (rank, title)
+            (rank, &self.text_keys[&s.title], s.library_index)
         });
         result.into()
     }
@@ -415,10 +530,10 @@ impl Models {
                 .map(|p| p.ids.clone())
                 .unwrap_or_default(),
             Some("album" | "artist") => {
-                let groups = if ctx["kind"] == "album" {
-                    &self.catalog.albums
+                let (groups, k) = if ctx["kind"] == "album" {
+                    (&self.catalog.albums, self.catalog.resolve_album_key(k))
                 } else {
-                    &self.catalog.artists
+                    (&self.catalog.artists, k)
                 };
                 groups
                     .iter()
