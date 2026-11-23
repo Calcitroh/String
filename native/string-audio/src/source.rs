@@ -18,17 +18,36 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use symphonia::core::packet::Packet;
 use symphonia::core::units::Timestamp;
 
 use crate::Error;
 use crate::mp4;
+use symphonia::core::formats::well_known::{FORMAT_ID_MKV, FORMAT_ID_MP3};
+
+#[cfg(windows)]
+mod media_foundation;
+mod mp3;
+
+#[cfg(test)]
+mod format_tests;
 
 /// How long a lossy decoder runs before a seek's target, so its output there is right again.
 /// Opus settles slowly (measured: 0.15 s still 1e-2 off, 0.35 s exact).
 const LOSSY_PREROLL_SECS: f64 = 0.1;
 const OPUS_PREROLL_SECS: f64 = 0.4;
 
-pub(crate) struct Source {
+pub(crate) enum Source {
+    Native(NativeSource),
+    #[cfg(windows)]
+    Windows(media_foundation::AacSource),
+}
+
+pub(crate) struct NativeSource {
+    corrected_mp3: bool,
+    mixed_mp3: Option<Box<mp3::Mixed>>,
+    // When an MP3 header describes only part of the stream, seek by the packets actually read.
+    packet_preroll: i64,
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
@@ -41,7 +60,7 @@ pub(crate) struct Source {
     delay: u64,
     /// The exact playable length, when the decoded stream runs on past it (MP4 padding).
     limit: Option<u64>,
-    /// The playable length (exact for most files; an estimate for MP3s without a header).
+    /// The playable length reported to the deck at open.
     frames: Option<u64>,
     /// Seconds decoded before a seek's target and dropped.
     preroll: f64,
@@ -79,22 +98,77 @@ fn err(path: &Path, what: impl std::fmt::Display) -> Error {
     Error::Open(format!("{}: {what}", path.display()))
 }
 
+fn probe(path: &Path) -> Result<Box<dyn FormatReader>, Error> {
+    let file = File::open(path).map_err(|e| err(path, e))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(|e| err(path, e))
+}
+
+// An open-ended container can signal its physical end either way. Damaged packets have
+// already advanced the reader and can be skipped without losing the rest of the song.
+fn next_packet(reader: &mut dyn FormatReader) -> Result<Option<Packet>, SymError> {
+    loop {
+        match reader.next_packet() {
+            Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(None);
+            }
+            Err(SymError::DecodeError(_)) => continue,
+            result => return result,
+        }
+    }
+}
+
+// Live WebM writers can omit Segment/Info/Duration. Only the last two audio packets need
+// decoding to get the end timestamp (Vorbis overlaps the preceding block).
+fn webm_end(
+    format: &mut dyn FormatReader,
+    decoder: &mut dyn AudioDecoder,
+    track_id: u32,
+    frames_at: impl Fn(u64) -> u64,
+) -> Result<Option<u64>, SymError> {
+    let (mut previous, mut last) = (None, None);
+    while let Some(packet) = next_packet(format)? {
+        if packet.track_id == track_id {
+            previous = last.replace(packet);
+        }
+    }
+    let Some(last) = last else { return Ok(None) };
+    if let Some(previous) = previous {
+        decoder.decode(&previous)?;
+    }
+    let count = decoder.decode(&last)?.frames() as u64;
+    decoder.reset();
+    Ok(Some(frames_at(last.pts.get().max(0) as u64) + count))
+}
+
 impl Source {
     pub fn open(path: &Path) -> Result<Source, Error> {
-        let file = File::open(path).map_err(|e| err(path, e))?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
-        let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
-        let format = symphonia::default::get_probe()
-            .probe(
-                &hint,
-                mss,
-                FormatOptions::default(),
-                MetadataOptions::default(),
-            )
-            .map_err(|e| err(path, e))?;
+        Self::open_using(
+            path,
+            #[cfg(windows)]
+            media_foundation::AacSource::open,
+        )
+    }
+
+    fn open_using(
+        path: &Path,
+        #[cfg(windows)] open_aac: fn(
+            &Path,
+            Option<f64>,
+        ) -> Result<media_foundation::AacSource, Error>,
+    ) -> Result<Self, Error> {
+        let mut format = probe(path)?;
         let track = format
             .default_track(TrackType::Audio)
             .ok_or_else(|| err(path, "no sound in this file"))?
@@ -107,11 +181,26 @@ impl Source {
             .clone();
         let rate = params
             .sample_rate
+            .filter(|&hz| hz != 0)
             .ok_or_else(|| err(path, "no sample rate"))?;
-        let channels = params.channels.clone();
-        let decoder = codecs()
-            .make_audio_decoder(&params, &AudioDecoderOptions::default().gapless(true))
-            .map_err(|e| err(path, e))?;
+        let decoder =
+            codecs().make_audio_decoder(&params, &AudioDecoderOptions::default().gapless(true));
+        #[cfg(windows)]
+        if params.codec == CODEC_ID_AAC {
+            if let Some(source) = media_foundation::AacSource::fallback(
+                path,
+                format.as_mut(),
+                rate,
+                decoder.as_deref().ok(),
+                open_aac,
+            )
+            .map_err(|e| err(path, e))?
+            {
+                return Ok(Source::Windows(source));
+            }
+        }
+        let mut decoder = decoder.map_err(|e| err(path, e))?;
+        let rate = decoder.codec_params().sample_rate.unwrap_or(rate);
         let tb = track
             .time_base
             .map(|t| (t.numer.get() as u64, t.denom.get() as u64))
@@ -133,7 +222,33 @@ impl Source {
         let mut frames = track
             .num_frames
             .or_else(|| track.duration.map(|d| ts_frames(d.get())));
-        if codec == CODEC_ID_OPUS {
+        let mut corrected_mp3 = false;
+        let mut mixed_mp3 = None;
+        if format.format_info().format == FORMAT_ID_MP3 {
+            let length = mp3::length(format.as_mut(), &track, rate).map_err(|e| err(path, e))?;
+            frames = Some(length.frames);
+            corrected_mp3 = length.corrected;
+            if length.mixed {
+                mixed_mp3 = Some(Box::new(mp3::Mixed::new(rate, track.delay.unwrap_or(0))));
+            }
+        }
+        if format.format_info().format == FORMAT_ID_MKV {
+            let media = format.media_info();
+            frames = frames.or_else(|| {
+                let tb = media.time_base?;
+                Some(
+                    (u128::from(media.duration?.get())
+                        * u128::from(tb.numer.get())
+                        * u128::from(rate)
+                        / u128::from(tb.denom.get())) as u64,
+                )
+            });
+            if frames.is_none() {
+                frames = webm_end(format.as_mut(), decoder.as_mut(), track.id, ts_frames)
+                    .map_err(|e| err(path, e))?;
+                format = probe(path)?;
+            }
+        } else if codec == CODEC_ID_OPUS {
             // the reader counts the pre-skip in its timestamps and in its length; the decoder
             // doesn't drop it
             delay = track.delay.unwrap_or(0) as u64;
@@ -149,8 +264,17 @@ impl Source {
                 frames = frames.map(|f| f.saturating_sub(delay));
             }
         }
-        let count = channels.as_ref().map(|c| c.count()).unwrap_or(2).max(1);
-        Ok(Source {
+        let channels = decoder
+            .codec_params()
+            .channels
+            .as_ref()
+            .or(params.channels.as_ref());
+        let count = channels.map(|c| c.count()).unwrap_or(2).max(1);
+        let downmix = Downmix::new(channels, count);
+        Ok(Source::Native(NativeSource {
+            corrected_mp3,
+            mixed_mp3,
+            packet_preroll: i64::MIN,
             format,
             decoder,
             track_id: track.id,
@@ -161,16 +285,42 @@ impl Source {
             limit,
             frames,
             preroll,
-            downmix: Downmix::new(channels.as_ref(), count),
+            downmix,
             cursor: None,
             skip_to: 0,
             pending: Vec::new(),
             pending_at: 0,
             scratch: Vec::new(),
             done: false,
-        })
+        }))
     }
 
+    pub fn info(&self) -> Info {
+        match self {
+            Self::Native(s) => s.info(),
+            #[cfg(windows)]
+            Self::Windows(s) => s.info,
+        }
+    }
+
+    pub fn read(&mut self, out: &mut Vec<f32>, max: usize) -> Result<usize, Error> {
+        match self {
+            Self::Native(s) => s.read(out, max),
+            #[cfg(windows)]
+            Self::Windows(s) => s.read(out, max),
+        }
+    }
+
+    pub fn seek(&mut self, frame: u64) -> Result<(), Error> {
+        match self {
+            Self::Native(s) => s.seek(frame),
+            #[cfg(windows)]
+            Self::Windows(s) => s.seek(frame),
+        }
+    }
+}
+
+impl NativeSource {
     pub fn info(&self) -> Info {
         Info {
             rate: self.rate,
@@ -224,6 +374,14 @@ impl Source {
             self.done = true;
             return Ok(());
         }
+        let ts = if let Some(mixed) = &mut self.mixed_mp3 {
+            mixed.rewind()
+        } else if self.corrected_mp3 {
+            self.packet_preroll = ts.saturating_sub(i64::from(self.rate) / 2);
+            0
+        } else {
+            ts
+        };
         match self.format.seek(
             SeekMode::Accurate,
             SeekTo::Timestamp {
@@ -251,13 +409,12 @@ impl Source {
 
     fn decode_next(&mut self) -> Result<(), Error> {
         loop {
-            let packet = match self.format.next_packet() {
+            let mut packet = match next_packet(self.format.as_mut()) {
                 Ok(Some(p)) => p,
                 Ok(None) => {
-                    self.done = true;
-                    return Ok(());
-                }
-                Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    if let Some(mixed) = &mut self.mixed_mp3 {
+                        mixed.finish(self.skip_to, &mut self.pending);
+                    }
                     self.done = true;
                     return Ok(());
                 }
@@ -266,11 +423,23 @@ impl Source {
                     self.done = true;
                     return Ok(());
                 }
-                Err(SymError::DecodeError(_)) => continue,
                 Err(e) => return Err(Error::Decode(e.to_string())),
             };
             if packet.track_id != self.track_id {
                 continue;
+            }
+            if self.corrected_mp3 {
+                if packet.pts.get() < self.packet_preroll {
+                    continue;
+                }
+                packet.trim_end = symphonia::core::units::Duration::ZERO;
+            }
+            if let Some(mixed) = &mut self.mixed_mp3 {
+                match mixed.packet(&packet, self.skip_to, &mut self.pending) {
+                    Ok(()) => return Ok(()),
+                    Err(SymError::DecodeError(_)) => continue,
+                    Err(e) => return Err(Error::Decode(e.to_string())),
+                }
             }
             let trim_start = self.ticks_to_frames(packet.trim_start.get() as i64).max(0) as usize;
             let trim_end = self.ticks_to_frames(packet.trim_end.get() as i64).max(0) as usize;
@@ -362,13 +531,18 @@ impl Downmix {
                 .collect(),
         };
         weights.resize(count, (0.0, 0.0));
-        // keep the loudest side from clipping
-        let left: f32 = weights.iter().map(|w| w.0).sum();
-        let right: f32 = weights.iter().map(|w| w.1).sum();
-        let norm = left.max(right).max(1.0);
-        for w in &mut weights {
-            w.0 /= norm;
-            w.1 /= norm;
+        // Browser 5.1 speaker mixing keeps the front channels at unity and drops LFE.
+        // Preserve the existing headroom for other layouts.
+        let standard_51 =
+            matches!(layout,Some(Channels::Positioned(p)) if matches!(p.bits(), 0x3f|0x60f));
+        if !standard_51 {
+            let left: f32 = weights.iter().map(|w| w.0).sum();
+            let right: f32 = weights.iter().map(|w| w.1).sum();
+            let norm = left.max(right).max(1.0);
+            for w in &mut weights {
+                w.0 /= norm;
+                w.1 /= norm;
+            }
         }
         Downmix {
             channels: count,
