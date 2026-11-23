@@ -402,8 +402,10 @@ impl Toast {
                 self.current = None;
                 return;
             }
+            // above everything else, the icon credit's card included: a toast may say a save failed
             egui::Area::new(Id::unique("toast"))
                 .anchor(Align2::CENTER_BOTTOM, [0., -BAR - 10.])
+                .order(egui::Order::Tooltip)
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(msg));
                 });
