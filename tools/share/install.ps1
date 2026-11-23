@@ -34,7 +34,7 @@ $old = "$To.old-$tag"
 $unzipAgain = 'String.zip did not unzip completely. Unzip it again (right-click it, Extract All) and run "Install String" from the new folder.'
 
 function Say([string]$text) { Write-Host "  $text" }
-function Fail([string]$text) { Write-Host ''; Write-Host "  $text" -ForegroundColor Yellow; Write-Host ''; exit 1 }
+function Fail([string]$text) { Close-Backups; Write-Host ''; Write-Host "  $text" -ForegroundColor Yellow; Write-Host ''; exit 1 }
 function Has([string]$path) { Test-Path -LiteralPath $path }
 function Under([string]$path, [string]$dir) { $path -and $path.StartsWith($dir + '\', [StringComparison]::OrdinalIgnoreCase) }
 function IsLink([string]$path) { (Has $path) -and ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) -ne 0 }
@@ -49,6 +49,56 @@ function NoLinks([string]$root, [string]$path) {
     if (IsLink $root) { return $false }
     for ($d = Split-Path $path -Parent; Under $d $root; $d = Split-Path $d -Parent) { if (IsLink $d) { return $false } }
     return $true
+}
+# A backup may be the last copy of an edited file. Check even the ancestors
+# outside the install folder, including a reparse point with a missing target.
+function Check-BackupPath([string]$path) {
+    while ($path) {
+        try {
+            if ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) { throw "$path is a folder link." }
+        } catch [IO.FileNotFoundException] { } catch [IO.DirectoryNotFoundException] { }
+        $path = [IO.Path]::GetDirectoryName($path)
+    }
+}
+$backupDirs = [Collections.Generic.Dictionary[string,IDisposable]]::new([StringComparer]::Ordinal)
+$backupFiles = [Collections.Generic.List[IDisposable]]::new()
+$savedHashes = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+function Close-Backups {
+    foreach ($file in $backupFiles) { $file.Dispose() }
+    $backupFiles.Clear()
+    foreach ($dir in $backupDirs.Values) { $dir.Dispose() }
+    $backupDirs.Clear()
+}
+# Pin from the root down. OPEN_REPARSE_POINT opens the directory itself;
+# denying write/delete sharing keeps it from being redirected after the check.
+function Pin-BackupDir([string]$dir) {
+    if ($backupDirs.ContainsKey($dir)) { return }
+    $parent = [IO.Path]::GetDirectoryName($dir)
+    if ($parent) {
+        Pin-BackupDir $parent
+        [void][IO.Directory]::CreateDirectory($dir)
+    }
+    $handle = [StringSetup.Backup]::CreateFileW($dir, 0x80, 1, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+    if ($handle.IsInvalid) { $handle.Dispose(); throw "Cannot secure the backup folder $dir." }
+    $backupDirs.Add($dir, $handle)
+    if ([IO.File]::GetAttributes($dir) -band [IO.FileAttributes]::ReparsePoint) { throw "$dir is a folder link." }
+}
+function Save-Backup([string]$source, [string]$dest) {
+    Pin-BackupDir ([IO.Path]::GetDirectoryName($dest))
+    $inputFile = [IO.File]::OpenRead($source)
+    try {
+        $copy = [IO.File]::Open($dest, 'CreateNew', 'ReadWrite', 'Read')
+        $backupFiles.Add($copy)
+        $inputFile.CopyTo($copy)
+        $copy.Flush($true)
+        $copy.Position = 0
+        $inputFile.Position = 0
+        $digest = [BitConverter]::ToString($sha.ComputeHash($copy)) -replace '-', ''
+        if ($digest -cne ([BitConverter]::ToString($sha.ComputeHash($inputFile)) -replace '-', '')) {
+            throw "Backup verification failed for $source."
+        }
+        return $digest
+    } finally { $inputFile.Dispose() }
 }
 # The entries of a folder's setup\files.txt: hash, size, relative path (cleaned up), full path; only paths inside the
 # folder. With -Strict (the unzipped copy), any odd line, an entry outside the folder, or a missing or wrong "#end"
@@ -112,6 +162,38 @@ function WebView2Version {
     return $null
 }
 
+function CheckNativeImports([string]$list) {
+    if (-not ('StringSetup.Loader' -as [type])) {
+        Add-Type -Namespace StringSetup -Name Loader -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+public static extern IntPtr LoadLibraryExW(string name, IntPtr file, uint flags);
+[DllImport("kernel32.dll", CharSet=CharSet.Ansi, ExactSpelling=true)]
+public static extern IntPtr GetProcAddress(IntPtr module, string name);
+[DllImport("kernel32.dll", EntryPoint="GetProcAddress", ExactSpelling=true)]
+public static extern IntPtr GetOrdinal(IntPtr module, IntPtr ordinal);
+[DllImport("kernel32.dll")] public static extern bool FreeLibrary(IntPtr module);
+'@
+    }
+    $rows = [IO.File]::ReadAllLines($list)
+    if (-not $rows.Count) { throw 'Missing list of Windows components.' }
+    foreach ($row in $rows) {
+        $parts = $row.Split(' ')
+        $dll = $parts[0]
+        if ($parts.Count -lt 2 -or $dll -notmatch '^[a-z0-9_-][a-z0-9_.-]*\.dll$') { throw 'Invalid list of Windows components.' }
+        # LOAD_LIBRARY_SEARCH_SYSTEM32 also resolves Windows API-set names.
+        $module = [StringSetup.Loader]::LoadLibraryExW($dll, [IntPtr]::Zero, 0x800)
+        if ($module -eq [IntPtr]::Zero) { throw "Windows could not load $dll." }
+        try {
+            foreach ($name in $parts[1..($parts.Count - 1)]) {
+                $proc = if ($name -match '^#([0-9]+)$') {
+                    [StringSetup.Loader]::GetOrdinal($module, [IntPtr][int]$Matches[1])
+                } else { [StringSetup.Loader]::GetProcAddress($module, $name) }
+                if ($proc -eq [IntPtr]::Zero) { throw "$dll is missing $name." }
+            }
+        } finally { [void][StringSetup.Loader]::FreeLibrary($module) }
+    }
+}
+
 Write-Host ''
 Say 'Installing String...'
 # The build is for x64 PCs. Windows 11 on ARM runs x64 programs; Windows 10 on ARM doesn't.
@@ -121,6 +203,7 @@ if ($arch -ne 'AMD64' -and -not ($arch -eq 'ARM64' -and $build -ge 22000)) { Fai
 if ($from -ieq $To -or (Under $from $To) -or (Under $To $from)) { Fail "Run the installer from the unzipped folder, not from $To." }
 if ((Has $To) -and -not (Has (Join-Path $To 'setup\files.txt')) -and [IO.Directory]::GetFileSystemEntries($To).Count) { Fail "$To already holds something that isn't String, so nothing was changed." }
 if (IsLink $To) { Fail "$To is a folder link, so nothing was changed." }
+try { Check-BackupPath "$To edits" } catch { Fail "$($_.Exception.Message) Nothing was changed." }
 
 Say 'Checking the unzipped files...'
 try {
@@ -136,6 +219,20 @@ try {
     if ($needsWebView -and -not ($files.Rel -like 'wwwroot\*')) { Fail $unzipAgain }
 }
 catch { Fail "$unzipAgain ($($_.Exception.Message))" }
+
+if (-not $needsWebView) {
+    if ($files.Rel -notcontains 'setup\imports.txt') { Fail $unzipAgain }
+    if (-not [Environment]::Is64BitProcess) {
+        # A 32-bit shell would check the 32-bit Windows DLLs.
+        $ps64 = Join-Path ([Environment]::GetFolderPath('Windows')) 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+        $options = @('-To', $To, '-Menu', $Menu, '-Desktop', $Desktop, '-AppsKey', $AppsKey)
+        if ($NoStart) { $options += '-NoStart' }
+        & $ps64 -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @options
+        exit $LASTEXITCODE
+    }
+    try { CheckNativeImports (Join-Path $from 'setup\imports.txt') }
+    catch { Fail "This Windows installation cannot load String $version. $($_.Exception.Message) Update Windows and try again. Your existing player has not been changed." }
+}
 
 # An open String saves and closes when asked (String.exe --quit); started directly, so Windows asks nothing.
 $running = Running
@@ -201,10 +298,16 @@ if ((Has $To) -and (Has (Join-Path $To 'setup\files.txt'))) {
         for ($n = 2; (Has $edits) -or (Has "$edits (the update's versions)"); $n++) { $edits = Join-Path "$To edits" "$stamp ($n)" }
         $theirs = "$edits (the update's versions)"
         try {
+            if (-not ('StringSetup.Backup' -as [type])) {
+                Add-Type -Namespace StringSetup -Name Backup -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string path, uint access, uint share,
+    IntPtr security, uint disposition, uint flags, IntPtr template);
+'@
+            }
             foreach ($rel in $mine) {
                 $dst = Join-Path $edits $rel
-                [void][IO.Directory]::CreateDirectory((Split-Path $dst -Parent))
-                [IO.File]::Copy((Join-Path $To $rel), $dst, $false)   # never over an earlier copy (another run at the same second stops here instead)
+                $savedHashes.Add($rel, (Save-Backup (Join-Path $To $rel) $dst))
             }
             foreach ($rel in $mine) {
                 $k = $rel.ToLower(); $was = $cur[$k]; $now = $next[$k]
@@ -215,8 +318,7 @@ if ((Has $To) -and (Has (Join-Path $To 'setup\files.txt'))) {
                 if ($updated -and -not ($was -and $lookTypes -contains [IO.Path]::GetExtension($rel).ToLower())) { $tookNew += $rel; continue }
                 if ($updated) {
                     $cmp = Join-Path $theirs $rel
-                    [void][IO.Directory]::CreateDirectory((Split-Path $cmp -Parent))
-                    [IO.File]::Copy($dst, $cmp, $false)
+                    [void](Save-Backup $dst $cmp)
                 }
                 [void][IO.Directory]::CreateDirectory((Split-Path $dst -Parent))
                 [IO.File]::Copy((Join-Path $To $rel), $dst, $true)
@@ -244,14 +346,13 @@ if (Has $old) {
     foreach ($rel in @(Walk $old $old)) {
         $p = Join-Path $old $rel; $k = $rel.ToLower()
         try {
+            if ((IsLink $p) -or -not (NoLinks $old $p)) { continue }
             $len = (New-Object IO.FileInfo $p).Length
             $was = $cur[$k]
             $go = $k -eq 'setup\files.txt' -or $k -eq 'setup\installed.txt' -or (Split-Path $k -Leaf) -in 'desktop.ini', 'thumbs.db'
             if (-not $go -and $was -and $len -eq $was.Size) { $go = (Sha256 $p) -eq $was.Hash }
-            if (-not $go -and $edits) {
-                $b = Join-Path $edits $rel
-                $go = [IO.File]::Exists($b) -and (New-Object IO.FileInfo $b).Length -eq $len -and (Sha256 $b) -eq (Sha256 $p)
-            }
+            # The verified backup and its parent directories are still held open.
+            if (-not $go -and $savedHashes.ContainsKey($rel)) { $go = (Sha256 $p) -ceq $savedHashes[$rel] }
             if ($go) { [IO.File]::SetAttributes($p, [IO.FileAttributes]::Normal); [IO.File]::Delete($p) }
         }
         catch { }
@@ -259,6 +360,7 @@ if (Has $old) {
     Remove-Empty $old
     if (Has $old) { Say "Some files of the copy you had weren't String's or in the saved copy, so they were left here: $old" }
 }
+Close-Backups
 if ($edits) {
     if ($keptMine.Count) { Say "Kept your own changes: $(Short $keptMine)" }
     if ($tookNew.Count) { Say "This update also changed $(Short $tookNew), so String uses its new version there. Yours is in the copy below." }

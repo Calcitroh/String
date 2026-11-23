@@ -130,6 +130,56 @@ pub struct Updater {
     #[cfg(any(test, feature = "test-feed"))]
     fixture: Option<String>,
 }
+
+// FILE_ID_INFO identifies a file on its volume, including on case-sensitive NTFS.
+#[repr(C)]
+#[derive(Default, PartialEq)]
+struct FileId {
+    volume: u64,
+    id: [u8; 16],
+}
+fn directory_id(path: &Path) -> Option<FileId> {
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            class: i32,
+            info: *mut FileId,
+            size: u32,
+        ) -> i32;
+    }
+    let file = fs::OpenOptions::new()
+        .access_mode(0x80) // FILE_READ_ATTRIBUTES
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS opens directories
+        .open(path)
+        .ok()?;
+    let mut info = FileId::default();
+    // The live file handle and writable buffer cover the entire FileIdInfo call.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            18,
+            &mut info,
+            size_of::<FileId>() as u32,
+        )
+    };
+    (ok != 0 && info.id != [0; 16]).then_some(info)
+}
+
+fn powershell_directory(path: &Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+    let Component::Prefix(prefix) = path.components().next()? else {
+        return None;
+    };
+    match prefix.kind() {
+        Prefix::VerbatimDisk(_) => Some(path.to_str()?.strip_prefix(r"\\?\")?.into()),
+        Prefix::VerbatimUNC(_, _) => Some(format!(r"\\{}", path.to_str()?.get(8..)?).into()),
+        Prefix::Disk(_) | Prefix::UNC(_, _) => Some(path.into()),
+        _ => None,
+    }
+}
+
 impl Updater {
     pub fn new(install: &Path, current: &str) -> io::Result<Self> {
         Ok(Self {
@@ -183,19 +233,20 @@ impl Updater {
         if !marked.is_absolute() {
             return None;
         }
+        // Only probe a marker naming the running executable's directory. Setup always
+        // receives the spelling derived from the executable, usable in PowerShell 5.1.
+        let to = powershell_directory(&self.install)?;
         let marked = std::path::absolute(marked).ok()?;
-        if crate::text::same_windows_path(&marked, &self.install) {
-            return Some(marked);
+        if !crate::text::same_windows_path(&powershell_directory(&marked)?, &to) {
+            return None;
         }
-        // A Windows launcher can give the executable a verbatim drive or UNC path.
-        // Compare the two spellings without accepting aliases to a different install.
-        let name = marked.to_str()?;
-        let verbatim = if let Some(share) = name.strip_prefix(r"\\") {
-            format!(r"\\?\UNC\{share}")
-        } else {
-            format!(r"\\?\{name}")
-        };
-        crate::text::same_windows_path(Path::new(&verbatim), &self.install).then_some(marked)
+        let running = directory_id(&self.install)?;
+        if directory_id(&marked)? != running
+            || (to != self.install && directory_id(&to)? != running)
+        {
+            return None;
+        }
+        Some(to)
     }
     fn get(&self, url: &str, within: Duration) -> Result<Response<Body>, ureq::Error> {
         #[cfg(any(test, feature = "test-feed"))]
