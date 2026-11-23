@@ -2253,7 +2253,7 @@
     setInterval(() => N.phone.sync(true), 5 * 60e3);
     if (S().roots.length || S().files.length) rescan();
     discordSync();
-    belt.ready.then(hello => { if (hello && hello.smoke) return; setTimeout(maybeCheckUpdates, 60e3); setInterval(maybeCheckUpdates, 6 * 3600e3); });
+    belt.ready.then(hello => { if (hello && hello.smoke) return; setTimeout(maybeCheckUpdates, 60e3); setInterval(maybeCheckUpdates, 6 * 3600e3); iconCredit(); });
     return true;
   })().catch(error => {
     const dialog = document.createElement('dialog');
@@ -2266,9 +2266,20 @@
     return false;
   });
 
+  /* A thank-you to the icon's maker: the first time String starts with this icon, a small card above the player bar,
+     until it's closed. set.iconCreditSeen is shared with String 2.0 (the same data), so it's shown once in either. */
+  function iconCredit() {
+    if (S().set.iconCreditSeen || document.querySelector('.credit-card')) return;
+    const card = document.createElement('div');
+    card.className = 'credit-card';
+    card.innerHTML = `<img src="logo.png" alt=""><span>Credits to Discord — awepollyon for the icon!</span><button class="icon-btn" title="Close">${icon('x')}</button>`;
+    card.querySelector('button').onclick = () => { S().set.iconCreditSeen = true; N.save(); card.remove(); };
+    document.body.appendChild(card);
+  }
+
   N.discord = D;
   N.snapshot = snapshot;
   N.mergeState = merge;
-  N.ui = { discordSync, go, back, fwd, render, route, openNP, closeNP, openQueue, closeQueue, trackMenu, ctxMenu, closeMenu, editInfo, newPlaylist, addToPlaylist, addRoots, addSongs, toggleLike, lists: () => lists, mmss, ctxIds, playCtx, deletePl, removeFromPlaylist, ask,
+  N.ui = { discordSync, go, back, fwd, render, route, openNP, closeNP, openQueue, closeQueue, trackMenu, ctxMenu, closeMenu, editInfo, newPlaylist, addToPlaylist, addRoots, addSongs, toggleLike, lists: () => lists, mmss, ctxIds, playCtx, deletePl, removeFromPlaylist, ask, iconCredit,
     h: { $, $$, esc, attr, plural, enc, pageTitle } };   // small helpers, for add-ons drawing pages of their own
 })();

@@ -587,6 +587,20 @@
       await belt.native.writeText(lookPaths.look + '\\look.css', '');
       check('look: emptying look.css brings String\'s look back', await waitFor(() => lookHi() === hiBefore, 5000), lookHi());
 
+      /* the icon's credit: a card the first time String starts with this icon (a self-test never shows it on its own);
+         closing it is remembered, in the setting String 2.0 shares */
+      check('credit: a self-test doesn\'t show it on its own', !document.querySelector('.credit-card'));
+      delete N.S.set.iconCreditSeen;
+      U.iconCredit();
+      const credit = document.querySelector('.credit-card');
+      const creditImg = credit && credit.querySelector('img');
+      check('credit: the card thanks the icon\'s maker, with the logo', !!credit && /Credits to Discord — awepollyon for the icon!/.test(credit.textContent) && await waitFor(() => creditImg.naturalWidth > 0, 3000));
+      await step('icon-credit', 600);
+      if (credit) credit.querySelector('button').click();
+      check('credit: closing it is remembered', !document.querySelector('.credit-card') && N.S.set.iconCreditSeen === true);
+      U.iconCredit();
+      check('credit: once closed it doesn\'t come back', !document.querySelector('.credit-card'));
+
       /* String's updates (src\Updater.cs) against a fake GitHub (tests\fake-github.js) with the test's own release key:
          never the real GitHub, and a test never starts an installer, it only unpacks the release */
       const fakeFeed = name => `http://127.0.0.1:47915/repos/${name}/releases/latest`;

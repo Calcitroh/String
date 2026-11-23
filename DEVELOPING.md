@@ -120,7 +120,10 @@ Dark and monochrome on purpose: contrast and weight do the work colour would do.
   `DataFolder` in `C:\Program Files\Navidrome\navidrome.ini`, else `C:\ProgramData\Navidrome\navidrome.db`): scrobbles
   joined to media_file and library, as full paths. `--navidrome-db <file>` (only with --smoke-test) points it at the
   database `tests\fake-navidrome.js` makes; a self-test never reads a real one.
-- `tools\make-icon.py`: draws `src\Assets\String.ico` / `.png` (Pillow).
+- The icon is String's logo, by awepollyon: `native\icon\logo.png`. `python native\icon\logo-to-icon.py` makes
+  `src\Assets\String.ico` / `.png`, String 2.0's copies and `src\wwwroot\logo.png` from it (Pillow). The first time
+  String starts with it, a card above the player bar credits its maker until closed (`iconCredit` in string.js;
+  `set.iconCreditSeen`, shared with String 2.0).
 
 Data: `%LOCALAPPDATA%\String\` (state.json, listening.json, library.json, presence.json, discord-covers.json,
 window.json, errors.log, lyrics\, translations\, tag-backup\, look\ (the person's own look), addons\, updates\,
@@ -249,8 +252,8 @@ at a time.
 - `string-platform`: Windows: one instance, media keys and taskbar buttons, Discord, files and the Recycle Bin,
   backups, the error log.
 - `string-app`: the window and every screen (egui and wgpu), and `String.exe`. `native\string-app\SCREENS.md` says how
-  the screens are put together. Its icon: `assets\String.ico` (and `.png` for the window), drawn by
-  `native\icon\make-icon.py` and built into the exe by `build.rs`.
+  the screens are put together. Its icon: `assets\String.ico` (and `.png` for the window and the icon's credit card,
+  `ui\credit.rs`), made by `native\icon\logo-to-icon.py` and built into the exe by `build.rs`.
 
 ```
 cd native
