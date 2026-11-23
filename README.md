@@ -1,72 +1,74 @@
 # String
 
-Your own songs, played like a streaming app. No ads, no accounts, no cloud: String plays the music files in the
-folders you pick, where they are, and doesn't change them. Dark and monochrome, for Windows 10 and 11.
+A dark, monochrome local music player for Windows 10 and 11. Plays your music files right where they sit, without
+changing them. No ads, no accounts, no cloud.
 
 > Before anything else, yes this is vibe coded. It also works! (hopefully)
 >
 > Icon's humanmade though, (DC - awepollyon) Thanks Bro <3
 
-- **Library:** Home, Songs, Albums, Artists, Liked, playlists and search. Songs, Liked and playlists have a filter box.
-  Add folders in Library (the gear at the top) or drop them on the window.
-- **Playing:** a queue (songs you add play first; drag songs onto the queue button) with a Recent tab, shuffle, repeat,
-  gapless or crossfaded songs, media keys, taskbar buttons, and Now Playing with a spinning record and a spectrum ring
-  that moves with the music. When a list ends, play goes on with the next album or more of your songs (Settings can
-  turn that off). Click a song's length to see the time left.
-- **Lyrics:** the lyrics button (or Y). Synced lyrics light up line by line; click a line to go there. They come from a
-  .lrc file next to the song, the song's own lyrics, or LRCLIB online (only if you say yes; each song is looked up once
-  and kept). **Translate** (or T) puts each line's translation under it, made on your PC by a model in
-  [Ollama](https://ollama.com): nothing leaves your computer.
-- **Loop:** right-click the seek bar: "Start the loop here", then "End the loop here". Each song remembers its loop
-  until you stop it (the chip by the seek bar, or \\).
-- **Stats:** how long you've listened today, this week, this month and this year, with your top artists and songs.
-  If your phone plays your library through [Navidrome](https://www.navidrome.org) on the same PC, those plays count too.
-- **Duplicates:** Library → Find duplicates lists songs you have more than once. Pick the copy to keep, then hide the
-  others in String or move them to the Recycle Bin (it asks first). The copy you keep takes over their likes, plays,
-  loops and playlist places.
-- **Your own look:** Library → Look → Open folder makes a `look.css` full of examples (colours, your own logo, a
-  background picture, a font). It loads after String's own look and updates never touch it.
-- **Discord:** "Listening to" with the song, the artist and a time bar. Set it up once in Library → Discord.
-- **Updates:** String checks for a newer version once a day and offers to install it (you can turn that off in
-  Library → Updates). Updates are signed: String only installs ones from this project.
+## Features
 
-Keys: Space play/pause · Ctrl+←/→ previous/next · ←/→ seek · Ctrl+↑/↓ volume · M mute · S shuffle · R repeat ·
-L like · Q queue · F Now Playing · Y lyrics · [ and ] loop start and end · \\ stop the loop · / search.
+- **Library:** Home, Songs, Albums, Artists, Liked, playlists, and search (Songs, Liked, and playlists also have a
+  filter box). Add folders from Library (the gear at the top) or drop them onto the window.
+- **Playing:** Queue (drag songs onto the queue button; queued songs play first), Recent tab, shuffle, repeat, gapless
+  or crossfade, media keys, and taskbar controls. Now Playing has a spinning record and a spectrum ring that moves with
+  the music. Keeps going with the next album or more of your songs when a list ends (can be turned off in Settings).
+  Click a song's length to see time left.
+- **Lyrics:** Hit `Y` or the lyrics button. Pulls from a `.lrc` file next to the song, embedded lyrics, or
+  [LRCLIB](https://lrclib.net) if you opt in (saved locally after the first lookup). Synced lines light up as they play
+  and you can click any line to jump there. Hit `T` to put a translation under each line, run locally through
+  [Ollama](https://ollama.com) so nothing leaves your PC.
+- **Loop:** Right-click the seek bar to set "Start the loop here" and "End the loop here". Each song remembers its loop
+  until you clear it (chip by the seek bar, or `\`).
+- **Stats:** Listening time for today, this week, this month, and this year, plus your top artists and songs. Plays
+  from your phone through [Navidrome](https://www.navidrome.org) on the same PC count too.
+- **Duplicates:** `Library → Find duplicates` catches tracks you have more than once. Pick the copy to keep and either
+  hide or Recycle Bin the rest (it asks first). Your likes, plays, loops, and playlist spots carry over to the one you
+  kept.
+- **Custom look:** `Library → Look → Open folder` creates a `look.css` with examples for colors, a custom logo, a
+  background image, and fonts. It loads on top of the default theme and updates won't touch it.
+- **Discord:** Shows "Listening to" with the song, artist, and time bar. Set it up once in `Library → Discord`.
+- **Updates:** Checks once a day for signed updates from this project and asks before installing (turn it off in
+  `Library → Updates`).
+
+Keys: `Space` play/pause · `Ctrl+←/→` prev/next · `←/→` seek · `Ctrl+↑/↓` volume · `M` mute · `S` shuffle · `R` repeat ·
+`L` like · `Q` queue · `F` Now Playing · `Y` lyrics · `T` translate · `[` and `]` loop start/end · `\` stop loop ·
+`/` search
 
 ## Install
 
-1. Download **String.zip** from the newest release on the [Releases](../../releases/latest) page.
-2. Right-click it, choose **Extract All...**, then **Extract**.
-3. Double-click **Install String** in the folder that opens.
+1. Download `String.zip` from the latest release on the [Releases](../../releases/latest) page.
+2. Right-click it → **Extract All...** → **Extract**.
+3. Double-click `Install String` in the folder that opens.
 
-Windows may warn you, because String isn't signed with a paid certificate: "More info", then "Run anyway". String
-installs for your Windows account only (no admin), with a Start menu and a desktop shortcut, and it uninstalls from
-Settings → Apps. "Read me first.txt" in the zip has the details, and "Phone setup.txt" shows how to listen on your phone.
+Windows will probably warn you since it isn't signed with a paid cert: click **More info**, then **Run anyway**.
+Installs for your Windows account only (no admin needed), adds Start menu and desktop shortcuts, and uninstalls from
+Settings → Apps. `Read me first.txt` in the zip has the details, and `Phone setup.txt` covers listening on your phone.
 
 ## String 2.0 preview
 
-String is being rebuilt as a native Windows program (written in Rust, in `native/`): the same player, using about half
-the memory and far less of the processor. A preview is on the [Releases](../../releases) page as a pre-release: unzip
-it and open String.exe. It opens your String library and leaves your installed String alone (installed copies never
-update to a preview). Your own look works in part: its tint, your logo and a background picture, not yet its colours
-or font. Not in it yet: add-ons, installing and updating.
+String is getting rebuilt as a native Windows app in Rust (`native/`). Same player, about half the RAM and way less CPU
+usage. There's a pre-release on the [Releases](../../releases) page: unzip it and open `String.exe`. It uses your
+existing String library without messing with your main install (installed copies never auto-update to previews). Not in
+yet: add-ons, custom CSS, installer, and auto-updates.
 
 ## What goes online
 
-Nothing about you, and only when you've turned the feature on:
+String doesn't upload your library or listening history. These features make online requests:
 
-- **Lyrics** (off until you say yes): the song's title, artist, album and length go to [LRCLIB](https://lrclib.net).
-- **Discord covers** (off until you turn them on): the song and artist name go to Apple's iTunes search, then Deezer's.
-- **Updates** (on; Library → Updates turns it off): once a day String asks GitHub for this project's newest release.
+- **Lyrics** (off until you say yes): sends song title, artist, album, and length to [LRCLIB](https://lrclib.net).
+- **Discord covers** (off until you turn it on): sends song and artist name to Apple's iTunes search, then Deezer as a
+  fallback.
+- **Updates** (on by default; disable in `Library → Updates`): checks GitHub once a day for the latest release.
 
-Your library, likes, playlists and stats stay on your PC, in `%LOCALAPPDATA%\String`, with a daily copy in
+Your library, likes, playlists, and stats stay on your PC in `%LOCALAPPDATA%\String`, with a daily backup in
 `Documents\String Backup`.
 
-## Add-ons
+## Add-ons & Building
 
-String can load add-ons: extra features someone gives you, in `%LOCALAPPDATA%\String\addons\<name>\`. They run as part
-of String, so only install add-ons from someone you trust. How they work: [DEVELOPING.md](DEVELOPING.md#add-ons).
+Drop add-ons into `%LOCALAPPDATA%\String\addons\<name>\`. They run as part of String, so only install ones from people
+you trust.
 
-## Building it yourself
-
-See [DEVELOPING.md](DEVELOPING.md). String is MIT-licensed: see [LICENSE](LICENSE).
+For [how add-ons work](DEVELOPING.md#add-ons) or building from source, check [DEVELOPING.md](DEVELOPING.md). String is
+MIT-licensed (see [LICENSE](LICENSE)).
