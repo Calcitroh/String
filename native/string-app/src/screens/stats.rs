@@ -17,8 +17,8 @@ use std::{
 use string_core::stats::{Listening, PeriodKind, PeriodKind::*, Unit};
 use windows::{
     Win32::Globalization::{
-        GetUserPreferredUILanguages, MUI_LANGUAGE_NAME, U_ZERO_ERROR, UCAL_DEFAULT,
-        UCAL_FIRST_DAY_OF_WEEK, ucal_close, ucal_getAttribute, ucal_open,
+        GetUserPreferredUILanguages, MUI_LANGUAGE_NAME, U_ZERO_ERROR, ULOC_FULLNAME_CAPACITY,
+        uloc_addLikelySubtags,
     },
     core::{PCSTR, PWSTR},
 };
@@ -73,34 +73,92 @@ fn week_start() -> Weekday {
     week_start_for_language(language.as_deref().unwrap_or("en-US"))
 }
 
-// Intl.Locale's week data comes from the language's territory, without regional-format overrides.
+// The web view uses CLDR week data. Windows ICU supplies the likely territory for a
+// language-only tag and decodes Unicode locale extensions, but its week table can be older.
 fn week_start_for_language(language: &str) -> Weekday {
-    let Ok(locale) = std::ffi::CString::new(language) else {
+    let Ok(input) = std::ffi::CString::new(language) else {
         return Weekday::Mon;
     };
     let mut status = U_ZERO_ERROR;
-    unsafe {
-        let cal = ucal_open(
-            std::ptr::null(),
-            0,
-            PCSTR(locale.as_ptr().cast()),
-            UCAL_DEFAULT,
+    let mut output = [0u8; ULOC_FULLNAME_CAPACITY as usize];
+    let len = unsafe {
+        uloc_addLikelySubtags(
+            PCSTR(input.as_ptr().cast()),
+            PCSTR(output.as_mut_ptr()),
+            output.len() as i32,
             &mut status,
-        );
-        if cal.is_null() {
-            return Weekday::Mon;
+        )
+    };
+    if status.0 > 0 || len < 0 || len as usize >= output.len() {
+        return Weekday::Mon;
+    }
+    let Ok(locale) = std::str::from_utf8(&output[..len as usize]) else {
+        return Weekday::Mon;
+    };
+    let (base, keywords) = locale.split_once('@').unwrap_or((locale, ""));
+    let keyword = |name: &str| {
+        keywords
+            .split(';')
+            .filter_map(|s| s.split_once('='))
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v)
+    };
+    if let Some(first) = keyword("fw")
+        .filter(|s| s.len() == 3)
+        .and_then(|s| s.parse::<Weekday>().ok())
+    {
+        return first;
+    }
+    if keyword("calendar") == Some("iso8601") {
+        return Weekday::Mon;
+    }
+
+    let is_region = |s: &str| {
+        (s.len() == 2 && s.bytes().all(|c| c.is_ascii_alphabetic()))
+            || (s.len() == 3 && s.bytes().all(|c| c.is_ascii_digit()))
+    };
+    let region = keyword("rg")
+        .and_then(|s| s.strip_suffix("zzzz"))
+        .filter(|s| is_region(s))
+        .or_else(|| {
+            language
+                .split('-')
+                .skip(1)
+                .take_while(|s| s.len() > 1)
+                .find(|s| is_region(s))
+        })
+        .or_else(|| {
+            base.rsplit_once('_')
+                .map(|(_, region)| region)
+                .filter(|s| is_region(s))
+        })
+        // Older Windows ICU leaves its Quechua name (quz) unexpanded. CLDR maps quz to qu-Latn-PE.
+        .unwrap_or(if base.split('_').next() == Some("quz") {
+            "PE"
+        } else {
+            "001"
+        });
+    // Non-Monday territories (including aliases), generated with Intl.Locale weekInfo,
+    // ICU 78.2 / CLDR 48, for und-AA through und-ZZ and und-000 through und-999.
+    match region.to_ascii_uppercase().as_str() {
+        "MV" | "462" => Weekday::Fri,
+        "AF" | "BH" | "DJ" | "DZ" | "EG" | "IQ" | "IR" | "JO" | "KW" | "LY" | "OM" | "QA"
+        | "SD" | "SY" | "004" | "012" | "048" | "262" | "364" | "368" | "400" | "414" | "434"
+        | "512" | "634" | "729" | "736" | "760" | "818" => Weekday::Sat,
+        "AG" | "AS" | "BD" | "BR" | "BS" | "BT" | "BU" | "BW" | "BZ" | "CA" | "CO" | "DM"
+        | "DO" | "ET" | "GT" | "GU" | "HK" | "HN" | "ID" | "IL" | "IN" | "IS" | "JM" | "JP"
+        | "JT" | "KE" | "KH" | "KR" | "LA" | "MH" | "MI" | "MM" | "MO" | "MT" | "MX" | "MZ"
+        | "NI" | "NP" | "NT" | "PA" | "PE" | "PH" | "PK" | "PR" | "PT" | "PU" | "PY" | "PZ"
+        | "RH" | "SA" | "SG" | "SV" | "TH" | "TT" | "TW" | "UM" | "US" | "VE" | "VI" | "WK"
+        | "WS" | "YD" | "YE" | "ZA" | "ZW" | "016" | "028" | "044" | "050" | "064" | "072"
+        | "076" | "084" | "104" | "116" | "124" | "158" | "170" | "212" | "214" | "222" | "230"
+        | "231" | "316" | "320" | "340" | "344" | "352" | "356" | "360" | "376" | "388" | "392"
+        | "404" | "410" | "418" | "446" | "470" | "484" | "508" | "524" | "536" | "558" | "581"
+        | "584" | "586" | "591" | "600" | "604" | "608" | "620" | "630" | "682" | "702" | "710"
+        | "716" | "720" | "764" | "780" | "840" | "850" | "862" | "882" | "886" | "887" => {
+            Weekday::Sun
         }
-        let first = ucal_getAttribute(cal.cast(), UCAL_FIRST_DAY_OF_WEEK);
-        ucal_close(cal);
-        match first {
-            1 => Weekday::Sun,
-            3 => Weekday::Tue,
-            4 => Weekday::Wed,
-            5 => Weekday::Thu,
-            6 => Weekday::Fri,
-            7 => Weekday::Sat,
-            _ => Weekday::Mon,
-        }
+        _ => Weekday::Mon,
     }
 }
 struct Bucket {
@@ -711,6 +769,24 @@ fn phone(ui: &mut Ui, v: &mut View<'_>, summary: &PhoneSummary) {
 #[cfg(test)]
 mod locale_tests {
     use super::*;
+    #[test]
+    fn week_uses_the_reference_territory_boundaries() {
+        let cases = [
+            ("is-IS", Weekday::Sun),
+            ("ar-AE", Weekday::Mon),
+            ("is", Weekday::Sun),
+            ("dv-MV", Weekday::Fri),
+            ("zh-Hant", Weekday::Sun),
+            ("quz", Weekday::Sun),
+            ("en-US-u-fw-mon", Weekday::Mon),
+            ("ar-AE-u-rg-uszzzz", Weekday::Sun),
+            ("ar-EG-u-ca-iso8601", Weekday::Mon),
+        ];
+        assert_eq!(
+            cases.map(|(tag, _)| week_start_for_language(tag)),
+            cases.map(|(_, day)| day)
+        );
+    }
     #[test]
     fn week_follows_the_display_language() {
         assert_eq!(week_start_for_language("en-GB"), Weekday::Mon);
