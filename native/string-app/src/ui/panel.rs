@@ -1,11 +1,14 @@
 //! The HUD kit for pages made of panels: headers, rows, switches, segments, buttons, fields and dialogs.
-use super::glyph;
+use super::{glow, glyph, gradient, text_glow};
 use crate::theme::*;
 use egui::{
     Align, Color32, Context, CornerRadius, Frame, Id, Key, Label, Layout, Margin, Rect, Response,
     RichText, Role, Sense, Shape, Stroke, StrokeKind, Ui, WidgetInfo, pos2, text::LayoutJob, vec2,
 };
 use std::sync::Arc;
+
+#[path = "settings_select.rs"]
+pub mod select;
 
 pub const INK: Color32 = Color32::from_rgb(5, 5, 6);
 pub fn white(opacity: f32) -> Color32 {
@@ -106,7 +109,7 @@ impl<'a> Btn<'a> {
         };
         let text = caps(ui, self.text, size, spacing);
         let lead = if self.icon.is_some() { icon + 9. } else { 0. };
-        let w = pad * 2. + lead + text.size().x - size * spacing;
+        let w = (pad * 2. + lead + text.size().x - size * spacing).min(ui.max_rect().width());
         let sense = if self.enabled {
             Sense::click()
         } else {
@@ -170,7 +173,7 @@ impl<'a> Btn<'a> {
                 ink,
             );
         }
-        p.galley(
+        p.with_clip_rect(r.intersect(ui.clip_rect())).galley(
             pos2(r.left() + pad + lead, r.center().y - text.size().y * 0.5),
             text,
             ink,
@@ -191,7 +194,7 @@ impl<'a> Btn<'a> {
 /// it, so a row of panels can share the tallest one's.
 pub fn panel<R>(ui: &mut Ui, min_height: f32, add: impl FnOnce(&mut Ui) -> R) -> (R, f32) {
     Frame::new()
-        .fill(Color32::from_rgb(7, 7, 9))
+        .fill(Color32::from_rgba_unmultiplied(7, 7, 9, 209))
         .stroke((1., HAIR2))
         .inner_margin(Margin::symmetric(22, 20))
         .show(ui, |ui| {
@@ -204,7 +207,7 @@ pub fn panel<R>(ui: &mut Ui, min_height: f32, add: impl FnOnce(&mut Ui) -> R) ->
                 inner.min,
                 vec2(inner.width(), min_height - 42.),
             ));
-            let r = ui.min_rect().expand2(vec2(21., 19.));
+            let r = ui.min_rect().expand2(vec2(22., 20.));
             let mut mesh = egui::Mesh::default();
             let low = r.top() + 120.0_f32.min(r.height());
             for (pt, c) in [
@@ -225,100 +228,142 @@ pub fn panel<R>(ui: &mut Ui, min_height: f32, add: impl FnOnce(&mut Ui) -> R) ->
 /// A panel's header: its name, a hairline, and a note at the right.
 pub fn panel_h(ui: &mut Ui, label: &str, note: &str, tint: Tint) {
     let name = caps(ui, label, 10.5, 0.2);
-    let note = line(ui, note, "Mono", 10.5, 0.06);
-    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 14.), Sense::hover());
+    let mut job = LayoutJob::simple_singleline(note.into(), font("Mono", 10.5), FAINT);
+    job.sections[0].format.extra_letter_spacing = 0.63;
+    job.sections[0].format.line_height = Some(10.5);
+    job.wrap.max_width = (ui.available_width() - name.size().x - 20.).max(1.);
+    job.halign = Align::Max;
+    let note = ui.painter().layout_job(job);
+    let (r, _) = ui.allocate_exact_size(
+        vec2(ui.available_width(), note.size().y.max(10.5)),
+        Sense::hover(),
+    );
     let p = ui
         .painter()
-        .with_clip_rect(r.expand(2.).intersect(ui.clip_rect()));
+        .with_clip_rect(r.expand2(vec2(0., 8.)).intersect(ui.clip_rect()));
     let y = r.center().y;
-    let from = r.left() + name.size().x + 2.;
+    let from = r.left() + name.size().x + 10.;
     let to = if note.size().x > 0. {
         (r.right() - note.size().x - 10.).max(from)
     } else {
         r.right()
     };
-    p.galley(pos2(r.left(), y - name.size().y * 0.5), name, tint.ink(1.));
-    if to > from + 8. {
-        p.line_segment(
-            [pos2(from, y), pos2(from + (to - from) * 0.6, y)],
-            (1., HAIR2),
+    let at = pos2(r.left(), y - name.size().y * 0.5);
+    p.add(text_glow(
+        name.mesh_bounds.translate(at.to_vec2()),
+        8.,
+        0.35,
+        tint,
+    ));
+    p.galley(at, name, tint.ink(1.));
+    if to > from {
+        gradient(
+            &p,
+            Rect::from_min_max(pos2(from, y), pos2(to, y + 1.)),
+            HAIR2,
+            Color32::TRANSPARENT,
+            true,
         );
-        p.line_segment([pos2(from + (to - from) * 0.6, y), pos2(to, y)], (1., HAIR));
     }
-    p.galley(
-        pos2(r.right() - note.size().x, y - note.size().y * 0.5),
-        note,
-        FAINT,
-    );
-    ui.add_space(10.);
+    p.galley(pos2(r.right(), y - note.size().y * 0.5), note, FAINT);
+    ui.add_space(16.);
 }
 /// A settings row: its name at the left, the control at the right.
 pub fn row<R>(ui: &mut Ui, label: &str, control: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.horizontal(|ui| {
-        ui.set_min_height(38.);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.add_space(10.);
-            let out = control(ui);
-            ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                ui.add_space(10.);
-                ui.add(Label::new(body(label)).selectable(false).wrap());
-            });
-            out
+    Frame::new()
+        .inner_margin(Margin::symmetric(10, 9))
+        .show(ui, |ui| {
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 20.),
+                Layout::right_to_left(Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.;
+                    let out = control(ui);
+                    ui.add_space(6.);
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(
+                            Label::new(
+                                RichText::new(label)
+                                    .font(font("UI", 13.5))
+                                    .line_height(Some(20.))
+                                    .color(TEXT),
+                            )
+                            .selectable(false)
+                            .wrap(),
+                        );
+                    });
+                    out
+                },
+            )
+            .inner
         })
         .inner
-    })
-    .inner
 }
 /// A settings row whose control is too wide to share a line with its name.
-pub fn row_below<R>(ui: &mut Ui, label: &str, control: impl FnOnce(&mut Ui) -> R) -> R {
-    ui.horizontal(|ui| {
-        ui.set_min_height(30.);
-        ui.add_space(10.);
-        ui.add(Label::new(body(label)).selectable(false));
-    });
-    ui.allocate_ui_with_layout(
-        vec2(ui.available_width(), 30.),
-        Layout::right_to_left(Align::Center),
-        |ui| {
-            ui.add_space(10.);
-            control(ui)
-        },
-    )
-    .inner
+pub fn segment_row<'a>(
+    ui: &mut Ui,
+    label: &str,
+    options: &[(&'a str, &str)],
+    current: &str,
+    tint: Tint,
+) -> Option<&'a str> {
+    let width = options
+        .iter()
+        .map(|(_, name)| caps(ui, name, 10.5, 0.12).size().x + 20.)
+        .sum::<f32>()
+        + 6.;
+    let label_width = line(ui, label, "UI", 13.5, 0.).size().x.min(120.);
+    if ui.available_width() >= width + label_width + 36. {
+        return row(ui, label, |ui| seg(ui, options, current, tint));
+    }
+    Frame::new()
+        .inner_margin(Margin::symmetric(10, 9))
+        .show(ui, |ui| {
+            ui.label(RichText::new(label).font(font("UI", 13.5)).color(TEXT));
+            ui.add_space(8.);
+            ui.allocate_ui_with_layout(
+                vec2(ui.available_width(), 30.),
+                Layout::right_to_left(Align::Center),
+                |ui| seg(ui, options, current, tint),
+            )
+            .inner
+        })
+        .inner
 }
 /// A row with a switch. True when the person flipped it.
 pub fn switch(ui: &mut Ui, label: &str, on: &mut bool, tint: Tint) -> bool {
-    let (r, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 36.), Sense::click());
+    let (r, mut resp) = ui.allocate_exact_size(vec2(ui.available_width(), 38.), Sense::click());
     if resp.clicked() {
         *on = !*on;
+        resp.mark_changed();
     }
     let state = *on;
     resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, state, label));
     let p = ui.painter().with_clip_rect(r.intersect(ui.clip_rect()));
-    if resp.hovered() {
+    if resp.hovered() || resp.has_focus() {
         p.rect_filled(r, 0, white(0.04));
     }
     p.text(
         pos2(r.left() + 10., r.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        font("UI", 14.),
+        font("UI", 13.5),
         SECONDARY,
     );
     let b = Rect::from_min_size(pos2(r.right() - 44., r.center().y - 8.), vec2(34., 16.));
-    let k = ui.ctx().animate_bool_with_time(resp.id, state, 0.16);
+    let k = ui.ctx().animate_bool_with_time(resp.id, state, 0.2);
     p.rect(
         b,
         0,
-        if state { tint.ink(0.14) } else { black(0.4) },
-        (1., if state { tint.ink(0.7) } else { HAIR3 }),
+        black(0.4).lerp_to_gamma(tint.ink(0.14), k),
+        (1., HAIR3.lerp_to_gamma(tint.ink(0.7), k)),
         StrokeKind::Inside,
     );
     let knob = Rect::from_min_size(pos2(b.left() + 3. + 18. * k, b.top() + 3.), vec2(10., 10.));
-    if state {
-        p.rect_filled(knob.expand(2.), 1, tint.ink(0.18));
+    if k > 0. {
+        glow(&p, knob, 0., 8., tint.ink(0.9 * k));
     }
-    p.rect_filled(knob, 0, if state { tint.ink(1.) } else { MUTED });
+    p.rect_filled(knob, 0, MUTED.lerp_to_gamma(tint.ink(1.), k));
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
 }
@@ -333,18 +378,22 @@ pub fn seg<'a>(
         .iter()
         .map(|(_, name)| caps(ui, name, 10.5, 0.12))
         .collect();
-    let w: f32 = texts.iter().map(|g| g.size().x + 19.).sum::<f32>() + 4.;
-    let (r, _) = ui.allocate_exact_size(vec2(w, 28.), Sense::hover());
+    let w: f32 = texts.iter().map(|g| g.size().x + 20.).sum::<f32>() + 6.;
+    let (r, _) = ui.allocate_exact_size(vec2(w, 30.), Sense::hover());
     ui.painter()
         .rect(r, 0, black(0.35), (1., HAIR2), StrokeKind::Inside);
     let mut picked = None;
-    let mut x = r.left() + 2.;
+    let mut x = r.left() + 3.;
     for ((key, name), text) in options.iter().zip(texts) {
-        let cell = Rect::from_min_size(pos2(x, r.top() + 2.), vec2(text.size().x + 19., 24.));
+        let cell = Rect::from_min_size(pos2(x, r.top() + 3.), vec2(text.size().x + 20., 24.));
         x = cell.right();
         let on = *key == current;
         // The name keeps two switches on one panel apart when they share a key (both have "mono").
-        let resp = ui.interact(cell, ui.scope_id().with(("seg", key, *name)), Sense::click());
+        let resp = ui.interact(
+            cell,
+            ui.scope_id().with(("seg", key, *name)),
+            Sense::click(),
+        );
         resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, on, *name));
         let p = ui.painter();
         if on {
@@ -358,7 +407,7 @@ pub fn seg<'a>(
         }
         let ink = if on {
             tint.ink(1.)
-        } else if resp.hovered() {
+        } else if resp.hovered() || resp.has_focus() {
             TEXT
         } else {
             MUTED
@@ -385,10 +434,10 @@ pub fn note(ui: &mut Ui, text: &str) {
             left: 10,
             right: 10,
             top: 0,
-            bottom: 8,
+            bottom: 12,
         })
         .show(ui, |ui| {
-            ui.add(Label::new(mono(text, 10.5).color(FAINT)).wrap());
+            ui.add(Label::new(mono(text, 10.5).line_height(Some(10.5)).color(FAINT)).wrap());
         });
 }
 /// Small print with a link at its end. True when the link was clicked.
@@ -422,20 +471,43 @@ pub fn empty_note(ui: &mut Ui, text: &str) {
 }
 /// A text box in the HUD look.
 pub fn field(ui: &mut Ui, text: &mut String, hint: &str, face: &str, width: f32) -> Response {
-    Frame::new()
-        .fill(black(0.5))
-        .stroke((1., HAIR2))
-        .inner_margin(Margin::symmetric(12, 9))
-        .show(ui, |ui| {
-            ui.add(
-                egui::TextEdit::singleline(text)
-                    .frame(Frame::NONE)
-                    .font(font(face, 13.5))
-                    .hint_text(RichText::new(hint).font(font(face, 13.5)).color(FAINT))
-                    .desired_width((width - 26.).max(40.)),
+    let response = ui.add(
+        egui::TextEdit::singleline(text)
+            .frame(
+                Frame::new()
+                    .fill(black(0.5))
+                    .inner_margin(Margin::symmetric(13, 0)),
             )
-        })
-        .inner
+            .font(font(face, 13.5))
+            .text_color(TEXT)
+            .hint_text(RichText::new(hint).font(font(face, 13.5)).color(FAINT))
+            .desired_width(width)
+            .min_size(vec2(0., 40.))
+            .align(egui::Align2::LEFT_CENTER),
+    );
+    let tint = super::tint(ui.ctx());
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.expand(1.5),
+            0,
+            (3., tint.ink(0.08)),
+            StrokeKind::Middle,
+        );
+    }
+    ui.painter().rect_stroke(
+        response.rect,
+        0,
+        (
+            1.,
+            if response.has_focus() {
+                tint.ink(0.6)
+            } else {
+                HAIR2
+            },
+        ),
+        StrokeKind::Inside,
+    );
+    response
 }
 /// A small label above a field.
 pub fn lbl(ui: &mut Ui, text: &str) {
@@ -445,20 +517,24 @@ pub fn lbl(ui: &mut Ui, text: &str) {
 }
 /// A number with its name above and a line below.
 pub fn kpi(ui: &mut Ui, width: f32, label: &str, value: &str, sub: &str, size: f32) {
-    let (r, _) = ui.allocate_exact_size(vec2(width, 96.), Sense::hover());
+    let (r, _) = ui.allocate_exact_size(vec2(width, 100.), Sense::hover());
     let p = ui.painter().with_clip_rect(r.intersect(ui.clip_rect()));
     p.rect(r, 0, white(0.02), (1., HAIR2), StrokeKind::Inside);
     let inner = r.shrink2(vec2(16., 15.));
     let name = caps(ui, label, 10.5, 0.2);
     p.galley(inner.min, name, FAINT);
     let clip = p.with_clip_rect(inner.intersect(p.clip_rect()));
-    clip.text(
-        pos2(inner.left(), inner.top() + 36.),
-        egui::Align2::LEFT_CENTER,
-        value,
-        font("Mono", size),
-        Color32::WHITE,
-    );
+    let mut job = LayoutJob::simple_singleline(value.into(), font("Mono", size), Color32::WHITE);
+    job.wrap = egui::text::TextWrapping::truncate_at_width(inner.width());
+    let text = clip.layout_job(job);
+    let at = pos2(inner.left(), inner.top() + 36. - text.size().y / 2.);
+    clip.add(text_glow(
+        text.mesh_bounds.translate(at.to_vec2()),
+        18.,
+        0.3,
+        super::tint(ui.ctx()),
+    ));
+    clip.galley(at, text, Color32::WHITE);
     clip.text(
         pos2(inner.left(), inner.bottom() - 6.),
         egui::Align2::LEFT_CENTER,
