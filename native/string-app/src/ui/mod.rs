@@ -335,6 +335,16 @@ pub fn seg(ui: &mut Ui, text: &str, selected: bool) -> Response {
 }
 pub fn rail(ui: &mut Ui, r: Rect, name: &str, frac: f32, t: Tint) -> (Response, Option<f32>) {
     let resp = ui.interact(r, ui.scope_id().with(name), Sense::click_and_drag());
+    let primary = egui::PointerButton::Primary;
+    let released = resp.clicked_by(primary) || resp.drag_stopped_by(primary);
+    let held = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down());
+    let value = if released || held {
+        ui.input(|i| i.pointer.interact_pos())
+            .map(|pt| ((pt.x - r.left()) / r.width().max(1.)).clamp(0., 1.))
+    } else {
+        None
+    };
+    let frac = value.unwrap_or(frac);
     resp.widget_info(|| {
         WidgetInfo::labeled(
             Role::Slider,
@@ -361,12 +371,6 @@ pub fn rail(ui: &mut Ui, r: Rect, name: &str, frac: f32, t: Tint) -> (Response, 
         glow(p, knob, 6., 12., t.ink(0.45));
         p.circle_filled(pos2(x, y), 6., t.ink(1.));
     }
-    let value = if resp.clicked() || resp.dragged() {
-        resp.interact_pointer_pos()
-            .map(|pt| ((pt.x - r.left()) / r.width().max(1.)).clamp(0., 1.))
-    } else {
-        None
-    };
     (resp, value)
 }
 pub fn sleeve(p: &Painter, r: Rect, art: Option<covers::Art>) {

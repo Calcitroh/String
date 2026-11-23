@@ -284,6 +284,7 @@ mod tests {
             position: 2.,
             duration: Some(80.),
             playing: true,
+            ..Default::default()
         };
         let clock = Clock { at, st, seek: 0 };
         assert!(!clock.changed(

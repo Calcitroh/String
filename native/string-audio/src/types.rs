@@ -31,7 +31,7 @@ impl Track {
 }
 
 /// A stretch of one song played over and over: from `start` seconds to `end` (or the song's
-/// end), as the JS player's loops. Shorter than half a second counts as no loop.
+/// end). A stretch shorter than one second counts as no loop.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LoopRange {
     pub start: f64,
@@ -129,6 +129,8 @@ pub struct Status {
     pub key: Option<u64>,
     /// Seconds into it.
     pub position: f64,
+    /// Cumulative seconds the mixer actually jumped back at loop boundaries.
+    pub loop_offset: f64,
     /// Its length, when known.
     pub duration: Option<f64>,
     pub playing: bool,

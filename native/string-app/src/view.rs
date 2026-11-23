@@ -138,9 +138,11 @@ impl View<'_> {
     pub fn volume(&mut self, n: f32) {
         let n = n.clamp(0., 1.);
         self.s.set_field("vol", n.into());
-        self.s.set_field("muted", false.into());
+        if n > 0. {
+            self.s.set_field("muted", false.into());
+        }
         self.player.set_volume(n);
-        self.player.set_muted(self.force_mute);
+        self.player.set_muted(self.force_mute || self.s.muted());
     }
     pub fn mute(&mut self) {
         let value = !self.s.muted();

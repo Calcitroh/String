@@ -31,6 +31,7 @@ pub struct Session {
     pub(crate) seek_position: f64,
     pub(crate) import_listens: Option<Vec<crate::integration::phone::Heard>>,
     active: u64,
+    active_failed: bool,
     sequence: u64,
     pending: Option<(u64, AdvancePlan)>,
     superseded: Option<u64>,
@@ -40,6 +41,8 @@ pub struct Session {
     was_playing: bool,
     last_key: Option<u64>,
     last_position: f64,
+    last_loop_offset: f64,
+    active_duration: Option<f64>,
     pub resync: bool,
     /// How many times song files were moved to the Recycle Bin: a scan that started before the last move found them
     /// still there, so its result is set aside and the scan runs again.
@@ -68,6 +71,7 @@ impl Session {
             seek_position: 0.,
             import_listens: None,
             active: 0,
+            active_failed: false,
             sequence: 0,
             pending: None,
             superseded: None,
@@ -77,6 +81,8 @@ impl Session {
             was_playing: false,
             last_key: None,
             last_position: 0.,
+            last_loop_offset: 0.,
+            active_duration: None,
             resync: false,
             removals: 0,
         }
@@ -92,7 +98,15 @@ impl Session {
         self.generation += 1;
     }
     pub fn current(&self) -> Option<&Song> {
+        if self.active_failed {
+            return None;
+        }
         self.models.by_id.get(self.state.queue.current()?)
+    }
+    pub fn bar_song(&self, status: Status) -> Option<&Song> {
+        (status.key == Some(self.active))
+            .then(|| self.current())
+            .flatten()
     }
     pub fn setting(&self, k: &str) -> &Value {
         self.state
@@ -125,22 +139,34 @@ impl Session {
     pub fn muted(&self) -> bool {
         self.field("muted").as_bool().unwrap_or(false)
     }
+    pub fn audible_volume(&self) -> f32 {
+        if self.muted() { 0. } else { self.volume() }
+    }
     pub fn loop_for(&self, id: &str) -> Option<LoopRange> {
+        let duration = if self.state.queue.current() == Some(id) {
+            self.active_duration
+        } else {
+            None
+        }
+        .or_else(|| self.models.by_id.get(id).map(|s| s.duration))
+        .filter(|d| *d > 0.);
+        self.saved_loop(id, duration)
+    }
+    fn saved_loop(&self, id: &str, duration: Option<f64>) -> Option<LoopRange> {
         let lp = &self.field("loops")[id];
-        (lp["a"].is_number() || lp["b"].is_number()).then(|| LoopRange {
-            start: lp["a"].as_f64().unwrap_or(0.),
-            end: lp["b"].as_f64(),
-        })
+        let (a, b) = (lp["a"].as_f64(), lp["b"].as_f64());
+        if a.is_none() && b.is_none() {
+            return None;
+        }
+        let limit = duration.unwrap_or(f64::INFINITY);
+        let start = a.unwrap_or(0.).clamp(0., limit);
+        let end = b.map(|t| t.clamp(0., limit));
+        (end.unwrap_or(limit) - start >= 1.).then_some(LoopRange { start, end })
     }
     fn opts(&self) -> PlaybackOptions {
         PlaybackOptions {
             autoplay: self.setting("autoplay").as_bool().unwrap_or(true),
-            looping: self
-                .state
-                .queue
-                .current()
-                .and_then(|id| self.loop_for(id))
-                .is_some(),
+            looping: self.current().and_then(|s| self.loop_for(&s.id)).is_some(),
         }
     }
     fn key(&mut self) -> u64 {
@@ -154,6 +180,8 @@ impl Session {
         self.pending = None;
         self.superseded = None;
         self.active = self.key();
+        self.active_failed = false;
+        self.active_duration = None;
         self.counted = false;
         self.was_playing = false;
         self.last_tick = Instant::now();
@@ -185,7 +213,8 @@ impl Session {
         }
     }
     pub fn toggle(&mut self, p: &Player) {
-        if p.status().playing {
+        let st = p.status();
+        if st.playing && self.bar_song(st).is_some() {
             p.pause()
         } else {
             self.resume(p)
@@ -198,23 +227,56 @@ impl Session {
             } else {
                 self.load_current(p, true, self.state.queue.pos())
             }
-        } else {
+        } else if !self.state.queue.items().is_empty() {
+            let queue = &mut self.state.queue;
+            let catalog = &self.models.catalog;
+            // Stay in the saved queue. Its successor also knows the Repeat All list boundaries.
+            let opts = PlaybackOptions {
+                autoplay: false,
+                looping: false,
+            };
+            let plan = queue.what_next(true, opts, catalog);
+            let started = if plan.action() == NextAction::Start {
+                queue.commit_next(plan, opts, catalog)
+            } else {
+                (0..queue.items().len()).any(|i| queue.jump(i, catalog))
+            };
+            if started {
+                self.state_dirty = true;
+                self.load_current(p, true, 0.);
+            }
+        } else if !self.models.songs.is_empty() {
             let ids = self.models.songs.clone();
+            self.state.queue.set_shuffle(true, &self.models.catalog);
             self.play_ids(
                 p,
                 &ids,
-                0,
+                -1,
                 json!({"kind":"songs","key":"","name":"All songs"}),
             );
         }
     }
     pub fn previous(&mut self, p: &Player) {
-        if self
-            .state
-            .queue
-            .previous(p.status().position, &self.models.catalog)
-            .is_some()
-        {
+        let at = self.state.queue.at();
+        let st = p.status();
+        let position = if st.key == Some(self.active) {
+            st.position
+        } else {
+            self.state.queue.pos()
+        };
+        self.state.queue.previous(position, &self.models.catalog);
+        // Repeat All can select this same place as a real previous song after wrapping.
+        let wrapped = position <= 3.5
+            && self.state.queue.repeat() == string_core::queue::Repeat::All
+            && self
+                .state
+                .queue
+                .current()
+                .and_then(|id| self.models.catalog.tracks.get(id))
+                .is_some_and(|song| !song.hidden && !song.unplayable);
+        if self.state.queue.at() == at && !wrapped {
+            self.seek(p, 0.);
+        } else {
             self.state_dirty = true;
             self.load_current(p, true, 0.)
         }
@@ -222,14 +284,23 @@ impl Session {
     pub fn next(&mut self, p: &Player) {
         let opts = self.opts();
         let plan = self.state.queue.what_next(true, opts, &self.models.catalog);
-        if plan.action() != NextAction::Stop
-            && self.state.commit_next(
-                plan,
-                opts,
-                &self.models.catalog,
-                Local::now().timestamp_millis(),
-            )
-        {
+        if self.state.queue.items().is_empty() {
+            return;
+        }
+        if plan.action() == NextAction::Stop {
+            p.pause();
+            self.seek(p, 0.);
+        } else if plan.action() == NextAction::Restart {
+            self.seek(p, 0.);
+            if !p.status().playing {
+                self.resume(p);
+            }
+        } else if self.state.commit_next(
+            plan,
+            opts,
+            &self.models.catalog,
+            Local::now().timestamp_millis(),
+        ) {
             self.state_dirty = true;
             self.load_current(p, true, 0.)
         }
@@ -282,27 +353,23 @@ impl Session {
         self.queue_changed(p);
     }
     pub fn set_loop(&mut self, p: &Player, point: Option<(bool, f64)>) {
-        let Some(id) = self.state.queue.current().map(str::to_owned) else {
+        let Some(song) = self.current() else {
             return;
         };
-        let mut lp = self.loop_for(&id).unwrap_or(LoopRange {
-            start: 0.,
-            end: None,
-        });
-        if let Some((start, at)) = point {
-            if start {
-                lp.start = at;
-                if lp.end.is_some_and(|b| b < at + 0.5) {
-                    lp.end = None
-                }
-            } else if at >= lp.start + 0.5 {
-                lp.end = Some(at)
-            } else {
-                self.notices
-                    .push_back("The loop end must follow its start.".into());
-                return;
-            }
+        let id = song.id.clone();
+        let st = p.status();
+        let duration = st
+            .duration
+            .filter(|_| st.key == Some(self.active))
+            .unwrap_or(song.duration);
+        if point.is_some() && duration <= 0. {
+            return;
         }
+        let previous = self.saved_loop(&id, Some(duration));
+        if point.is_none() && previous.is_none() {
+            return;
+        }
+        let lp = point.and_then(|(start, at)| edit_loop(previous, start, at, duration));
         let entry = self
             .state
             .fields
@@ -312,13 +379,21 @@ impl Session {
             *entry = json!({})
         }
         let obj = entry.as_object_mut().unwrap();
-        if point.is_some() {
-            obj.insert(id, json!({"a":lp.start,"b":lp.end}));
-            p.set_loop(Some(lp));
+        if let Some(lp) = lp {
+            let a = (lp.start > 0.).then_some(lp.start);
+            obj.insert(id, json!({"a":a,"b":lp.end}));
+            let start = crate::theme::time(lp.start);
+            let message = if let Some(end) = lp.end {
+                format!("Looping {start}–{}", crate::theme::time(end))
+            } else {
+                format!("Loop starts at {start}. Right-click where it should end.")
+            };
+            self.notices.push_back(message);
         } else {
             obj.remove(&id);
-            p.set_loop(None)
+            self.notices.push_back("Loop off".into());
         }
+        p.set_loop(lp);
         self.queue_changed(p);
     }
     pub fn tick(&mut self, st: Status, force: bool) {
@@ -326,18 +401,29 @@ impl Session {
         if !force && dt < 0.5 && self.was_playing == st.playing && self.last_key == st.key {
             return;
         }
-        let key_matches = st.key == Some(self.active);
+        let key_matches = st.key == Some(self.active) && !self.active_failed;
         if key_matches {
-            let heard = st.position - self.last_position;
+            self.active_duration = st.duration;
+            let rewound = st.loop_offset - self.last_loop_offset;
+            let heard = st.position - self.last_position + rewound;
             if self.was_playing
                 && heard > 0.
                 && heard <= dt + 0.15
-                && dt <= 30.
+                && (dt <= 30. || rewound > 0.)
                 && self.last_key == st.key
                 && let Some(s) = self.current()
             {
                 let track = CountedTrack(s.id.clone(), s.title.clone(), s.artist.clone());
-                self.heard(track, heard, Local::now().naive_local());
+                let now = Local::now().naive_local();
+                // A delayed tick can cover many real jumps. The listening document accepts
+                // local samples of up to 30 seconds apiece.
+                let mut remaining = heard;
+                while remaining > 30. {
+                    remaining -= 30.;
+                    let at = now - chrono::TimeDelta::milliseconds((remaining * 1000.) as i64);
+                    self.heard(track.clone(), 30., at);
+                }
+                self.heard(track, remaining, now);
             }
             if self.state.queue.pos() != st.position {
                 self.state.queue.seek(st.position);
@@ -371,6 +457,7 @@ impl Session {
         self.was_playing = key_matches && st.playing;
         self.last_key = st.key;
         self.last_position = st.position;
+        self.last_loop_offset = st.loop_offset;
     }
     pub fn add_playlist(&mut self, name: String, ids: &[String]) {
         let now = Local::now().timestamp_millis();
@@ -411,6 +498,40 @@ impl Session {
         }
     }
 }
+/// A missing endpoint follows the corresponding end of the song. Leave room for the end dip
+/// when choosing points, as the original player does.
+fn edit_loop(
+    previous: Option<LoopRange>,
+    start: bool,
+    at: f64,
+    duration: f64,
+) -> Option<LoopRange> {
+    if !at.is_finite() || duration < 1. {
+        return None;
+    }
+    let limit = (duration - 0.3).max(0.);
+    let at = at.clamp(0., limit);
+    let mut a = previous.map_or(0., |lp| lp.start.min(limit));
+    let mut b = previous.and_then(|lp| lp.end).map(|b| b.min(limit));
+    if start {
+        a = at
+    } else {
+        b = Some(at)
+    }
+    if let Some(end) = &mut b {
+        if *end < a {
+            std::mem::swap(&mut a, end);
+        }
+        if *end - a < 1. {
+            *end = (a + 1.).min(duration);
+            a = a.min(*end - 1.);
+        }
+    } else {
+        a = a.min((duration - 0.12 - 1.).max(0.));
+    }
+    (a > 0. || b.is_some()).then_some(LoopRange { start: a, end: b })
+}
+
 struct QueueHost {
     session: Shared,
     ctx: Context,
@@ -458,6 +579,8 @@ impl Host for QueueHost {
                         s.resync = true;
                     } else {
                         s.active = track.key;
+                        s.active_failed = false;
+                        s.active_duration = None;
                         s.counted = false;
                         s.last_tick = Instant::now();
                         s.state_dirty = true;
@@ -470,6 +593,10 @@ impl Host for QueueHost {
                 }
             }
             Event::Failed { track, error } => {
+                if track.key == s.active {
+                    s.active_failed = true;
+                    s.was_playing = false;
+                }
                 let id = string_core::library::track_id(&track.path.to_string_lossy());
                 s.failed.insert(id.clone());
                 if let Some(row) = s.models.catalog.tracks.get_mut(&id) {
@@ -481,6 +608,7 @@ impl Host for QueueHost {
                 ));
             }
             Event::Stopped => {
+                s.invalidate_plan();
                 s.state.queue.seek(0.);
                 s.state_dirty = true;
             }
@@ -513,4 +641,232 @@ pub fn open(session: &Shared, ctx: &Context, force_mute: bool) -> Player {
         s.load_current(&p, false, pos)
     }
     p
+}
+
+#[cfg(test)]
+mod player_tests {
+    use super::*;
+    use std::time::Duration;
+    use string_audio::OfflinePlayer;
+
+    struct SilentHost;
+    impl Host for SilentHost {
+        fn next_after(&mut self, _: &Track) -> Option<Track> {
+            None
+        }
+        fn event(&mut self, _: Event) {}
+    }
+    fn session(paths: &[&str]) -> Session {
+        let mut library = Library::default();
+        for path in paths {
+            library
+                .tracks
+                .push(serde_json::from_value(json!({"path":path,"duration":200})).unwrap());
+        }
+        Session::new(Default::default(), Default::default(), library)
+    }
+    fn muted_player() -> Player {
+        Player::new(
+            Config {
+                muted: true,
+                ..Default::default()
+            },
+            SilentHost,
+        )
+    }
+    fn select(s: &mut Session, ids: &[&str], at: isize) {
+        let ids: Vec<_> = ids.iter().map(|id| id.to_string()).collect();
+        assert!(s.state.queue.play_ids(
+            &ids,
+            at,
+            json!({"kind":"pl","key":"example"}),
+            &s.models.catalog
+        ));
+    }
+
+    #[test]
+    fn loop_keys_normalize_and_report_each_change() {
+        let mut s = session(&["a.wav"]);
+        select(&mut s, &["a.wav"], 0);
+        let p = muted_player();
+        s.set_loop(&p, Some((true, 0.)));
+        assert!(s.loop_for("a.wav").is_none());
+        for (start, at, a, b) in [
+            (true, 10., 10., None),
+            (false, 5., 5., Some(10.)),
+            (true, 30., 10., Some(30.)),
+            (false, 10.3, 10., Some(11.)),
+        ] {
+            s.notices.clear();
+            s.set_loop(&p, Some((start, at)));
+            assert_eq!(s.loop_for("a.wav"), Some(LoopRange { start: a, end: b }));
+            assert_eq!(s.notices.len(), 1);
+        }
+        s.set_loop(&p, None);
+        s.set_loop(&p, Some((true, 400.)));
+        assert!((s.loop_for("a.wav").unwrap().start - 198.88).abs() < 1e-8);
+        s.set_loop(&p, Some((false, 400.)));
+        let lp = s.loop_for("a.wav").unwrap();
+        assert!(lp.end.unwrap() <= 200. && lp.end.unwrap() - lp.start >= 1.);
+        s.set_loop(&p, None);
+        assert_eq!(s.notices.back().unwrap(), "Loop off");
+    }
+
+    #[test]
+    fn short_or_out_of_song_saved_loops_are_inactive() {
+        let mut s = session(&["a.wav"]);
+        select(&mut s, &["a.wav"], 0);
+        for entry in [
+            json!({"a":4,"b":4.9}),
+            json!({"a":199.5}),
+            json!({"a":201,"b":220}),
+        ] {
+            s.set_field("loops", json!({"a.wav":entry}));
+            assert!(s.track("a.wav", 1).unwrap().loop_range.is_none());
+            assert!(!s.opts().looping);
+        }
+    }
+
+    #[test]
+    fn play_without_current_preserves_the_list_and_shuffles_only_an_empty_queue() {
+        let mut s = session(&["a.wav", "b.wav", "c.wav"]);
+        let p = muted_player();
+        s.resume(&p);
+        assert!(s.state.queue.shuffled());
+        assert_eq!(s.state.queue.items().len(), 3);
+        for (at, missing, next) in [(0, "c.wav", "b.wav"), (1, "b.wav", "c.wav")] {
+            let mut s = session(&["a.wav", "b.wav", "c.wav"]);
+            select(&mut s, &["c.wav", "b.wav"], at);
+            let saved = serde_json::to_vec(&s.state).unwrap();
+            s.library.tracks.retain(|t| t.path != missing);
+            let mut restored = Session::new(
+                serde_json::from_slice(&saved).unwrap(),
+                s.listening,
+                s.library,
+            );
+            restored.resume(&p);
+            assert_eq!(restored.state.queue.current(), Some(next));
+            assert_eq!(restored.state.queue.items().len(), 2);
+            assert_eq!(restored.state.queue.context(None)["key"], "example");
+        }
+    }
+
+    #[test]
+    fn next_at_a_stopping_edge_rewinds_the_selected_song() {
+        let p = muted_player();
+        for mode in ["autoplay off", "repeat one", "loop"] {
+            let mut s = session(&["a.wav"]);
+            select(&mut s, &["a.wav"], 0);
+            match mode {
+                "autoplay off" => s.set_setting("autoplay", false.into()),
+                "repeat one" => s.state.queue.set_repeat(string_core::queue::Repeat::One),
+                _ => s.set_field("loops", json!({"a.wav":{"a":2,"b":4}})),
+            }
+            s.state.queue.seek(51.);
+            s.next(&p);
+            assert_eq!(s.state.queue.pos(), 0., "{mode}");
+            assert_eq!(s.state.queue.current(), Some("a.wav"));
+        }
+    }
+
+    #[test]
+    fn failed_selection_stops_showing_a_title_and_recovery_shows_the_confirmed_song() {
+        let mut s = session(&["a.wav", "b.wav", "c.wav"]);
+        select(&mut s, &["a.wav", "b.wav", "c.wav"], 0);
+        s.active = s.key();
+        let first = s.track("a.wav", s.active).unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let mut host = QueueHost {
+            session: shared.clone(),
+            ctx: Context::default(),
+        };
+        host.event(Event::Failed {
+            track: first.clone(),
+            error: "missing".into(),
+        });
+        assert!(shared.lock().unwrap().current().is_none());
+        let second = host.next_after(&first).unwrap();
+        host.event(Event::Failed {
+            track: second.clone(),
+            error: "missing".into(),
+        });
+        let third = host.next_after(&second).unwrap();
+        host.event(Event::Started { track: third });
+        assert_eq!(shared.lock().unwrap().current().unwrap().id, "c.wav");
+    }
+
+    #[test]
+    fn previous_after_the_threshold_keeps_the_play_and_its_count() {
+        let mut s = session(&["a.wav", "b.wav"]);
+        select(&mut s, &["a.wav", "b.wav"], 1);
+        s.state.queue.seek(35.);
+        s.counted = true;
+        let p = muted_player();
+        let key = s.active;
+        s.previous(&p);
+        assert_eq!(s.state.queue.current(), Some("b.wav"));
+        assert_eq!(s.state.queue.pos(), 0.);
+        assert_eq!(s.active, key);
+        assert!(s.counted);
+        assert!(!p.status().playing);
+        select(&mut s, &["b.wav"], 0);
+        s.state.queue.set_repeat(string_core::queue::Repeat::All);
+        s.previous(&p);
+        assert_ne!(
+            s.active, key,
+            "Repeat All selects the only song again near its start"
+        );
+    }
+
+    #[test]
+    fn five_missing_files_stop_with_no_song_in_the_bar() {
+        let paths = ["1.wav", "2.wav", "3.wav", "4.wav", "5.wav", "6.wav"];
+        let mut s = session(&paths);
+        select(&mut s, &paths, 0);
+        let first = s.track(paths[0], s.active).unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let host = QueueHost {
+            session: shared.clone(),
+            ctx: Context::default(),
+        };
+        let mut player = OfflinePlayer::new(48000, Config::default(), host);
+        player.play_track(first, 0.);
+        player.render_secs(0.1);
+        let s = shared.lock().unwrap();
+        assert_eq!(s.failed.len(), 5);
+        assert!(!player.status().playing);
+        assert!(s.current().is_none());
+    }
+
+    #[test]
+    fn one_second_loops_count_every_rendered_second_between_infrequent_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop.wav");
+        let mut wav = b"RIFF".to_vec();
+        let bytes = 8000_u32 * 4 * 2;
+        wav.extend((36 + bytes).to_le_bytes());
+        wav.extend(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
+        wav.extend(8000_u32.to_le_bytes());
+        wav.extend(16000_u32.to_le_bytes());
+        wav.extend(b"\x02\0\x10\0data");
+        wav.extend(bytes.to_le_bytes());
+        wav.resize(44 + bytes as usize, 0);
+        std::fs::write(&path, wav).unwrap();
+        let name = path.to_str().unwrap();
+        let id = string_core::library::track_id(name);
+        let mut s = session(&[name]);
+        select(&mut s, &[&id], 0);
+        s.set_field("loops", json!({&id:{"a":1,"b":2}}));
+        let mut p = OfflinePlayer::new(8000, Config::default(), SilentHost);
+        p.play_track(s.track(&id, s.active).unwrap(), 1.);
+        p.render_secs(0.1);
+        s.tick(p.status(), true);
+        for seconds in [0.5, 1., 2.25, 1.25, 32.] {
+            p.render_secs(seconds);
+            s.last_tick = Instant::now() - Duration::from_secs_f64(seconds);
+            s.tick(p.status(), true);
+        }
+        let heard: f64 = s.listening.days().values().map(|d| d.s).sum();
+        assert!((heard - 37.).abs() < 0.003, "heard {heard} of 37 seconds");
+    }
 }
