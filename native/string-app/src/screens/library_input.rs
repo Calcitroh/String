@@ -27,6 +27,7 @@ pub struct Probe {
     original_sort: serde_json::Value,
     original_album_sort: serde_json::Value,
     selected_track: Option<String>,
+    selected_key: Option<u64>,
 }
 impl Probe {
     fn send(&self, frames: impl IntoIterator<Item = Vec<Event>>) {
@@ -122,10 +123,15 @@ impl Probe {
                     self.step = 13;
                     return Ok(false);
                 }
+                if v.st.playing || v.s.bar_song(v.st).is_none() {
+                    return Ok(false);
+                }
                 self.click(Self::first_card_play(width));
             }
             10 => {
-                if !v.st.playing {
+                // The queue changes on the click. The audio callback can still publish
+                // the previous occurrence while the selected album is starting.
+                if !v.st.playing || v.s.bar_song(v.st).is_none() {
                     return Ok(false);
                 }
                 if v.views.history.current != Route::Albums
@@ -139,22 +145,27 @@ impl Probe {
                     return Err("The first album card disagrees with the playback order".into());
                 }
                 self.selected_track = v.s.state.queue.current().map(str::to_owned);
+                self.selected_key = v.st.key;
                 self.click(Self::first_card_play(width));
             }
             11 => {
-                if v.st.playing {
+                if v.st.playing || v.s.bar_song(v.st).is_none() {
                     return Ok(false);
                 }
-                if v.s.state.queue.current() != self.selected_track.as_deref() {
+                if v.s.state.queue.current() != self.selected_track.as_deref()
+                    || v.st.key != self.selected_key
+                {
                     return Err("Pause changed the active card's track".into());
                 }
                 self.click(Self::first_card_play(width));
             }
             12 => {
-                if !v.st.playing {
+                if !v.st.playing || v.s.bar_song(v.st).is_none() {
                     return Ok(false);
                 }
-                if v.s.state.queue.current() != self.selected_track.as_deref() {
+                if v.s.state.queue.current() != self.selected_track.as_deref()
+                    || v.st.key != self.selected_key
+                {
                     return Err("Resume restarted another song".into());
                 }
             }

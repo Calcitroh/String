@@ -46,6 +46,204 @@ impl Drop for Song {
     }
 }
 
+struct Queue(Track);
+impl Host for Queue {
+    fn next_after(&mut self, current: &Track) -> Option<Track> {
+        (current.key == 1).then(|| self.0.clone())
+    }
+    fn event(&mut self, _: Event) {}
+}
+
+#[test]
+fn blocked_preload_keeps_feeding_and_accepts_pause_and_next() {
+    check_blocked_open(false);
+    check_blocked_open(true);
+}
+
+fn check_blocked_open(skip_again: bool) {
+    use crate::source::Source;
+    use std::sync::mpsc;
+
+    let first = Song::new("playing");
+    let second = Song::new("blocked");
+    let next = Track::new(2, &second.0);
+    let position = Arc::new(Position::new());
+    let (a, ar) = deck::rings(8000);
+    let (b, br) = deck::rings(8000);
+    let (mut mixer, link) = Mixer::new(8000, [ar, br], Spectrum::new().shared, position.clone());
+    let mut engine = Engine::new(
+        Box::new(Queue(next.clone())),
+        Config::default(),
+        [a, b],
+        link,
+        position.clone(),
+    );
+    let (entered, opening) = mpsc::channel();
+    let (release, gate) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    engine.set_preload_opener(move |path| {
+        entered.send(()).unwrap();
+        gate.recv_timeout(Duration::from_secs(3))
+            .expect("source open blocked the engine until the deadline");
+        let result = Source::open(path);
+        finished.send(()).unwrap();
+        result
+    });
+    engine.command(Command::Play {
+        track: Track::new(1, &first.0),
+        from: 0.,
+        start: true,
+    });
+    let mut block = [0.; 1600];
+    mixer.render(&mut block, 0);
+    engine.pump();
+    opening.recv_timeout(Duration::from_secs(2)).unwrap();
+    // Consume more than the entire 1.5-second ring while the next open is held.
+    for _ in 0..20 {
+        engine.pump();
+        mixer.render(&mut block, 0);
+        assert!(block.iter().all(|sample| *sample > 0.1));
+    }
+    engine.command(Command::Pause);
+    for _ in 0..3 {
+        engine.pump();
+        mixer.render(&mut block, 0);
+    }
+    assert!(!engine::status(&position, None).playing);
+    assert!(block.iter().all(|sample| *sample == 0.));
+    // Next selects the very track being opened. Pause must still take effect
+    // before that selection completes, and the source must only be opened once.
+    engine.command(Command::Play {
+        track: next,
+        from: 0.,
+        start: true,
+    });
+    engine.command(Command::Pause);
+    engine.pump();
+    mixer.render(&mut block, 0);
+    assert_ne!(engine::status(&position, None).key, Some(2));
+    let expected = if skip_again {
+        engine.command(Command::Play {
+            track: Track::new(3, &first.0),
+            from: 0.,
+            start: true,
+        });
+        for _ in 0..3 {
+            engine.pump();
+            mixer.render(&mut block, 0);
+        }
+        assert_eq!(engine::status(&position, None).key, Some(3));
+        assert!(block.iter().all(|sample| *sample > 0.1));
+        3
+    } else {
+        2
+    };
+    release.send(()).unwrap();
+    done.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        engine.pump();
+        mixer.render(&mut block, 0);
+        if engine::status(&position, None).key == Some(expected) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Next never selected the prepared track"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(engine::status(&position, None).playing, skip_again);
+    assert!(opening.try_recv().is_err());
+}
+
+#[test]
+fn late_preload_plays_the_resampled_tail_and_can_be_superseded() {
+    use std::sync::mpsc;
+    struct Editable(Arc<Mutex<Track>>);
+    impl Host for Editable {
+        fn next_after(&mut self, current: &Track) -> Option<Track> {
+            (current.key == 1).then(|| self.0.lock().unwrap().clone())
+        }
+        fn event(&mut self, _: Event) {}
+    }
+    let first = Song::new("resampled-tail");
+    let second = Song::new("late");
+    let position = Arc::new(Position::new());
+    let (a, ar) = deck::rings(16000);
+    let (b, br) = deck::rings(16000);
+    let (mut mixer, link) = Mixer::new(16000, [ar, br], Spectrum::new().shared, position.clone());
+    let wanted = Arc::new(Mutex::new(Track::new(2, &second.0)));
+    let mut engine = Engine::new(
+        Box::new(Editable(wanted.clone())),
+        Config::default(),
+        [a, b],
+        link,
+        position.clone(),
+    );
+    let (release, gate) = mpsc::channel();
+    let (finished, done) = mpsc::channel();
+    let (entered, opening) = mpsc::channel();
+    let blocked_path = second.0.clone();
+    engine.set_preload_opener(move |path| {
+        if path == blocked_path {
+            entered.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(3)).unwrap();
+            finished.send(()).unwrap();
+        }
+        crate::source::Source::open(path)
+    });
+    let track = Track::new(1, &first.0);
+    let mut reference =
+        crate::OfflinePlayer::new(16000, Config::default(), HostEvents(Default::default()));
+    reference.play_track(track.clone(), 0.);
+    let expected = reference.render_secs(4.);
+    engine.command(Command::Play {
+        track,
+        from: 0.,
+        start: true,
+    });
+    for (i, samples) in expected.chunks(320).enumerate() {
+        engine.pump();
+        let mut block = [0.; 320];
+        mixer.render(&mut block, 0);
+        assert!(
+            samples == block,
+            "lost the playing song's tail at block {i}"
+        );
+        if i == 0 {
+            engine.pump();
+            opening.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    }
+    // Let even the resampler's ringing drain. Queue changes at this point still
+    // belong to the outgoing song until the replacement actually starts.
+    for _ in 0..20 {
+        engine.pump();
+        mixer.render(&mut [0.; 320], 0);
+    }
+    engine.pump();
+    assert_eq!(engine::status(&position, None).key, None);
+    *wanted.lock().unwrap() = Track::new(3, &first.0);
+    engine.command(Command::QueueChanged);
+    release.send(()).unwrap();
+    done.recv_timeout(Duration::from_secs(2)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while engine::status(&position, None).key != Some(3) {
+        engine.pump();
+        mixer.render(&mut [0.; 320], 0);
+        assert_ne!(
+            engine::status(&position, None).key,
+            Some(2),
+            "played a superseded queue entry"
+        );
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let st = engine::status(&position, None);
+    assert!(st.playing && st.key == Some(3));
+}
+
 #[test]
 fn loss_retries_freezes_time_and_restores_playing_or_paused_at_the_new_rate() {
     let epoch = Instant::now();

@@ -104,7 +104,8 @@ fn ready(v: &mut View<'_>) -> bool {
     let previous = p.sent.checked_sub(1).map(|i| STEPS[i]);
     let (index, playing) = previous.map_or((0, true), |(_, i, on)| (i, on));
     let changed_track = p.sent == 0 || (p.sent >= 2 && STEPS[p.sent - 2].1 != index);
-    let confirmed = v.st.key.is_some()
+    // A third key can still be in flight after rapid Next and Previous commands.
+    let confirmed = v.s.bar_song(v.st).is_some()
         && (v.st.key != p.prior_key) == changed_track
         && v.st.playing == playing
         && v.s.state.queue.at() == Some(index)
