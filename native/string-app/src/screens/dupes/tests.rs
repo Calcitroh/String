@@ -36,29 +36,65 @@ struct Fixture {
 }
 impl Fixture {
     fn with_view(&mut self, action: impl FnOnce(&mut State, &mut View<'_>)) {
-        use string_platform::{errors_log::ErrorLog, instance::{self, Claim, Names}};
+        use string_platform::{
+            errors_log::ErrorLog,
+            instance::{self, Claim, Names},
+        };
         struct Quiet;
         impl string_audio::Host for Quiet {
-            fn next_after(&mut self, _: &string_audio::Track) -> Option<string_audio::Track> { None }
+            fn next_after(&mut self, _: &string_audio::Track) -> Option<string_audio::Track> {
+                None
+            }
             fn event(&mut self, _: string_audio::Event) {}
         }
         let args = crate::Args {
-            root: self._dir.path().into(), explicit: true, smoke: Some(self._dir.path().into()),
-            quit: false, add: None, playlist: None,
+            root: self._dir.path().into(),
+            explicit: true,
+            smoke: Some(self._dir.path().into()),
+            quit: false,
+            add: None,
+            playlist: None,
         };
-        let Claim::First(instance) = instance::claim_quietly(&Names::custom(&format!("StringCopiesTest{:x}", rand::random::<u64>()))).unwrap() else { panic!() };
+        let Claim::First(instance) = instance::claim_quietly(&Names::custom(&format!(
+            "StringCopiesTest{:x}",
+            rand::random::<u64>()
+        )))
+        .unwrap() else {
+            panic!()
+        };
         let adds = crate::add_work::Adds::new().unwrap();
-        action(&mut self.page, &mut View {
-            adds: &adds.input,
-            platform: &mut crate::platform::Platform::new(instance, &args, std::sync::Arc::new(ErrorLog::new(self._dir.path()))),
-            s: &mut self.session,
-            player: &string_audio::Player::new(string_audio::Config { muted: true, ..Default::default() }, Quiet),
-            st: Default::default(), views: &mut Default::default(), covers: &mut ui::covers::CoverCache::new(&self.ctx),
-            viz: &Default::default(), scan: &mut Default::default(), tint: Tint::Mono, mono: true, force_mute: true,
-        });
+        action(
+            &mut self.page,
+            &mut View {
+                adds: &adds.input,
+                platform: &mut crate::platform::Platform::new(
+                    instance,
+                    &args,
+                    std::sync::Arc::new(ErrorLog::new(self._dir.path())),
+                ),
+                s: &mut self.session,
+                player: &string_audio::Player::new(
+                    string_audio::Config {
+                        muted: true,
+                        ..Default::default()
+                    },
+                    Quiet,
+                ),
+                st: Default::default(),
+                views: &mut Default::default(),
+                covers: &mut ui::covers::CoverCache::new(&self.ctx),
+                viz: &Default::default(),
+                scan: &mut Default::default(),
+                tint: Tint::Mono,
+                mono: true,
+                force_mute: true,
+            },
+        );
     }
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::in_dir(tempfile::tempdir().unwrap())
+    }
+    fn in_dir(dir: tempfile::TempDir) -> Self {
         let mut library = Library::default();
         for (i, name) in ["a.wav", "b.wav", "c.wav", "d.wav"].iter().enumerate() {
             let path = dir.path().join(name);
@@ -331,16 +367,23 @@ fn twelve_thousand_songs_reuse_the_completed_look_on_idle_frames() {
 fn confirmed_batch_moves_only_validated_files_and_guards_the_keeper() {
     let mut f = Fixture::new();
     assert!(f.act(Intent::Ask).is_some());
-    let checked = f.act(Intent::Recycle).unwrap();
+    let mut checked = f.act(Intent::Recycle).unwrap();
     let keeper = std::path::Path::new(&f.session.library.tracks[0].path);
     let bin = f._dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
-    let moved = checked.recycle(|path| {
-        assert!(fs::OpenOptions::new().write(true).open(path).is_err());
-        assert!(fs::rename(keeper, bin.join("keeper")).is_err());
-        fs::rename(path, bin.join(path.file_name().unwrap()))
-    });
-    assert!(moved.outcomes.iter().all(Result::is_ok));
+    for index in 0..checked.plan.len() {
+        checked
+            .move_one(
+                index,
+                |path| {
+                    assert!(fs::OpenOptions::new().write(true).open(path).is_err());
+                    assert!(fs::rename(keeper, bin.join("keeper")).is_err());
+                    fs::rename(path, bin.join(path.file_name().unwrap()))
+                },
+                |path| path.parent().unwrap().ends_with("bin"),
+            )
+            .unwrap();
+    }
     assert_eq!(fs::read_dir(bin).unwrap().count(), 2);
     assert!(keeper.is_file());
 }
@@ -394,7 +437,12 @@ fn review_replacement_before_look_cannot_inherit_cached_tags() {
     let modified = fs::metadata(&path).unwrap().modified().unwrap();
     let other = f._dir.path().join("restored.wav");
     fs::write(&other, recording(b"Else", 8000)).unwrap();
-    fs::File::options().write(true).open(&other).unwrap().set_modified(modified).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&other)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
     fs::rename(other, &path).unwrap();
     f.page = State::default();
     f.refresh();
@@ -407,69 +455,249 @@ fn review_replacement_before_look_cannot_inherit_cached_tags() {
 #[test]
 fn review_shell_success_for_a_substituted_file_must_not_authorize_a_merge() {
     let mut f = Fixture::new();
+    let history = f.history();
     f.page.drop = HashSet::from([f.ids[1].clone()]);
-    let checked = f.act(Intent::Recycle).unwrap();
+    let mut checked = f.act(Intent::Recycle).unwrap();
     let saved = f._dir.path().join("saved-original.wav");
     let replacement = f._dir.path().join("other.wav");
     fs::write(&replacement, recording(b"Else", 8000)).unwrap();
-    let moved = checked.recycle(|path| {
-        fs::rename(path, &saved)?;
-        fs::rename(&replacement, path)?;
-        fs::rename(path, f._dir.path().join("wrong-bin-item.wav"))
+    let moved = checked.move_one(
+        0,
+        |path| {
+            fs::rename(path, &saved)?;
+            fs::rename(&replacement, path)?;
+            fs::rename(path, f._dir.path().join("wrong-bin-item.wav"))
+        },
+        |path| path.ends_with("wrong-bin-item.wav"),
+    );
+    assert!(moved.is_err());
+    let original = f.session.library.tracks[1].clone();
+    f.with_view(|page, v| {
+        let mut progress = Progress::default();
+        page.finish_move(
+            &checked.plan[0],
+            &original,
+            moved.map_err(|e| e.to_string()),
+            &mut progress,
+            v,
+        );
+        assert_eq!((progress.moved, progress.failed.len()), (0, 1));
     });
-    assert!(moved.outcomes[0].is_err());
+    assert_eq!(f.history(), history);
+}
+
+#[test]
+#[ignore = "uses the Windows Recycle Bin and restores one generated song"]
+fn windows_recycle_restores_the_checked_song_to_its_original_path() {
+    use std::os::windows::process::CommandExt;
+    let runs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-runs");
+    fs::create_dir_all(&runs).unwrap();
+    let mut f = Fixture::in_dir(tempfile::tempdir_in(std::path::absolute(runs).unwrap()).unwrap());
+    f.page.drop = HashSet::from([f.ids[1].clone()]);
+    let mut checked = f.act(Intent::Recycle).unwrap();
+    let source = PathBuf::from(&checked.plan[0].path);
+    let before = fs::read(&source).unwrap();
+    let moved = checked.recycle(0, string_platform::files::recycle);
+    drop(checked);
+    if !source.exists() {
+        // Restrict Restore to this fixture's unique directory and original filename.
+        let restore = std::process::Command::new("powershell.exe")
+            .creation_flags(0x08000000)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                r#"
+$ErrorActionPreference = 'Stop'
+$bin = (New-Object -ComObject Shell.Application).Namespace(10)
+$items = @($bin.Items() | Where-Object {
+    $_.ExtendedProperty('System.Recycle.DeletedFrom') -eq $env:STRING_TEST_RESTORE_DIR -and
+    $_.ExtendedProperty('System.FileName') -eq $env:STRING_TEST_RESTORE_NAME
+})
+if ($items.Count -ne 1) { throw 'Expected one matching disposable song' }
+$items[0].InvokeVerb('undelete')
+"#,
+            ])
+            .env(
+                "STRING_TEST_RESTORE_DIR",
+                source
+                    .parent()
+                    .unwrap()
+                    .as_os_str()
+                    .to_string_lossy()
+                    .trim_start_matches(r"\\?\"),
+            )
+            .env("STRING_TEST_RESTORE_NAME", source.file_name().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            restore.status.success(),
+            "{}",
+            String::from_utf8_lossy(&restore.stderr)
+        );
+        let until = Instant::now() + Duration::from_secs(5);
+        while !source.exists() && Instant::now() < until {
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+    assert_eq!(fs::read(source).unwrap(), before);
+    moved.unwrap();
 }
 
 #[test]
 fn review_edit_after_first_move_preserves_the_pending_file() {
     let mut f = Fixture::new();
-    let checked = f.act(Intent::Recycle).unwrap();
+    let mut checked = f.act(Intent::Recycle).unwrap();
     let pending = checked.plan[1].clone();
     let bin = f._dir.path().join("bin");
     fs::create_dir(&bin).unwrap();
-    let mut count = 0;
-    let moved = checked.recycle(|path| {
-        fs::rename(path, bin.join(path.file_name().unwrap()))?;
-        if count == 0 {
-            crate::ui::edit_info::save_info(&mut f.session, &pending.drop_id, &Info { title: "Other song".into(), ..Default::default() });
-        }
-        count += 1;
-        Ok(())
-    });
+    let mut progress = Progress::default();
+    let (at, _) = f
+        .page
+        .next_pair(&checked, &mut progress, &f.session)
+        .unwrap();
+    checked
+        .move_one(
+            at,
+            |path| fs::rename(path, bin.join(path.file_name().unwrap())),
+            |path| path.parent().unwrap().ends_with("bin"),
+        )
+        .unwrap();
+    crate::ui::edit_info::save_info(
+        &mut f.session,
+        &pending.drop_id,
+        &Info {
+            title: "Other song".into(),
+            ..Default::default()
+        },
+    );
+    assert!(
+        f.page
+            .next_pair(&checked, &mut progress, &f.session)
+            .is_none()
+    );
     assert!(std::path::Path::new(&pending.path).is_file());
-    assert!(moved.outcomes[1].is_err());
+    assert_eq!(progress.failed.len(), 1);
+    assert!(f.page.unticked.contains(&pending.drop_id));
 }
 
 #[test]
 fn review_scan_observing_a_move_preserves_its_history() {
     let mut f = Fixture::new();
-    let revision = basis(&f.session);
-    let checked = f.act(Intent::Recycle).unwrap();
+    let mut checked = f.act(Intent::Recycle).unwrap();
     let bin = f._dir.path().join(".bin");
     fs::create_dir(&bin).unwrap();
-    let moved = checked.recycle(|path| fs::rename(path, bin.join(path.file_name().unwrap())));
-    assert!(moved.outcomes.iter().all(Result::is_ok));
-    let paths: Vec<PathBuf> = f.session.library.tracks.iter().map(|t| PathBuf::from(&t.path)).collect();
+    for at in 0..checked.plan.len() {
+        checked
+            .move_one(
+                at,
+                |path| fs::rename(path, bin.join(path.file_name().unwrap())),
+                |path| path.parent().unwrap().ends_with(".bin"),
+            )
+            .unwrap();
+    }
+    let originals = f.session.library.tracks.clone();
+    let paths: Vec<PathBuf> = f
+        .session
+        .library
+        .tracks
+        .iter()
+        .map(|t| PathBuf::from(&t.path))
+        .collect();
     assert_eq!(f.session.library.scan(&[], &paths).removed, 2);
     f.session.rebuild();
-    f.with_view(|page, v| page.recycled(revision, moved, v));
+    f.with_view(|page, v| {
+        let mut progress = Progress::default();
+        for copy in &checked.plan {
+            let original = originals.iter().find(|t| t.path == copy.path).unwrap();
+            page.finish_move(copy, original, Ok(()), &mut progress, v);
+        }
+        assert_eq!(progress.moved, 2);
+    });
     let keep = &f.ids[0];
     assert_eq!(f.session.field("plays")[keep][0], 3);
     assert_eq!(f.session.field("liked")[keep], 2);
     assert_eq!(f.session.field("loops")[keep]["b"], 7);
-    assert!(!f.history().to_string().contains(&json!(f.ids[1]).to_string()));
+    assert_eq!(
+        f.session.field("playlists")[0]["items"][0]["id"],
+        keep.as_str()
+    );
+    let listening = json!(f.session.listening);
+    assert_eq!(listening["tracks"][0][0], keep.as_str());
+    assert_eq!(
+        listening["days"]
+            .as_object()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()["t"]["0"],
+        17.
+    );
+    assert!(
+        !f.history()
+            .to_string()
+            .contains(&json!(f.ids[1]).to_string())
+    );
 }
 
 #[test]
 fn review_refresh_keeps_the_chosen_keeper_and_unticked_copy() {
     let mut f = Fixture::new();
-    f.page.keep[0] = f.ids[1].clone();
-    f.page.tick(0);
-    f.page.drop.remove(&f.ids[2]);
+    f.page.choose_keep(0, f.ids[1].clone());
+    f.page.choose_drop(f.ids[2].clone(), false);
     f.session.plays_revision += 1;
     f.refresh();
     assert_eq!(f.page.keep, [f.ids[1].clone()]);
     assert_eq!(f.page.drop, HashSet::from([f.ids[0].clone()]));
+}
+
+#[test]
+fn missing_recycled_row_cannot_authorize_a_changed_keeper() {
+    let mut f = Fixture::new();
+    let history = f.history();
+    f.page.drop = HashSet::from([f.ids[1].clone()]);
+    let mut checked = f.act(Intent::Recycle).unwrap();
+    checked
+        .move_one(
+            0,
+            |source| fs::rename(source, f._dir.path().join("moved.wav")),
+            |path| path.ends_with("moved.wav"),
+        )
+        .unwrap();
+    let original = f.session.library.tracks.remove(1);
+    f.session.library.tracks[0].tags.title = "Changed keeper".into();
+    f.session.rebuild();
+    f.with_view(|page, v| {
+        let mut progress = Progress::default();
+        page.finish_move(&checked.plan[0], &original, Ok(()), &mut progress, v);
+        assert_eq!((progress.moved, progress.failed.len()), (1, 1));
+    });
+    assert_eq!(f.history(), history);
+}
+
+#[test]
+fn scanner_waits_for_the_move_and_discards_its_pre_move_result() {
+    let mut f = Fixture::new();
+    let copy = f.session.library.tracks[1].path.clone();
+    f.session.set_field("roots", json!([f._dir.path()]));
+    let mut scan = crate::scan::Scanner::default();
+    scan.requested = true;
+    scan.poll(&mut f.session, &f.ctx);
+    assert!(scan.running());
+    scan.recycling = true;
+    fs::rename(copy, f._dir.path().join("moved.out")).unwrap();
+    f.session.removals += 1;
+    scan.poll(&mut f.session, &f.ctx);
+    assert_eq!(scan.completed, 0);
+    scan.recycling = false;
+    let start = Instant::now();
+    while scan.requested || scan.running() {
+        scan.poll(&mut f.session, &f.ctx);
+        assert!(start.elapsed() < Duration::from_secs(30));
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(scan.completed, 2);
+    assert!(!f.session.models.by_id.contains_key(&f.ids[1]));
 }
 
 #[test]
@@ -485,7 +713,14 @@ fn review_drop_resolves_dragged_ids_after_a_scan() {
     f.session.rebuild();
     selection.bind(&f.ids[..1].to_vec().into(), None);
     f.with_view(|_, v| ui::side_playlists::drop_songs(v, &list, &payload));
-    let dest = f.session.field("playlists").as_array().unwrap().iter().find(|pl| pl["id"] == list).unwrap();
+    let dest = f
+        .session
+        .field("playlists")
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|pl| pl["id"] == list)
+        .unwrap();
     assert_eq!(dest["items"].as_array().unwrap().len(), 1);
     assert_eq!(dest["items"][0]["id"], f.ids[0]);
 }
