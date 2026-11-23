@@ -1,4 +1,5 @@
 pub mod covers;
+pub mod credit;
 pub mod edit_info;
 pub mod glyph;
 pub mod menus;

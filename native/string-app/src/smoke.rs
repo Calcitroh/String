@@ -88,6 +88,8 @@ pub const CASES: &[Case] = &[
     lib::SEARCH,
     lib::SEARCH_GROUPS,
     lib::HOME_PLAYING,
+    crate::ui::credit::smoke::SHOWN,
+    crate::ui::credit::smoke::CLOSED,
     Case {
         name: "40-edit-info",
         prepare: crate::ui::edit_info::smoke::prepare,

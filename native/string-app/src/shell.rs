@@ -139,6 +139,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
         ui::queue_drawer::show(ui, v, main);
     }
     ui::edit_info::show(ui.ctx(), v);
+    ui::credit::show(ui.ctx(), v);
     ui::menus::overlay(ui, v);
     v.views.toast.show(ui.ctx());
 }
