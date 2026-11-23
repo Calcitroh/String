@@ -174,10 +174,28 @@ impl Updater {
         Ok(updater)
     }
     pub fn installed(&self) -> bool {
-        fs::read(self.install.join("setup/installed.txt"))
-            .ok()
-            .and_then(|bytes| std::path::absolute(crate::text::host_text(&bytes).trim()).ok())
-            .is_some_and(|p| crate::text::same_windows_path(&p, &self.install))
+        self.installed_at().is_some()
+    }
+    fn installed_at(&self) -> Option<PathBuf> {
+        let bytes = fs::read(self.install.join("setup/installed.txt")).ok()?;
+        let text = crate::text::host_text(&bytes);
+        let marked = Path::new(text.trim());
+        if !marked.is_absolute() {
+            return None;
+        }
+        let marked = std::path::absolute(marked).ok()?;
+        if crate::text::same_windows_path(&marked, &self.install) {
+            return Some(marked);
+        }
+        // A Windows launcher can give the executable a verbatim drive or UNC path.
+        // Compare the two spellings without accepting aliases to a different install.
+        let name = marked.to_str()?;
+        let verbatim = if let Some(share) = name.strip_prefix(r"\\") {
+            format!(r"\\?\UNC\{share}")
+        } else {
+            format!(r"\\?\{name}")
+        };
+        crate::text::same_windows_path(Path::new(&verbatim), &self.install).then_some(marked)
     }
     fn get(&self, url: &str, within: Duration) -> Result<Response<Body>, ureq::Error> {
         #[cfg(any(test, feature = "test-feed"))]
@@ -280,9 +298,9 @@ impl Updater {
         want: &str,
         mut progress: impl FnMut(Progress),
     ) -> io::Result<InstallPlan> {
-        if !self.installed() {
-            return Err(invalid("Only an installed String updates itself"));
-        }
+        let to = self
+            .installed_at()
+            .ok_or_else(|| invalid("Only an installed String updates itself"))?;
         let release = self
             .latest()?
             .ok_or_else(|| invalid("There is no release to install"))?;
@@ -335,7 +353,7 @@ impl Updater {
         Ok(InstallPlan {
             script: ready.join("app/setup/install.ps1"),
             ready,
-            to: self.install.clone(),
+            to,
             version,
         })
     }

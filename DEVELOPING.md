@@ -217,6 +217,12 @@ String.cmd` → `app\setup\install.ps1`, and the notes `Read me first.txt` and `
 With the release key at `%USERPROFILE%\.string-release\release-key.pem` (its public half must be `UpdateKey`), it
 signs the zip (`release\String.zip.sig`); `-Publish` puts both on GitHub with the GitHub CLI.
 
+For 2.0, run `pwsh -File tools\release-native.ps1 -Full -Version 2.0.0`. It checks the version against
+`string-app` and the finished executable. It writes the same `release\String.zip` and detached signature used by
+installed 1.x and 2.x copies. The zip contains `Install String.cmd`, `Read me first.txt`, `app\String.exe`, the
+native licences and the same `app\setup` scripts and manifest. Both updaters must recognize the signing key.
+Without a key, the builder produces an unsigned zip for manual testing. Full native publishing is disabled.
+
 The installer (per user, no admin): `%LOCALAPPDATA%\Programs\String`, Start menu and desktop shortcuts, an HKCU Apps
 entry that runs `setup\uninstall.ps1`; the installed copy loses Windows' downloaded-file mark. It checks the unzipped
 copy against `files.txt` (hashes through .NET: Get-FileHash vanishes when Windows PowerShell 5.1 inherits pwsh's
@@ -230,12 +236,22 @@ String's unchanged or identical to its saved copy. The uninstaller copies every 
 anything, and deletes data only after a typed `yes`. Those files stay plain ASCII and Windows PowerShell 5.1
 compatible.
 
+On the move from 1.x to 2.0, the installer retires the bundled .NET runtime, WebView2 files, web pages and
+presence helper. Edits to retired files and additions inside the old web, runtime or helper folders are saved in the dated
+edits folder. Other personal files carry forward. Only 1.x checks for the WebView2 runtime.
+
 Testing the installer: never run it (or the uninstaller) with default parameters on a PC whose String you use (they
 would take over its Start menu entry and its data), and never start an installed test copy without `--smoke-test`:
-`--quit` and the single-instance signals are shared with a running String. Use `-To -Menu -Desktop -AppsKey -Data`
-and `-NoStart`, and `tests\run-selftest.ps1 -Exe <installed copy>`.
+`--quit` and the single-instance signals are shared with a running String. Set `-To -Menu -Desktop -AppsKey`,
+use `-NoStart` for installation and `-Data -DataChoice keep` for removal.
 
-## String 2.0 (native, preview)
+`pwsh -File tests\test-update-20.ps1` builds 1.3.1, saves its zip, then builds 2.0.0. To replay archives,
+pass `-LegacyZip <1.3.1 zip> -NativeZip <2.0.0 zip>` with their adjacent `.sig` files. The test checks any
+supplied signatures, performs a clean install and a migration with Windows PowerShell 5.1, compares the profile
+and program files, checks the shortcuts and exercises uninstall. It runs the upgraded player's muted, off-screen
+self-test with generated songs. Each run prints its folder under `test-runs\`, including `smoke\results.json`.
+
+## String 2.0 (native)
 
 `native\` is String rebuilt as a native program in Rust: a Cargo workspace on the MSVC toolchain
 (`native\rust-toolchain.toml`; it needs Visual Studio Build Tools' C++ tools). It reads and writes the same data
@@ -254,7 +270,8 @@ at a time.
   backups, the error log.
 - `string-app`: the window and every screen (egui and wgpu), and `String.exe`. `native\string-app\SCREENS.md` says how
   the screens are put together. Its icon: `assets\String.ico` (and `.png` for the window and the icon's credit card,
-  `ui\credit.rs`), made by `native\icon\logo-to-icon.py` and built into the exe by `build.rs`.
+  `ui\credit.rs`), made by `native\icon\logo-to-icon.py`. `build.rs` embeds the icon and the crate's Windows file and
+  product versions. Settings > Apps reads the product version.
 
 ```
 cd native
@@ -273,7 +290,8 @@ folder (its backups stay inside it), and it shares the single-instance names, so
 `release\native-build` with the source paths renamed (the libraries' to `/cargo`, String's to `/string`), runs the same
 privacy check as `tools\release.ps1`, and `-Publish` makes a GitHub pre-release on the pushed commit it was built from.
 Installed copies never update to a pre-release; the script checks that the newest full release is still the same
-afterwards. Not in the preview yet: add-ons, your own look, installing and updating from 1.x.
+afterwards. For an installable build, use `-Full` as described in Releases. The full executable links the Visual C++
+runtime statically, so a fresh PC can run it without installing the redistributable.
 
 ## Things learned the hard way
 

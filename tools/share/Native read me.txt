@@ -1,0 +1,22 @@
+String 2.0 for Windows
+======================
+
+To install String, right-click String.zip, choose Extract All, then open
+"Install String.cmd" in the extracted folder. Open String from the Start menu
+or the desktop. On first use, choose the folders where you keep your music.
+
+Updating from String 1.x
+
+String uses the same songs, library, playlists, likes and listening history.
+The installer replaces the program files. Your saved data stays in
+%LOCALAPPDATA%\String. String 2.0 runs natively and needs no WebView2 or .NET
+runtime installation.
+
+If you changed files in the installed program, the installer shows where it
+saved them, in a dated folder beside the program named "String edits".
+Stylesheets from the old web player are kept there. The native player draws
+its own screens.
+
+Use Settings in String to check for future releases. To uninstall String,
+use Windows Settings > Apps. You can keep your saved library for a later
+install. The program's third-party licences are in app\licenses in this zip.

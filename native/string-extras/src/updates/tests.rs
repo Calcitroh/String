@@ -2,23 +2,57 @@ use super::*;
 use std::{
     fs::File,
     net::{TcpListener, TcpStream},
+    os::windows::process::CommandExt,
     process::{Child, Stdio},
     thread,
 };
 use tempfile::tempdir;
 use zip::{ZipWriter, write::SimpleFileOptions};
 
+// The fixture's entry point directs the real release installer to test-only shell locations.
+const FIXTURE_SETUP: &str = r#"param([Parameter(Mandatory)][string]$To)
+if ($To -cne $env:STRING_TEST_TARGET) { throw 'Unexpected install target' }
+& (Join-Path $PSScriptRoot 'isolated.ps1') -To $To -Menu "$To menu" -Desktop "$To desktop" -AppsKey 'HKCU:\Software\StringUpdateFixture' -NoStart
+exit $LASTEXITCODE
+"#;
+
+fn manifest_row(name: &str, contents: &str) -> String {
+    let hash: String = Sha256::digest(contents.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect();
+    format!(
+        "{hash}\t{}\t{}\r\n",
+        contents.len(),
+        name.replace('/', "\\")
+    )
+}
+
 fn archive(file: File, version: &str, symlink: bool) -> File {
     let mut z = ZipWriter::new(file);
     let opts = SimpleFileOptions::default();
-    for (name, bytes) in [
-        ("app/setup/version.txt", version),
-        ("app/String.exe", "fixture"),
-        ("app/setup/install.ps1", "fixture"),
-    ] {
-        z.start_file(name, opts).unwrap();
+    let files = [
+        ("setup/version.txt", version),
+        ("String.exe", "fixture"),
+        ("setup/install.ps1", FIXTURE_SETUP),
+        (
+            "setup/isolated.ps1",
+            include_str!("../../../../tools/share/install.ps1"),
+        ),
+        (
+            "setup/uninstall.ps1",
+            include_str!("../../../../tools/share/uninstall.ps1"),
+        ),
+    ];
+    let mut manifest = String::new();
+    for (name, bytes) in files {
+        z.start_file(format!("app/{name}"), opts).unwrap();
         z.write_all(bytes.as_bytes()).unwrap();
+        manifest.push_str(&manifest_row(name, bytes));
     }
+    manifest.push_str(&format!("#end\t{}\r\n", files.len()));
+    z.start_file("app/setup/files.txt", opts).unwrap();
+    z.write_all(manifest.as_bytes()).unwrap();
     if symlink {
         z.add_symlink("app/alias", "elsewhere", opts).unwrap();
     }
@@ -34,11 +68,34 @@ impl Drop for Server {
     }
 }
 fn config(install: &Path, origin: &str, repo: &str, key: &str) -> Updater {
-    Updater::for_test_feed(install, "1.1.0", &format!("{origin}/repos/{repo}"), key).unwrap()
+    Updater::for_test_feed(install, "2.0.0", &format!("{origin}/repos/{repo}"), key).unwrap()
+}
+#[test]
+fn windows_installer_marker_matches_the_verbatim_exe_directory() {
+    let tmp = tempdir().unwrap();
+    let install = tmp.path().join("Player");
+    fs::create_dir_all(install.join("setup")).unwrap();
+    // install.ps1 writes an absolute Win32 path in UTF-8 without a BOM.
+    fs::write(
+        install.join("setup/installed.txt"),
+        install.to_str().unwrap(),
+    )
+    .unwrap();
+    let exe_dir = fs::canonicalize(&install).unwrap();
+    let updater = Updater::new(&exe_dir, "2.0.0").unwrap();
+    assert_eq!(updater.installed_at().as_deref(), Some(install.as_path()));
+    fs::write(
+        install.join("setup/installed.txt"),
+        tmp.path().to_str().unwrap(),
+    )
+    .unwrap();
+    assert!(!updater.installed());
 }
 #[test]
 fn signed_release_feed_end_to_end() {
-    let tmp = tempdir().unwrap();
+    let runs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-runs");
+    fs::create_dir_all(&runs).unwrap();
+    let tmp = tempfile::tempdir_in(std::path::absolute(runs).unwrap()).unwrap();
     let root = tmp.path();
     for (name, ver) in [("good.zip", "9.9.9"), ("liar.zip", "9.9.8")] {
         archive(File::create(root.join(name)).unwrap(), ver, false);
@@ -76,6 +133,12 @@ fn signed_release_feed_end_to_end() {
         .flat_map(u16::to_le_bytes)
         .collect::<Vec<_>>();
     fs::write(install.join("setup/installed.txt"), marker).unwrap();
+    fs::write(install.join("setup/version.txt"), "2.0.0").unwrap();
+    fs::write(
+        install.join("setup/files.txt"),
+        manifest_row("setup/version.txt", "2.0.0") + "#end\t1\r\n",
+    )
+    .unwrap();
     let check = good.check().unwrap();
     assert!(check.installed && check.newer);
     let latest = check.latest.unwrap();
@@ -92,13 +155,32 @@ fn signed_release_feed_end_to_end() {
     );
     assert!(matches!(events.last(), Some(Progress::Verifying)));
     assert_eq!(plan.ready, data.join(r"updates\String-9.9.9"));
-    assert_eq!(fs::read_to_string(&plan.script).unwrap(), "fixture");
+    assert_eq!(fs::read_to_string(&plan.script).unwrap(), FIXTURE_SETUP);
     assert_eq!(plan.to, install);
     assert!(
         plan.command()
             .get_args()
             .all(|s| !s.to_string_lossy().contains(install.to_str().unwrap()))
     );
+    // Use the same PowerShell command and working directory as the app, with no console.
+    let run = plan
+        .command()
+        .creation_flags(0x08000000)
+        .env("STRING_TEST_TARGET", &install)
+        .env("LOCALAPPDATA", root)
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let version = fs::read_to_string(install.join("setup/version.txt")).unwrap();
+    assert_eq!(version, "9.9.9", "{}", String::from_utf8_lossy(&run.stdout));
+    assert_eq!(fs::read(install.join("String.exe")).unwrap(), b"fixture");
+    let updated =
+        Updater::for_test_feed(&install, &version, &format!("{origin}/repos/good"), &key).unwrap();
+    assert!(!updated.check().unwrap().newer);
     for (repo, message) in [
         ("tampered", "signature"),
         ("liar", "version inside"),
