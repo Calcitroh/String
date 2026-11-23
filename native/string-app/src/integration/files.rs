@@ -114,11 +114,6 @@ impl View<'_> {
     pub fn pick_songs(&mut self) {
         self.platform.picker = Some(LibraryPicker::Songs);
     }
-    pub fn reveal(&mut self, path: &Path) {
-        if let Err(e) = self.platform.files().reveal(path) {
-            self.views.toast.set(e.to_string());
-        }
-    }
     pub fn open_web_link(&mut self, url: &str) {
         if let Err(e) = self.platform.files().open_web_link(url) {
             self.views.toast.set(e.to_string());

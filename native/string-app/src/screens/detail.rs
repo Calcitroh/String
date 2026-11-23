@@ -231,7 +231,7 @@ pub fn actions(ui: &mut Ui, v: &mut View<'_>, ids: &Ids, more: bool, hint: Optio
             v.tint,
         );
         if resp.clicked() {
-            crate::ui::menus::ctx_menu(ctx, resp.rect.left_bottom(), Some(ids.clone()));
+            crate::ui::menus::ctx_menu(ctx, resp.rect.left_bottom(), filtered.then(|| ids.clone()));
         }
     }
     ui.add_space(12.);

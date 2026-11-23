@@ -92,9 +92,7 @@ impl LyricsView {
     }
 
     fn open(&mut self, ctx: &Context, song: &Song, permission: Option<bool>, force: bool) {
-        if force || self.translator.song_changed(&song.id) {
-            self.translator.clear();
-        }
+        self.translator.page_opened(&song.id, force);
         self.page = Some(Page {
             id: song.id.clone(),
             entered: Instant::now(),
@@ -442,7 +440,7 @@ fn empty(ui: &mut Ui, allow: Option<bool>, result: &LyricsResult) -> Option<Acti
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn fixture() -> (tempfile::TempDir, Song, LyricsView, LanguageModel) {
+    pub(super) fn fixture() -> (tempfile::TempDir, Song, LyricsView, LanguageModel) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("song.flac");
         let lib =

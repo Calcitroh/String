@@ -11,6 +11,7 @@
 //!
 //! `overlay` draws whatever is open once per frame, after the screens.
 use crate::{
+    integration::files::Files,
     model::{Ids, Models},
     playback::Session,
     route::Route,
@@ -42,7 +43,7 @@ pub struct Hooks {
     /// Open the Edit info dialog for this song id.
     pub edit_info: Option<fn(&mut View<'_>, &str)>,
     /// Show this file or folder in Explorer.
-    pub reveal: Option<fn(&mut View<'_>, &Path)>,
+    pub reveal: Option<fn(Files, &Path) -> std::io::Result<()>>,
 }
 static HOOKS: Mutex<Hooks> = Mutex::new(Hooks {
     edit_info: None,
@@ -92,7 +93,7 @@ struct Menu {
     fresh: bool,
 }
 enum Purpose {
-    NewPlaylist { ids: Vec<String>, open: bool },
+    NewPlaylist { source: Kind, open: bool },
     Rename(String),
     Delete(String),
 }
@@ -180,13 +181,16 @@ pub fn is_open() -> bool {
 }
 /// Ask for a name, then make the playlist with these songs; `open` also goes to its page.
 pub fn new_playlist(v: &View<'_>, ids: Vec<String>, open: bool) {
+    prompt_playlist(v, Kind::Picker { ids: ids.into() }, open);
+}
+fn prompt_playlist(v: &View<'_>, source: Kind, open: bool) {
     state().dialog = Some(Dialog {
         title: "New playlist".into(),
         text: String::new(),
         value: Some(format!("Playlist {}", v.s.models.playlists.len() + 1)),
         ok: "Create",
         danger: false,
-        purpose: Purpose::NewPlaylist { ids, open },
+        purpose: Purpose::NewPlaylist { source, open },
         fresh: 4,
         answer: None,
     });
@@ -585,19 +589,23 @@ pub fn shuffle_ctx(v: &mut View<'_>, ctx: &Value, visible: Option<&Ids>) {
     let ctx = named(&v.s.models, ctx);
     v.s.play_ids(v.player, &ids, -1, ctx);
 }
-pub fn reveal(v: &mut View<'_>, path: &Path) {
+fn reveal(ctx: &Context, v: &View<'_>, path: PathBuf) {
     let hook = hooks().reveal;
-    if let Some(f) = hook {
-        f(v, path);
-    } else if !v.force_mute {
-        use std::os::windows::process::CommandExt;
-        let shown = std::process::Command::new("explorer.exe")
-            .raw_arg(format!("/select,\"{}\"", path.display()))
-            .spawn();
-        if let Err(e) = shown {
-            v.views.toast.set(format!("Explorer did not open: {e}"));
-        }
+    if hook.is_none() && v.force_mute {
+        return;
     }
+    let files = v.platform.files();
+    crate::services::fire(ctx, move |_| {
+        if let Some(show) = hook {
+            return show(files, &path);
+        }
+        use std::os::windows::process::CommandExt;
+        std::process::Command::new("explorer.exe")
+            .raw_arg(format!("/select,\"{}\"", path.display()))
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| std::io::Error::other(format!("Explorer did not open: {e}")))
+    });
 }
 
 /* ---------- the menu ---------- */
@@ -784,15 +792,19 @@ fn entries(v: &View<'_>, m: &Menu) -> Vec<Entry> {
     }
     out
 }
-fn run(v: &mut View<'_>, kind: Kind, cmd: Cmd) {
-    let ids = match &kind {
-        Kind::Track { ids, .. } | Kind::Picker { ids } => ids.clone(),
-        Kind::List { ctx, visible } => list_ids(v, ctx, visible),
-    };
+impl Kind {
+    fn ids(&self, v: &View<'_>) -> Ids {
+        match self {
+            Self::Track { ids, .. } | Self::Picker { ids } => ids.clone(),
+            Self::List { ctx, visible } => list_ids(v, ctx, visible),
+        }
+    }
+}
+fn run(ui_ctx: &Context, v: &mut View<'_>, kind: Kind, cmd: Cmd) {
     match cmd {
         Cmd::Play => match &kind {
             Kind::List { ctx, visible } => play_ctx(v, ctx, visible.as_ref()),
-            Kind::Track { origin, .. } => {
+            Kind::Track { ids, origin } => {
                 let ctx = origin
                     .ctx
                     .as_ref()
@@ -808,7 +820,7 @@ fn run(v: &mut View<'_>, kind: Kind, cmd: Cmd) {
                         v.s.play_ids(v.player, list, *row as isize, ctx);
                     }
                 } else {
-                    v.s.play_ids(v.player, &ids, 0, ctx);
+                    v.s.play_ids(v.player, ids, 0, ctx);
                 }
             }
             Kind::Picker { .. } => {}
@@ -819,14 +831,15 @@ fn run(v: &mut View<'_>, kind: Kind, cmd: Cmd) {
             }
         }
         Cmd::PlayNext => {
+            let ids = kind.ids(v);
             if !ids.is_empty() {
                 play_next(v, &ids);
             }
         }
-        Cmd::Queue => queue_tracks(v, &ids),
-        Cmd::NewPlaylist => new_playlist(v, ids.to_vec(), false),
-        Cmd::AddTo(key) => add_to_playlist(v, &key, &ids),
-        Cmd::Like => toggle_like(v, &ids),
+        Cmd::Queue => queue_tracks(v, &kind.ids(v)),
+        Cmd::NewPlaylist => prompt_playlist(v, kind, false),
+        Cmd::AddTo(key) => add_to_playlist(v, &key, &kind.ids(v)),
+        Cmd::Like => toggle_like(v, &kind.ids(v)),
         Cmd::RemoveFromPlaylist => {
             if let Kind::Track { origin, .. } = kind
                 && let Some((key, mut picked)) = origin.playlist
@@ -848,7 +861,7 @@ fn run(v: &mut View<'_>, kind: Kind, cmd: Cmd) {
                 v.views.toast.set(format!("Now “{title}” by {artist}"));
             }
         }
-        Cmd::Reveal(path) => reveal(v, &path),
+        Cmd::Reveal(path) => reveal(ui_ctx, v, path),
         Cmd::Rename(key) => rename_playlist(v, &key),
         Cmd::Delete(key) => delete_playlist(v, &key),
         Cmd::Picker | Cmd::Back => {}
@@ -994,7 +1007,7 @@ fn show_menu(ctx: &Context, v: &mut View<'_>) {
         Some(Cmd::Picker) => menu.sub = true,
         Some(Cmd::Back) => menu.sub = false,
         Some(cmd) => {
-            run(v, menu.kind, cmd);
+            run(ctx, v, menu.kind, cmd);
             return;
         }
         None => {}
@@ -1197,7 +1210,8 @@ fn show_dialog(ctx: &Context, v: &mut View<'_>) {
             let text = d.value.as_deref().unwrap_or("").trim().to_owned();
             match d.purpose {
                 _ if d.value.is_some() && text.is_empty() => {}
-                Purpose::NewPlaylist { ids, open } => {
+                Purpose::NewPlaylist { source, open } => {
+                    let ids = source.ids(v);
                     let id = v.s.new_playlist(&text, &ids);
                     if !ids.is_empty() {
                         v.views
@@ -1600,6 +1614,166 @@ pub mod smoke {
 mod tests {
     use super::*;
     use string_core::{library::Library, state::State, stats::Listening};
+    fn with_menu(test: impl FnOnce(&Context, &mut View<'_>)) {
+        use crate::{Args, platform::Platform};
+        use std::sync::Arc;
+        use string_platform::{
+            errors_log::ErrorLog,
+            instance::{self, Claim, Names},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let args = Args {
+            root: dir.path().into(),
+            explicit: true,
+            smoke: Some(dir.path().into()),
+            quit: false,
+            add: None,
+            playlist: None,
+        };
+        let names = Names::custom(&format!("StringMenuTest{:x}", rand::random::<u64>()));
+        let Claim::First(instance) = instance::claim_quietly(&names).unwrap() else {
+            panic!()
+        };
+        let ctx = Context::default();
+        crate::theme::install(&ctx);
+        let lib = serde_json::from_value(json!({"v":1,"tracks":[
+            {"path":"a.wav","title":"One","artist":"Band","album":"Mix"},
+            {"path":"b.wav","title":"Two","artist":"Band","album":"Mix"}
+        ]}))
+        .unwrap();
+        let shared = Arc::new(Mutex::new(Session::new(
+            State::default(),
+            Listening::default(),
+            lib,
+        )));
+        let player = crate::playback::open(&shared, &ctx, true);
+        let adds = crate::add_work::Adds::new().unwrap();
+        test(
+            &ctx,
+            &mut View {
+                adds: &adds.input,
+                platform: &mut Platform::new(instance, &args, Arc::new(ErrorLog::new(dir.path()))),
+                s: &mut shared.lock().unwrap(),
+                player: &player,
+                st: Default::default(),
+                views: &mut Default::default(),
+                covers: &mut ui::covers::CoverCache::new(&ctx),
+                viz: &Default::default(),
+                scan: &mut Default::default(),
+                tint: Tint::Mono,
+                mono: true,
+                force_mute: true,
+            },
+        );
+    }
+
+    fn click_detail_more(ctx: &Context, v: &mut View<'_>) -> Kind {
+        let ids = v.s.models.context_ids(&v.context());
+        let mut frame = |events| {
+            let mut more = Pos2::ZERO;
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    crate::screens::detail::actions(ui, v, &ids, true, None);
+                    more = ctx
+                        .read_response(ui.scope_id().with("More"))
+                        .unwrap()
+                        .rect
+                        .center();
+                },
+            );
+            more
+        };
+        let pos = frame(vec![]);
+        frame(vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            frame(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Modifiers::NONE,
+            }]);
+        }
+        state().menu.take().expect("More opened the list menu").kind
+    }
+
+    #[test]
+    fn detail_menu_adds_the_live_album_and_artist_after_a_scan() {
+        with_menu(|ctx, v| {
+            let song = v.s.models.by_id["a.wav"].clone();
+            v.go(Route::Album(song.album_key.clone()));
+            let album = click_detail_more(ctx, v);
+            let album_ctx = v.context();
+            let ids = v.s.models.context_ids(&album_ctx);
+            assert!(
+                v.s.state
+                    .queue
+                    .play_ids(&ids, 1, album_ctx, &v.s.models.catalog)
+            );
+            run(ctx, v, album.clone(), Cmd::Play);
+            let playing = v.s.state.queue.current().unwrap().to_owned();
+            v.go(Route::Artist(song.artist_key.clone()));
+            let artist = click_detail_more(ctx, v);
+            v.views.filter = "One".into();
+            let filtered = click_detail_more(ctx, v);
+            run(ctx, v, album.clone(), Cmd::NewPlaylist);
+            v.s.library.tracks.retain(|t| t.path != "b.wav");
+            v.s.rebuild();
+            state().dialog.as_mut().unwrap().answer = Some(true);
+            let _ = ctx.run_ui(Default::default(), |_| show_dialog(ctx, v));
+            let mut contents = vec![order(v.s, &v.s.models.playlists[0].id)];
+            for kind in [album, artist] {
+                let key = v.s.new_playlist("After scan", &[]);
+                run(ctx, v, kind, Cmd::AddTo(key.clone()));
+                contents.push(order(v.s, &key));
+            }
+            assert_eq!(contents, ["a.wav", "a.wav", "a.wav"]);
+            assert_eq!(playing, ids[1], "Play resumes the current song");
+            assert!(
+                matches!(filtered, Kind::List { visible: Some(ids), .. } if ids.as_ref() == ["a.wav"])
+            );
+        });
+    }
+
+    #[test]
+    fn explorer_menu_runs_the_reveal_hook_off_the_ui_thread() {
+        use std::{sync::mpsc, thread, time::Duration};
+        static RESULT: Mutex<Option<mpsc::Sender<(PathBuf, thread::ThreadId)>>> = Mutex::new(None);
+        with_menu(|ctx, v| {
+            let (tx, rx) = mpsc::channel();
+            *RESULT.lock().unwrap() = Some(tx);
+            let old = hooks().reveal.replace(|_, path| {
+                RESULT
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send((path.into(), thread::current().id()))
+                    .unwrap();
+                Ok(())
+            });
+            let path = PathBuf::from("music");
+            run(
+                ctx,
+                v,
+                Kind::List {
+                    ctx: json!({"kind":"artist"}),
+                    visible: None,
+                },
+                Cmd::Reveal(path.clone()),
+            );
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            hooks().reveal = old;
+            let (seen, worker) = result.unwrap();
+            assert_eq!(seen, path);
+            assert_ne!(worker, thread::current().id());
+        });
+    }
+
     fn order(s: &Session, key: &str) -> String {
         s.playlist_entries(key)
             .iter()
