@@ -327,7 +327,195 @@ impl Adds {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::time::Duration;
+    use string_core::library::track_id;
+
+    fn named_add(s: &mut Session, paths: Vec<PathBuf>) {
+        Batch::new(Source::Helper(Some("List".into())), classify(paths), None)
+            .apply(s, &mut Scanner::default());
+    }
+
+    fn scan_selection(s: &mut Session) -> string_core::library::ScanReport {
+        let [roots, files] = ["roots", "files"].map(|key| {
+            s.field(key)
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| PathBuf::from(v.as_str().unwrap()))
+                .collect::<Vec<_>>()
+        });
+        let report = s.library.scan(&roots, &files);
+        s.rebuild();
+        playlist_add::resolve_folders(s, &report.complete_folders);
+        report
+    }
+
+    fn song(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            include_bytes!("../../string-core/tests/fixtures/tag-scan/tone.flac"),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn final_add_readmits_a_cached_song_after_its_root_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = song(dir.path(), "keep.flac");
+        song(dir.path(), "leave.flac");
+        let mut s = Session::new(Default::default(), Default::default(), Default::default());
+        s.set_field("roots", json!([dir.path()]));
+        assert_eq!(scan_selection(&mut s).read, 2);
+        s.set_field("roots", json!([]));
+        named_add(&mut s, vec![file.clone(), file.clone()]);
+        assert_eq!(scan_selection(&mut s).removed, 1);
+        assert_eq!(s.field("files"), &json!([file]));
+        assert_eq!(
+            &*s.models.playlists[0].ids,
+            &[track_id(file.to_str().unwrap())]
+        );
+    }
+
+    #[test]
+    fn final_explicit_roots_reach_skipped_names_and_depths_in_either_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let deep = (0..15).fold(root.to_owned(), |p, _| p.join("d"));
+        let hidden = root.join(".archive").join("disc");
+        let ordinary = root.join("album");
+        let folders = [&deep, &hidden, &ordinary];
+        let mut ids = Vec::new();
+        for folder in folders {
+            fs::create_dir_all(folder).unwrap();
+            ids.push(track_id(song(folder, "one.flac").to_str().unwrap()));
+        }
+        for parent_first in [true, false] {
+            let mut s = Session::new(Default::default(), Default::default(), Default::default());
+            if parent_first {
+                s.set_field("roots", json!([root]));
+            }
+            named_add(&mut s, folders.into_iter().cloned().collect());
+            if !parent_first {
+                Batch::new(Source::Helper(None), classify(vec![root.to_owned()]), None)
+                    .apply(&mut s, &mut Scanner::default());
+            }
+            assert_eq!(scan_selection(&mut s).read, 3);
+            assert_eq!(&*s.models.playlists[0].ids, &ids);
+            assert_eq!(s.field("roots").as_array().unwrap().len(), 3);
+        }
+    }
+
+    #[test]
+    fn final_batch_uses_the_roots_that_will_actually_be_scanned() {
+        let root = PathBuf::from(r"C:\Music");
+        let middle = (0..10).fold(root.clone(), |p, _| p.join("disc"));
+        let deep = (0..10).fold(middle.clone(), |p, _| p.join("disc"));
+        let mut folders = vec![deep.clone(), middle, root.clone()];
+        for name in [
+            "$offline",
+            "node_modules",
+            "System Volume Information",
+            "__MACOSX",
+        ] {
+            folders.push(root.join(name).join("songs"));
+        }
+        let mut expected = folders.clone();
+        expected.remove(1);
+        let mut s = Session::new(Default::default(), Default::default(), Default::default());
+        let folders = folders
+            .into_iter()
+            .map(|path| Location {
+                path,
+                directory: true,
+            })
+            .collect();
+        Batch::new(Source::Helper(None), folders, None).apply(&mut s, &mut Scanner::default());
+        assert_eq!(s.field("roots"), &json!(expected));
+    }
+
+    #[test]
+    fn final_unavailable_link_keeps_the_folder_place_until_its_target_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let album = tmp.path().join("album");
+        let target = tmp.path().join("target");
+        let link = album.join("disc");
+        fs::create_dir(&album).unwrap();
+        fs::create_dir(&target).unwrap();
+        assert!(
+            std::process::Command::new("cmd")
+                .args(["/d", "/c", "mklink", "/J"])
+                .arg(&link)
+                .arg(&target)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let tail = song(tmp.path(), "last.flac");
+        let mut s = Session::new(Default::default(), Default::default(), Default::default());
+        named_add(&mut s, vec![album, tail.clone()]);
+        let marker = s.field("playlists")[0]["items"][0].clone();
+        fs::remove_dir(&target).unwrap();
+        scan_selection(&mut s);
+        assert_eq!(s.field("playlists")[0]["items"][0], marker);
+        let mut s = Session::new(s.state, Default::default(), s.library);
+        fs::create_dir(&target).unwrap();
+        song(&target, "first.flac");
+        let recovered = link.join("first.flac");
+        assert!(scan_selection(&mut s).issues.is_empty());
+        assert_eq!(
+            &*s.models.playlists[0].ids,
+            &[
+                track_id(recovered.to_str().unwrap()),
+                track_id(tail.to_str().unwrap())
+            ]
+        );
+    }
+
+    #[test]
+    fn final_bulk_helper_folders_fit_one_ui_operation() {
+        use windows::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentThread, GetThreadTimes},
+        };
+        fn thread_cpu() -> Duration {
+            let [mut created, mut exit, mut kernel, mut user] = [FILETIME::default(); 4];
+            unsafe {
+                GetThreadTimes(
+                    GetCurrentThread(),
+                    &mut created,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+            }
+            .unwrap();
+            let ticks =
+                |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+            Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+        }
+        let mut s = Session::new(Default::default(), Default::default(), Default::default());
+        let folders = (0..4_000)
+            .map(|i| Location {
+                path: PathBuf::from(format!(r"C:\Collection\album-{i}")),
+                directory: true,
+            })
+            .collect();
+        let batch = Batch::new(Source::Helper(None), folders, None);
+        let start = thread_cpu();
+        let wall = Instant::now();
+        batch.apply(&mut s, &mut Scanner::default());
+        let elapsed = thread_cpu() - start;
+        eprintln!(
+            "4,000 sibling folders on the session thread: {elapsed:?} CPU, {:?} elapsed",
+            wall.elapsed()
+        );
+        assert!(elapsed < Duration::from_millis(250), "{elapsed:?}");
+        assert_eq!(s.field("roots").as_array().unwrap().len(), 4_000);
+    }
 
     #[test]
     fn a_partly_full_queue_keeps_the_dropped_paths_that_fit() {
