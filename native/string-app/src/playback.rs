@@ -1102,6 +1102,54 @@ mod player_tests {
         assert_eq!(p.status().position, 1. / 8000.);
     }
 
+    /// Next inside an album moves one song on, whatever loop is on (reported live: it went back into the album).
+    #[test]
+    fn next_in_an_album_moves_one_song_with_any_loop_on() {
+        for mode in ["repeat one", "repeat all", "seek-bar loop"] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths: Vec<_> = (1..=3)
+                .map(|n| {
+                    let path = dir.path().join(format!("0{n} song.wav"));
+                    write_song(&path, 8);
+                    path.to_str().unwrap().to_owned()
+                })
+                .collect();
+            let names: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let ids: Vec<String> = names.iter().map(|p| string_core::library::track_id(p)).collect();
+            let mut s = session(&names);
+            let album = s.models.catalog.albums.first().map(|g| g.key.clone()).unwrap_or_default();
+            assert!(s.state.queue.play_ids(
+                &ids,
+                0,
+                json!({"kind":"album","key":album}),
+                &s.models.catalog
+            ));
+            match mode {
+                "repeat one" => s.state.queue.set_repeat(string_core::queue::Repeat::One),
+                "repeat all" => s.state.queue.set_repeat(string_core::queue::Repeat::All),
+                _ => s.set_field("loops", json!({&ids[0]:{"a":1,"b":3}})),
+            }
+            let p = TestTransport(OfflinePlayer::new(8000, Config::default(), SilentHost).into());
+            s.load_current(&p, true, 0.);
+            p.0.borrow_mut().render_secs(1.5);
+            s.next(&p);
+            p.0.borrow_mut().render_secs(0.5);
+            assert_eq!(
+                s.state.queue.current(),
+                Some(ids[1].as_str()),
+                "{mode}: Next from the first song"
+            );
+            s.next(&p);
+            p.0.borrow_mut().render_secs(0.5);
+            assert_eq!(
+                s.state.queue.current(),
+                Some(ids[2].as_str()),
+                "{mode}: Next from the second song"
+            );
+            assert!(p.status().playing, "{mode}: still playing");
+        }
+    }
+
     #[test]
     fn review_repeat_one_preload_failure_keeps_the_playing_song() {
         let dir = tempfile::tempdir().unwrap();

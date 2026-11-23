@@ -494,7 +494,7 @@ fn periods(ui: &mut Ui, v: &mut View<'_>, snapshot: &Snapshot) {
             p.rect(
                 r,
                 0,
-                if selected { v.tint.ink(0.06) } else { PANEL },
+                if selected { v.tint.ink(0.06) } else { STATS_PANEL },
                 (1., border),
                 StrokeKind::Inside,
             );
@@ -556,9 +556,11 @@ fn periods(ui: &mut Ui, v: &mut View<'_>, snapshot: &Snapshot) {
         });
     ui.add_space(14.);
 }
+/// Stats' panels and tiles sit a shade darker than the other pages' panels, so the white bars carry the page.
+const STATS_PANEL: egui::Color32 = egui::Color32::from_rgb(8, 8, 10);
 fn panel() -> egui::Frame {
     egui::Frame::new()
-        .fill(PANEL)
+        .fill(STATS_PANEL)
         .stroke((1., HAIR2))
         .inner_margin(egui::Margin::symmetric(21, 19))
 }
@@ -668,12 +670,10 @@ fn rank_row(ui: &mut Ui, v: &mut View<'_>, i: usize, item: &Rank, max: f64) -> b
         w,
         4.,
     );
-    p.rect_filled(bar, 2, RAISED);
-    p.rect_filled(
-        bar.with_max_x(x + w * (item.seconds / max.max(0.1)) as f32),
-        2,
-        v.tint.ink(if text { 0.7 } else { 0.35 }),
-    );
+    p.rect_filled(bar, 2, PANEL2);
+    let fill = bar.with_max_x(x + w * (item.seconds / max.max(0.1)) as f32);
+    ui::glow(p, fill, 2., 8., v.tint.ink(if text { 0.3 } else { 0.12 }));
+    p.rect_filled(fill, 2, v.tint.ink(if text { 0.75 } else { 0.35 }));
     if item.key.is_some() {
         response
             .on_hover_cursor(egui::CursorIcon::PointingHand)

@@ -448,7 +448,7 @@ pub fn show(
                 let hr = area(r.left() + like_x, r.center().y - 15., 30., 30.);
                 let icon = Rect::from_center_size(hr.center(), Vec2::splat(13.));
                 if is_liked {
-                    crate::screens::cards::heart(&p, icon, tint);
+                    crate::screens::cards::lit_heart(&p, icon, tint);
                 } else {
                     glyph::draw(&p, icon, "heart", MUTED);
                 }

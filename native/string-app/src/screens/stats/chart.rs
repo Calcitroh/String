@@ -65,7 +65,8 @@ pub(super) fn bars(ui: &mut Ui, s: &Snapshot, tint: Tint) {
         let hit = area(x - slot / 2., plot.top(), slot, plot.height());
         let hover = ui.interact(hit, ui.scope_id().with(("time bucket", i)), Sense::hover());
         if hover.hovered() {
-            p.rect_filled(hit, 0, Color32::from_white_alpha(9));
+            // faint: with one bar (All time) its column is the whole chart
+            p.rect_filled(hit, 0, Color32::from_white_alpha(4));
         }
         hover.on_hover_ui(|ui| {
             ui.label(mono(long, 11.).color(MUTED));
@@ -82,11 +83,14 @@ pub(super) fn bars(ui: &mut Ui, s: &Snapshot, tint: Tint) {
                 sw: 0,
                 se: 0,
             };
-            if current {
-                for px in (1..=4).rev() {
-                    p.rect_filled(b.expand(px as f32), corners, tint.ink(0.025));
-                }
-            }
+            // every bar glows softly, the current one most
+            crate::ui::glow(
+                p,
+                b,
+                f32::from(rad),
+                if current { 16. } else { 10. },
+                tint.ink(if current { 0.38 } else { 0.14 }),
+            );
             p.rect_filled(b, corners, tint.ink(if current { 1. } else { 0.5 }));
             if *seconds == max && !peak {
                 peak = true;

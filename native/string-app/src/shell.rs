@@ -382,6 +382,8 @@ fn topbar(ui: &mut Ui, v: &mut View<'_>) {
         egui::TextEdit::singleline(&mut v.views.query)
             .id(egui::Id::unique("global search"))
             .hint_text("Search songs, albums, artists")
+            // centred on the magnifier: a text field otherwise sits at the top of its 30 px box
+            .align(egui::Align2::LEFT_CENTER)
             .frame(egui::Frame::NONE),
     );
     if std::mem::take(&mut v.views.search_focus) {

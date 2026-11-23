@@ -412,11 +412,13 @@ pub fn seg<'a>(
         } else {
             MUTED
         };
-        p.galley(
-            pos2(cell.left() + 10., cell.center().y - text.size().y * 0.5),
-            text,
-            ink,
-        );
+        let at = pos2(cell.left() + 10., cell.center().y - text.size().y * 0.5);
+        if on {
+            // the chosen name glows softly, inside its own cell
+            let lit = Rect::from_min_size(at, text.size()).expand2(vec2(3., 0.));
+            glow(p, lit, 3., 7., tint.ink(0.22));
+        }
+        p.galley(at, text, ink);
         if resp
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()

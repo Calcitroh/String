@@ -72,6 +72,12 @@ fn circle_image(p: &Painter, r: Rect, texture: egui::TextureId, zoom: f32, color
     }
     p.add(mesh);
 }
+/// A liked heart: filled, with a soft glow around it (the player bar's and the song rows').
+pub fn lit_heart(p: &Painter, r: Rect, t: Tint) {
+    let w = r.width();
+    crate::ui::glow(p, r.shrink(w * 0.12), w * 0.3, w * 0.75, t.ink(0.5));
+    heart(p, r, t);
+}
 pub fn heart(p: &Painter, r: Rect, t: Tint) {
     // A triangle fan preserves the notch at the top of the heart.
     let mut mesh = Mesh::default();

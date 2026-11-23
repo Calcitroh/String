@@ -273,8 +273,7 @@ pub fn like_btn(ui: &mut Ui, r: Rect, title: &str, liked: bool, t: Tint) -> Resp
     let resp = hit(ui, r, title, title);
     let p = ui.painter();
     let heart = Rect::from_center_size(r.center() + vec2(0., 0.5), Vec2::splat(15.));
-    glow(p, heart.shrink(3.), 4., 5., t.ink(0.35));
-    crate::screens::cards::heart(p, heart, t);
+    crate::screens::cards::lit_heart(p, heart, t);
     resp.on_hover_text(title)
 }
 /// The big round play button: a lit rim, a soft halo and a glowing glyph (the web version's `.play-big`).

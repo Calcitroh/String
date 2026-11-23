@@ -52,11 +52,12 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     );
     controls.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.;
-        if ui::seg(ui, "RECORD", !lyrics).clicked() {
-            v.views.overlay = Some(Overlay::Record);
-        }
-        if ui::seg(ui, "LYRICS", lyrics).clicked() {
-            v.views.overlay = Some(Overlay::Lyrics);
+        // the same dark segmented switch as the Library page's, its chosen side lit with a soft glow
+        let current = if lyrics { "lyrics" } else { "record" };
+        match crate::ui::panel::seg(ui, &[("record", "Record"), ("lyrics", "Lyrics")], current, t) {
+            Some("record") => v.views.overlay = Some(Overlay::Record),
+            Some("lyrics") => v.views.overlay = Some(Overlay::Lyrics),
+            _ => {}
         }
         let (b, _) = ui.allocate_exact_size(vec2(30., 26.), egui::Sense::hover());
         if ui::icon_btn(ui, b, "down", "Close Now Playing", false, t).clicked() {
