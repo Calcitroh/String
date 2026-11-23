@@ -2,7 +2,7 @@ use crate::{
     player_bar,
     route::Route,
     screens,
-    theme::*,
+    theme::{look, *},
     ui::{self, area, child},
     view::{Overlay, View},
 };
@@ -95,6 +95,8 @@ pub fn shortcuts(ui: &Ui, v: &mut View<'_>) {
     }
 }
 pub fn show(ui: &mut Ui, v: &mut View<'_>) {
+    // the person's own look.css: "Use my look.css" is on unless turned off, as in 1.x
+    look::frame(ui.ctx(), v.s.setting("look").as_bool().unwrap_or(true));
     ui::set_tint(ui.ctx(), v.tint);
     screens::dupes::settle(v);
     let r = ui.max_rect();
@@ -111,6 +113,8 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             main.width() - side,
             main.height(),
         );
+        // the look's picture behind the pages (1.x's #main)
+        look::paint_main(ui.painter(), body);
         screens::detail::backdrop(ui, v, body);
         topbar(
             &mut child(
@@ -157,45 +161,58 @@ fn sidebar(ui: &mut Ui, v: &mut View<'_>) {
         false,
     );
     p.vline(r.right() - 1., r.y_range(), (1., HAIR));
-    // the logo: a glowing wire between two ringed pegs, then S T R I N G with a soft halo
-    let x = r.left() + 20.;
-    let y = r.top() + 32.;
-    let (a, b) = (pos2(x + 4., y), pos2(x + 30., y));
-    ui::glow(
+    // the logo box (1.x's .brand): the person's own picture from their look, if any, then String's logo unless the
+    // look hides it: a glowing wire between two ringed pegs, then S T R I N G with a soft halo
+    let brand = look::brand();
+    look::paint_brand(
         &p,
-        Rect::from_min_max(a, b).expand2(vec2(0., 1.)),
-        1.,
-        6.,
-        t.ink(0.25),
+        area(r.left(), r.top(), r.width(), brand.height),
+        brand.pad,
     );
-    if v.st.playing {
-        // The string plucks while music plays, as in the web version (±5.5 px, 0.11 s each way).
-        let time = ui.input(|i| i.time);
-        let bend = -5.5 * (std::f64::consts::PI * time / 0.11).cos() as f32;
-        p.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
-            [a, pos2(x + 17., y + bend), b],
-            false,
-            egui::Color32::TRANSPARENT,
-            egui::Stroke::new(1.6, t.ink(1.)),
-        ));
-        ui.ctx().request_repaint();
-    } else {
-        p.line_segment([a, b], (1.6, t.ink(1.)));
+    let x = r.left() + brand.pad[3];
+    let y = r.top() + brand.pad[0] + (brand.height - brand.pad[0] - brand.pad[2]) / 2.;
+    if brand.wire {
+        let (a, b) = (pos2(x + 4., y), pos2(x + 30., y));
+        ui::glow(
+            &p,
+            Rect::from_min_max(a, b).expand2(vec2(0., 1.)),
+            1.,
+            6.,
+            t.ink(0.25),
+        );
+        if v.st.playing {
+            // The string plucks while music plays, as in the web version (±5.5 px, 0.11 s each way).
+            let time = ui.input(|i| i.time);
+            let bend = -5.5 * (std::f64::consts::PI * time / 0.11).cos() as f32;
+            p.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
+                [a, pos2(x + 17., y + bend), b],
+                false,
+                egui::Color32::TRANSPARENT,
+                egui::Stroke::new(1.6, t.ink(1.)),
+            ));
+            ui.ctx().request_repaint();
+        } else {
+            p.line_segment([a, b], (1.6, t.ink(1.)));
+        }
+        for peg in [a, b] {
+            p.circle(peg, 2.4, BG, (1.4, t.ink(0.8)));
+        }
     }
-    for peg in [a, b] {
-        p.circle(peg, 2.4, BG, (1.4, t.ink(0.8)));
+    if brand.name {
+        ui::glowing(
+            &p,
+            area(x + 46., y - 10., 150., 20.),
+            "STRING",
+            "HUD",
+            15.,
+            5.7,
+            TEXT,
+            egui::Align2::LEFT_CENTER,
+            (20., 0.4, t),
+        );
     }
-    ui::glowing(
-        &p,
-        area(x + 46., y - 10., 150., 20.),
-        "STRING",
-        "HUD",
-        15.,
-        5.7,
-        TEXT,
-        egui::Align2::LEFT_CENTER,
-        (20., 0.4, t),
-    );
+    // the page list starts below the logo box: 62 px in String's own look
+    let top = r.top() + brand.height;
     let today =
         v.s.listening
             .days()
@@ -222,7 +239,7 @@ fn sidebar(ui: &mut Ui, v: &mut View<'_>) {
     for (idx, (route, icon, count)) in nav.into_iter().enumerate() {
         let row = area(
             r.left() + 10.,
-            r.top() + 62. + idx as f32 * 39.,
+            top + idx as f32 * 39.,
             r.width() - 21.,
             38.,
         );
@@ -280,7 +297,7 @@ fn sidebar(ui: &mut Ui, v: &mut View<'_>) {
         ui,
         v,
         Rect::from_min_max(
-            pos2(r.left(), r.top() + 316.),
+            pos2(r.left(), (top + 254.).min(r.bottom() - 40.)),
             pos2(r.right(), r.bottom() - 40.),
         ),
     );

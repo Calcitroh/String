@@ -44,7 +44,8 @@ Settings → Apps. "Read me first.txt" in the zip has the details, and "Phone se
 String is being rebuilt as a native Windows program (written in Rust, in `native/`): the same player, using about half
 the memory and far less of the processor. A preview is on the [Releases](../../releases) page as a pre-release: unzip
 it and open String.exe. It opens your String library and leaves your installed String alone (installed copies never
-update to a preview). Not in it yet: add-ons, your own look, installing and updating.
+update to a preview). Your own look works in part: its tint, your logo and a background picture, not yet its colours
+or font. Not in it yet: add-ons, installing and updating.
 
 ## What goes online
 

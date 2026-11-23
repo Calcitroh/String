@@ -127,6 +127,11 @@ pub const CASES: &[Case] = &[
         ready: crate::screens::dupes::smoke::settled,
     },
     Case {
+        name: "47-look",
+        prepare: crate::screens::settings::smoke::look,
+        ready: crate::screens::settings::smoke::look_ready,
+    },
+    Case {
         name: "queue-drawer",
         prepare: lists::queue,
         ready: lists::queue_ready,
