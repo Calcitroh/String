@@ -1,5 +1,6 @@
 use egui::{Color32, Context, FontData, FontDefinitions, FontFamily, FontId, RichText};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
+pub mod look;
 pub const BG: Color32 = Color32::from_rgb(5, 5, 6);
 pub const BG2: Color32 = Color32::from_rgb(8, 8, 10);
 pub const PANEL: Color32 = Color32::from_rgb(11, 11, 13);
@@ -22,20 +23,26 @@ pub enum Tint {
     Mono,
     Arc,
     Ember,
+    /// The person's own, from `--hi` in their look.css (see `look`).
+    Custom([u8; 3]),
 }
 impl Tint {
+    /// The tint to draw with for the `tint` setting: Mono, Arc or Ember, unless the person's look.css (while "Use
+    /// my look.css" is on) sets a `--hi` that wins over it, as it would in 1.x.
     pub fn parse(value: Option<&str>) -> Self {
-        match value {
+        let own = match value {
             Some("arc") => Self::Arc,
             Some("ember") => Self::Ember,
             _ => Self::Mono,
-        }
+        };
+        look::tint(own).map_or(own, Self::Custom)
     }
     pub fn rgb(self) -> [u8; 3] {
         match self {
             Self::Mono => [236, 238, 242],
             Self::Arc => [120, 220, 255],
             Self::Ember => [255, 190, 112],
+            Self::Custom(rgb) => rgb,
         }
     }
     pub fn ink(self, opacity: f32) -> Color32 {

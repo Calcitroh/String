@@ -47,6 +47,8 @@ pub struct State {
     pub how_open: Option<bool>,
     /// Scroll this row of panels into view once.
     pub reveal_row: Option<usize>,
+    /// Scroll the Look part of Playback to the top for this many frames (the rows settle their heights meanwhile).
+    pub reveal_look: u8,
     numbers: Option<(u64, Numbers)>,
 }
 #[derive(Default)]
@@ -697,12 +699,25 @@ fn playback(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
     );
     ui.add_space(10.);
     panel::panel_h(ui, "Look", "", tint);
+    if st.reveal_look > 0 {
+        st.reveal_look -= 1;
+        ui.scroll_to_cursor(Some(Align::Min));
+    }
     let now = v.s.setting("tint").as_str().unwrap_or("mono").to_owned();
+    // the person's look.css can set its own tint: shown beside String's three while it's the one drawn
+    let custom = matches!(tint, Tint::Custom(_));
+    let tints: &[(&str, &str)] = if custom {
+        &[("mono", "Mono"), ("arc", "Arc"), ("ember", "Ember"), ("look", "Look")]
+    } else {
+        &[("mono", "Mono"), ("arc", "Arc"), ("ember", "Ember")]
+    };
     let picked = panel::row(ui, "Tint", |ui| {
         panel::seg(
             ui,
-            &[("mono", "Mono"), ("arc", "Arc"), ("ember", "Ember")],
-            if matches!(now.as_str(), "arc" | "ember") {
+            tints,
+            if custom {
+                "look"
+            } else if matches!(now.as_str(), "arc" | "ember") {
                 &now
             } else {
                 "mono"
@@ -710,8 +725,13 @@ fn playback(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
             tint,
         )
     });
-    if let Some(k) = picked {
+    if let Some(k) = picked
+        && k != "look"
+    {
         v.s.set_setting("tint", k.into());
+    }
+    if custom {
+        panel::note(ui, "Your look.css sets the tint while “Use my look.css” is on.");
     }
     let picked = panel::row(ui, "Cover art", |ui| {
         panel::seg(
@@ -728,6 +748,31 @@ fn playback(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
     if panel::switch(ui, "Spectrum in the player bar", &mut viz, tint) {
         v.s.set_setting("viz", viz.into());
     }
+    // your own look: <data>\look\look.css, the same file and setting as 1.x (see theme::look)
+    let open = panel::row(ui, "Your own look", |ui| {
+        Btn::new("Open folder", tint).icon("folder").sm().show(ui)
+    });
+    if open.clicked() {
+        match crate::theme::look::open_folder() {
+            Ok((css, made)) => {
+                if made {
+                    v.views
+                        .toast
+                        .set("Your look folder is ready: look.css has examples to start from");
+                }
+                services::fire(ui.ctx(), move |s| s.reveal(&css));
+            }
+            Err(e) => v.views.toast.set(e.to_string()),
+        }
+    }
+    let mut look = v.s.setting("look").as_bool().unwrap_or(true);
+    if panel::switch(ui, "Use my look.css", &mut look, tint) {
+        v.s.set_setting("look", look.into());
+    }
+    panel::note(
+        ui,
+        "A look.css in your look folder, with pictures beside it, can change the tint, the logo and the picture behind the pages. Updates never touch it, and String shows each saved change straight away. The first time, the folder gets a look.css full of examples. Its colours and fonts work in String 1.x only, for now.",
+    );
 }
 fn valid_id(id: &str) -> bool {
     (15..=22).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
@@ -1165,5 +1210,22 @@ pub mod smoke {
         let mut st = state();
         st.updates = Default::default();
         st.how_open = None;
+    }
+    static LOOK_AT: Mutex<Option<Instant>> = Mutex::new(None);
+    /// Settings → Look, with whatever look the test profile has (a planted `look\look.css` shows its tint, logo and
+    /// background here and on every page before).
+    pub fn look(v: &mut View<'_>) {
+        tidy();
+        v.go(Route::Settings);
+        state().reveal_look = 6;
+        *LOOK_AT.lock().unwrap() = Some(Instant::now());
+    }
+    /// Once the look matches the switch, its pictures are on screen and the scroll has come to rest.
+    pub fn look_ready(v: &mut View<'_>) -> bool {
+        let on = v.s.setting("look").as_bool().unwrap_or(true);
+        v.views.history.current == Route::Settings
+            && state().reveal_look == 0
+            && LOOK_AT.lock().unwrap().is_some_and(|t| t.elapsed() > Duration::from_millis(700))
+            && crate::theme::look::settled(on)
     }
 }
