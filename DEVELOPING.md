@@ -121,9 +121,10 @@ Dark and monochrome on purpose: contrast and weight do the work colour would do.
   joined to media_file and library, as full paths. `--navidrome-db <file>` (only with --smoke-test) points it at the
   database `tests\fake-navidrome.js` makes; a self-test never reads a real one.
 - The icon is String's logo, by awepollyon: `native\icon\logo.png`. `python native\icon\logo-to-icon.py` makes
-  `src\Assets\String.ico` / `.png`, String 2.0's copies and `src\wwwroot\logo.png` from it (Pillow). The first time
-  String starts with it, a card above the player bar credits its maker until closed (`iconCredit` in string.js;
-  `set.iconCreditSeen`, shared with String 2.0).
+  `src\Assets\String.ico` / `.png`, String 2.0's copies and `src\wwwroot\string-icon-credit.png` from it (Pillow).
+  The first time String starts with it, a card above the player bar credits its maker until closed (`iconCredit` in
+  string.js, `#stringIconCredit`, its layout on the element because an update keeps a person's edited string.css;
+  `set.iconCreditSeen`, shared with String 2.0). The installer then tells Windows icons changed, without waiting.
 
 Data: `%LOCALAPPDATA%\String\` (state.json, listening.json, library.json, presence.json, discord-covers.json,
 window.json, errors.log, lyrics\, translations\, tag-backup\, look\ (the person's own look), addons\, updates\,

@@ -2119,7 +2119,7 @@
     }
     if (typing) return;
     const k = e.key, ctrl = e.ctrlKey || e.metaKey;
-    if ((k === ' ' || k === 'Enter') && e.target.id === 'tDur') return;
+    if ((k === ' ' || k === 'Enter') && (e.target.id === 'tDur' || e.target.id === 'stringIconCreditClose')) return;
     if (e.altKey && k === 'ArrowLeft') { e.preventDefault(); back(); return; }
     if (e.altKey && k === 'ArrowRight') { e.preventDefault(); fwd(); return; }
     if (e.altKey) return;
@@ -2267,12 +2267,17 @@
   });
 
   /* A thank-you to the icon's maker: the first time String starts with this icon, a small card above the player bar,
-     until it's closed. set.iconCreditSeen is shared with String 2.0 (the same data), so it's shown once in either. */
+     until it's closed. set.iconCreditSeen is shared with String 2.0 (the same data), so it's shown once in either.
+     Its layout is on the element itself: an update keeps a person's edited string.css, which wouldn't have it. Its
+     picture has a name of its own, so it never takes the place of a logo.png someone put there. */
   function iconCredit() {
-    if (S().set.iconCreditSeen || document.querySelector('.credit-card')) return;
+    if (S().set.iconCreditSeen || document.getElementById('stringIconCredit')) return;
     const card = document.createElement('div');
-    card.className = 'credit-card';
-    card.innerHTML = `<img src="logo.png" alt=""><span>Credits to Discord — awepollyon for the icon!</span><button class="icon-btn" title="Close">${icon('x')}</button>`;
+    card.id = 'stringIconCredit';
+    card.style.cssText = 'position:fixed;z-index:30;right:18px;bottom:calc(var(--bar, 84px) + 14px);display:flex;align-items:center;gap:12px;' +
+      'padding:10px 10px 10px 12px;border:1px solid var(--hair2, rgb(255 255 255 / .12));background:var(--panel, #0b0b0d);' +
+      'box-shadow:0 10px 30px rgb(0 0 0 / .67);color:var(--text, #e9e9ec);font:13.5px/1.3 var(--ui, "Segoe UI", sans-serif)';
+    card.innerHTML = `<img src="string-icon-credit.png" alt="" style="width:40px;height:40px;flex:none"><span style="white-space:nowrap">Credits to Discord — awepollyon for the icon!</span><button class="icon-btn" id="stringIconCreditClose" title="Close">${icon('x')}</button>`;
     card.querySelector('button').onclick = () => { S().set.iconCreditSeen = true; N.save(); card.remove(); };
     document.body.appendChild(card);
   }
