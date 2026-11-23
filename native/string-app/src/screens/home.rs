@@ -75,7 +75,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             };
             let route = match recent["kind"].as_str() {
                 Some("artist") => Route::Artist(k.into()),
-                Some("album") => Route::Album(k.into()),
+                Some("album") => Route::Album(v.s.models.catalog.resolve_album_key(k).into()),
                 Some("pl") => Route::Playlist(k.into()),
                 _ => continue,
             };

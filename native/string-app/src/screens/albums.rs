@@ -2,9 +2,16 @@ use super::{
     cards, home,
     library::{self, Index, count},
 };
-use crate::{model::norm, theme::*, ui, view::View};
-use egui::{Id, Ui};
-use std::cmp::Reverse;
+use crate::{theme::*, ui, view::View};
+use egui::Ui;
+use serde_json::Value;
+
+pub(super) fn set_sort(v: &mut View<'_>, mode: Value) {
+    v.s.set_field("albumSort", mode);
+    v.s.models.sort_albums(&v.s.state);
+    v.s.generation += 1;
+    v.s.queue_changed(v.player);
+}
 
 pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     if home::empty(ui, v) {
@@ -16,22 +23,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             .as_str()
             .unwrap_or("artist")
             .to_owned();
-    let order = library::cached(
-        ui,
-        "album order",
-        Id::unique((v.s.generation, &mode)),
-        || {
-            let mut order: Vec<_> = (0..index.albums.len()).collect();
-            let albums = &index.albums;
-            match mode.as_str() {
-                "name" => {}
-                "recent" => order.sort_by_key(|&i| Reverse(albums[i].added)),
-                "year" => order.sort_by_key(|&i| Reverse(albums[i].year)),
-                _ => order.sort_by_cached_key(|&i| (norm(&albums[i].artist), albums[i].year)),
-            }
-            order
-        },
-    );
+    let order = &index.album_order;
     egui::ScrollArea::vertical().show(ui, |ui| {
         let r = library::title_bar(ui, 30., "Albums", &count(order.len(), "album"), 236.);
         let bar = ui::area(r.right() - 227., r.top(), 227., 30.);
@@ -59,7 +51,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                 if selected { TEXT } else { MUTED },
             );
             if resp.clicked() {
-                v.s.set_field("albumSort", key.into());
+                set_sort(v, key.into());
             }
             x += width;
         }

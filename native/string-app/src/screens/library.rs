@@ -71,7 +71,11 @@ pub fn section(ui: &mut Ui, title: &str, link: Option<Route>, v: &mut View<'_>) 
         ui.label(hud(&title.to_uppercase(), 12.5).extra_letter_spacing(3.));
         if let Some(route) = link
             && ui
-                .link(mono("Show all", 10.5).extra_letter_spacing(0.63).color(FAINT))
+                .link(
+                    mono("Show all", 10.5)
+                        .extra_letter_spacing(0.63)
+                        .color(FAINT),
+                )
                 .clicked()
         {
             v.go(route);
@@ -127,6 +131,7 @@ pub struct Artist {
 }
 pub struct Index {
     pub albums: Vec<Album>,
+    pub album_order: Vec<usize>,
     pub artists: Vec<Artist>,
     pub playlists: Vec<Card>,
     pub recent_albums: Vec<usize>,
@@ -155,59 +160,18 @@ impl Index {
     }
     fn build(s: &Session) -> Self {
         let m = &s.models;
-        let tags: HashMap<_, _> = s
-            .library
-            .tracks
-            .iter()
-            .map(|t| (t.id(), t.tags.album_artist.as_str()))
-            .collect();
+        // Other views use library insertion order even when the Albums page changes sort.
+        let mut groups: Vec<_> = m.catalog.albums.iter().collect();
+        groups.sort_unstable_by_key(|g| m.album_info[&g.key].first);
         let mut album_idx = HashMap::new();
-        let albums: Vec<_> = m
-            .catalog
-            .albums
-            .iter()
+        let albums: Vec<_> = groups
+            .into_iter()
             .enumerate()
             .map(|(i, g)| {
                 album_idx.insert(&g.key, i);
-                let mut names = HashMap::<&str, usize>::new();
-                let mut year = 0;
-                let mut added = 0;
-                let mut duration = 0.;
-                for id in &g.ids {
-                    let song = &m.by_id[id];
-                    let aa = tags.get(id).copied().unwrap_or("");
-                    let name = if aa.is_empty()
-                        || s.field("edits")[id]["artist"]
-                            .as_str()
-                            .is_some_and(|a| !a.is_empty())
-                    {
-                        &song.artist
-                    } else {
-                        aa
-                    };
-                    if !name.is_empty() {
-                        *names.entry(name).or_default() += 1;
-                    }
-                    year = year.max(song.year);
-                    added = added.max(song.added);
-                    duration += song.duration;
-                }
-                let name = names
-                    .iter()
-                    .min_by_key(|&(name, n)| (Reverse(n), name))
-                    .map_or("", |(name, _)| *name);
-                let artist = if names.len() > 2
-                    && g.ids
-                        .first()
-                        .and_then(|id| tags.get(id))
-                        .is_none_or(|a| a.is_empty())
-                {
-                    "Various artists"
-                } else if name.is_empty() {
-                    "Unknown artist"
-                } else {
-                    name
-                };
+                let info = &m.album_info[&g.key];
+                let artist = &info.artist;
+                let year = info.year;
                 let caption = if year == 0 {
                     artist.to_owned()
                 } else {
@@ -220,15 +184,16 @@ impl Index {
                         caption,
                         Art::Cover(cover(s, &g.ids)),
                     ),
-                    artist: artist.into(),
-                    artist_key: norm(name),
+                    artist: artist.clone(),
+                    artist_key: info.artist_key.clone(),
                     year,
-                    added,
-                    duration,
+                    added: info.added,
+                    duration: info.duration,
                 }
             })
             .collect();
-        let mut artists: Vec<_> = m
+        let album_order = m.catalog.albums.iter().map(|g| album_idx[&g.key]).collect();
+        let artists: Vec<_> = m
             .catalog
             .artists
             .iter()
@@ -257,9 +222,6 @@ impl Index {
                 }
             })
             .collect();
-        artists.sort_by_key(
-            |a| matches!(&a.card.target,Target::Page(Route::Artist(k)) if k.is_empty()),
-        );
         let playlists = m
             .playlists
             .iter()
@@ -293,30 +255,15 @@ impl Index {
             .collect();
         // Newest first; albums added at the same moment keep the order their first song has in the library, as in
         // the web version.
-        let mut first = HashMap::new();
-        for (i, t) in s.library.tracks.iter().enumerate() {
-            if let Some(song) = m.by_id.get(&t.id())
-                && !s.state.hidden(&song.id)
-            {
-                first.entry(song.album_key.as_str()).or_insert(i);
-            }
-        }
         let mut recent_albums: Vec<_> = (0..albums.len()).collect();
-        recent_albums.sort_by_key(|&i| {
-            (
-                Reverse(albums[i].added),
-                first
-                    .get(m.catalog.albums[i].key.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX),
-            )
-        });
+        recent_albums.sort_by_key(|&i| Reverse(albums[i].added));
         recent_albums.truncate(14);
         let mut most_artists:Vec<_>=(0..artists.len()).filter(|&i| matches!(&artists[i].card.target, Target::Page(Route::Artist(k)) if !k.is_empty())).collect();
         most_artists.sort_by_key(|&i| Reverse(artists[i].songs));
         most_artists.truncate(14);
         Self {
             albums,
+            album_order,
             artists,
             playlists,
             recent_albums,
@@ -388,7 +335,16 @@ pub fn filtered(ui: &Ui, v: &mut View<'_>, ids: &Ids) -> Ids {
     .clone()
 }
 pub fn clip_label(ui: &Ui, r: Rect, text: &str, face: &str, size: f32, color: Color32) {
-    ui::spaced(ui.painter(), r, text, face, size, 0., color, Align2::LEFT_CENTER);
+    ui::spaced(
+        ui.painter(),
+        r,
+        text,
+        face,
+        size,
+        0.,
+        color,
+        Align2::LEFT_CENTER,
+    );
 }
 pub fn title_bar(ui: &mut Ui, height: f32, title: &str, meta: &str, controls: f32) -> Rect {
     let (_, r) = ui.allocate_space(vec2(ui.available_width(), height));
