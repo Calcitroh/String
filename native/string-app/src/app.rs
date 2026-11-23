@@ -56,11 +56,11 @@ impl App {
         exit: Arc<AtomicI32>,
     ) -> Result<Self, Error> {
         let ctx = &cc.egui_ctx;
-        platform.attach(cc)?;
+        let lyrics = crate::screens::lyrics::LyricsView::new(&args.root, args.smoke.is_some());
+        platform.attach(cc, lyrics.ollama())?;
         adds.attach(ctx);
         theme::install(ctx);
         let now = Instant::now();
-        let lyrics = crate::screens::lyrics::LyricsView::new(&args.root, args.smoke.is_some());
         let mut a = Self {
             smoke: args.smoke.clone().map(Smoke::new),
             args,

@@ -230,32 +230,9 @@ pub fn actions(ui: &mut Ui, v: &mut View<'_>, ids: &Ids, more: bool, hint: Optio
             false,
             v.tint,
         );
-        egui::Popup::menu(&resp).show(|ui| {
-            for (name, end) in [("Play next", false), ("Add to queue", true)] {
-                if ui.button(name).clicked() {
-                    v.s.insert(v.player, &ids, end);
-                    ui.close();
-                }
-            }
-            if !v.s.models.playlists.is_empty() {
-                let mut add = None;
-                ui.menu_button("Add to playlist", |ui| {
-                    for pl in &v.s.models.playlists {
-                        if ui.button(&pl.name).clicked() {
-                            add = Some(pl.id.clone());
-                            ui.close();
-                        }
-                    }
-                });
-                if let Some(k) = add {
-                    v.s.add_to_playlist(&k, ids.clone());
-                }
-            }
-            if ui.button("Toggle liked").clicked() {
-                v.s.toggle_like(&ids);
-                ui.close();
-            }
-        });
+        if resp.clicked() {
+            crate::ui::menus::ctx_menu(ctx, resp.rect.left_bottom(), Some(ids.clone()));
+        }
     }
     ui.add_space(12.);
     ids

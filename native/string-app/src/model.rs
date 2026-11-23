@@ -447,9 +447,17 @@ impl Models {
         self.songs = ids.clone().into();
     }
     pub fn refresh_lists(&mut self, state: &State) {
+        let hidden = state
+            .fields
+            .get("hidden")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|entries| entries.keys())
+            .filter(|id| state.hidden(id) && self.by_id.contains_key(*id));
         self.liked = self
             .songs
             .iter()
+            .chain(hidden)
             .filter(|id| {
                 state
                     .fields
@@ -483,7 +491,7 @@ impl Models {
                         .into_iter()
                         .flatten()
                         .filter_map(|v| v.as_str().or(v["id"].as_str()))
-                        .filter(|id| self.by_id.contains_key(*id) && !state.hidden(id))
+                        .filter(|id| self.by_id.contains_key(*id))
                         .map(str::to_owned)
                         .collect(),
                 })

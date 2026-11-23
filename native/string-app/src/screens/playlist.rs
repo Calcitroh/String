@@ -45,31 +45,26 @@ const HERO: f32 = 262.;
 const ACTIONS: f32 = 80.;
 const HEAD: f32 = 40.;
 
-fn build(v: &View<'_>, key: &str) -> Page {
-    let entries = v.s.playlist_entries(key);
+fn build(s: &crate::playback::Session, key: &str, filter: String) -> Page {
+    let entries = s.playlist_entries(key);
     let total = entries.len();
-    let filter = v.views.filter.clone();
     let terms = norm(&filter);
-    let terms: Vec<_> = terms.split_whitespace().collect();
     let (mut have, mut duration) = (0, 0.);
     let mut rows = vec![];
     for (place, id, added) in entries {
-        let Some(song) = v.s.models.by_id.get(&id).filter(|_| !v.s.state.hidden(&id)) else {
+        let Some(song) = s.models.by_id.get(&id) else {
             continue;
         };
         have += 1;
         duration += song.duration;
-        if !terms.is_empty() {
-            let text = norm(&format!("{} {} {}", song.title, song.artist, song.album));
-            if !terms.iter().all(|t| text.contains(t)) {
-                continue;
-            }
+        if !song.matches(&terms) {
+            continue;
         }
         rows.push(Entry { place, id, added });
     }
     Page {
         key: key.into(),
-        generation: v.s.generation,
+        generation: s.generation,
         filter,
         ids: rows.iter().map(|r| r.id.clone()).collect(),
         added: rows.iter().map(|r| r.added).collect(),
@@ -215,7 +210,8 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     let old = PAGE.lock().unwrap().take().filter(|p| p.key == key);
     let mut page = match old {
         Some(p) if p.generation == v.s.generation && p.filter == v.views.filter => p,
-        _ => build(v, &key),
+        // A rebuilt list (another filter included) keeps the chosen songs: the selection follows them by identity.
+        _ => build(v.s, &key, v.views.filter.clone()),
     };
     v.views.selection.display(&page.ids, Some(&page.added));
     let n = page.rows.len();
@@ -695,7 +691,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                 v.s.playlist_move(&key, &places, before);
                 // Bind the selected rows to their new places, including identical legacy entries.
                 let start = at - page.drag.iter().filter(|&&i| i < at).count();
-                let next = build(v, &key);
+                let next = build(v.s, &key, v.views.filter.clone());
                 v.views.selection = Default::default();
                 v.views.selection.bind(&next.ids, Some(&next.added));
                 for i in start..start + places.len() {
@@ -781,4 +777,58 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
 }
 fn time_text(seconds: f64) -> String {
     time(seconds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use string_core::{library::Library, state::State};
+
+    fn session() -> crate::playback::Session {
+        let mut state = State::default();
+        let path = "01 original.flac";
+        state.fields.insert("liked".into(), json!({path: 12}));
+        state.fields.insert("hidden".into(), json!({path: true}));
+        state.fields.insert(
+            "playlists".into(),
+            json!([{"id":"p","name":"Mix","items":[path,"other.flac","gone.flac"]}]),
+        );
+        let library: Library = serde_json::from_value(json!({"v":1,"tracks":[
+            {"path":path,"title":"First","genre":"Tango","albumArtist":"Guests"},
+            {"path":"other.flac","title":"Second","genre":"Jazz"}
+        ]}))
+        .unwrap();
+        crate::playback::Session::new(state, Default::default(), library)
+    }
+
+    #[test]
+    fn saved_lists_display_hidden_songs_and_the_queue_skips_them() {
+        let mut s = session();
+        let rows = build(&s, "p", String::new());
+        assert_eq!(rows.ids.as_ref(), &["01 original.flac", "other.flac"]);
+        assert_eq!(s.models.liked.as_ref(), &["01 original.flac"]);
+        assert_eq!(s.models.playlists[0].ids, rows.ids);
+        assert!(
+            s.state
+                .queue
+                .play_ids(&rows.ids, 0, json!({}), &s.models.catalog)
+        );
+        assert_eq!(s.state.queue.current(), Some("other.flac"));
+        assert!(
+            s.state
+                .queue
+                .insert(&s.models.liked, false, &s.models.catalog)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn playlist_filter_matches_genre_album_artist_and_filename_together() {
+        let mut s = session();
+        s.state.fields.remove("hidden");
+        s.rebuild();
+        let page = build(&s, "p", "gUeSTs original TANGO".into());
+        assert_eq!(page.ids.as_ref(), &["01 original.flac"]);
+        assert_eq!(page.rows[0].place, 0);
+    }
 }

@@ -170,3 +170,25 @@ fn legacy_unasked_record_upgrades_through_search() {
     assert_eq!(found.lines[0].text, "match");
     assert_eq!(record(tmp.path()).1["asked"], true);
 }
+
+#[test]
+fn interrupted_retry_does_not_ask_again_on_return_or_restart() {
+    let dir = tempdir().unwrap();
+    let fake = Fake::new("lrclib", "normal");
+    let lyrics = Lyrics::with_base_url(dir.path(), &fake.base);
+    let path = dir.path().join("no-match.flac");
+    let mut t = song(&path);
+    t.title = "Absent song";
+    assert!(lyrics.get(&t, true, false).online);
+    let requests = || fake.read("/api/_seen").as_array().unwrap().len();
+    assert_eq!(requests(), 2);
+    // The local phase of Look again runs before the view's online delay.
+    lyrics.lookup(&t, string_lyrics::Lookup::BeforeOnlineDelay, true);
+    assert_eq!(requests(), 2);
+    assert!(lyrics.get(&t, true, false).online);
+    let reopened = Lyrics::with_base_url(dir.path(), &fake.base);
+    assert!(reopened.get(&t, true, false).online);
+    assert_eq!(requests(), 2);
+    assert!(reopened.get(&t, true, true).online);
+    assert_eq!(requests(), 4);
+}

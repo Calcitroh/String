@@ -160,17 +160,12 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                         }
                     });
                 }
-                "more" => {
-                    egui::Popup::menu(&resp).show(|ui| {
-                        if ui.button("Show in songs").clicked() {
-                            v.jump_current();
-                            ui.close();
-                        }
-                        if ui.button("Play next").clicked() {
-                            v.s.insert(v.player, std::slice::from_ref(&song.id), false);
-                            ui.close();
-                        }
-                    });
+                "more" if resp.clicked() => {
+                    ui::menus::track_menu(
+                        vec![song.id.clone()],
+                        resp.rect.left_bottom(),
+                        ui::menus::Origin::none(),
+                    );
                 }
                 _ => {}
             }

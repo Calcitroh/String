@@ -20,22 +20,26 @@
 
 use crate::Hwnd;
 use std::{fs, io, path::Path};
-use windows::Win32::Foundation::{COLORREF, POINT};
+use windows::Win32::Foundation::{COLORREF, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_TEXT_COLOR,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
-    MONITORINFO, MonitorFromPoint, MonitorFromWindow,
+    CreateSolidBrush, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+    MonitorFromWindow,
 };
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, GetDpiForSystem,
+    SetThreadDpiAwarenessContext,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GCLP_HBRBACKGROUND, GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, GetWindowPlacement,
-    HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOW,
-    SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetClassLongPtrW, SetForegroundWindow, SetWindowPos, ShowWindow,
-    WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_EX_TOOLWINDOW,
+    GCLP_HBRBACKGROUND, GWL_EXSTYLE, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW,
+    GetWindowPlacement, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, IsZoomed,
+    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE,
+    SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetClassLongPtrW, SetForegroundWindow, SetWindowPos,
+    ShowWindow, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 /// A colour, red, green and blue.
@@ -122,6 +126,24 @@ fn dwm_set(hwnd: Hwnd, attribute: DWMWINDOWATTRIBUTE, value: u32) -> io::Result<
 
 /* ---------- window.json ---------- */
 
+pub const MIN_SIZE: (f64, f64) = (960., 600.);
+
+// WPF runs system-DPI-aware. Ask Windows for the same virtualized desktop coordinates and use
+// that coordinate space when positioning the per-monitor-aware native window, too.
+struct WpfCoordinates(DPI_AWARENESS_CONTEXT);
+impl WpfCoordinates {
+    fn enter() -> Self {
+        Self(unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) })
+    }
+}
+impl Drop for WpfCoordinates {
+    fn drop(&mut self) {
+        if !self.0.0.is_null() {
+            unsafe { SetThreadDpiAwarenessContext(self.0) };
+        }
+    }
+}
+
 /// The window's place as `window.json` keeps it: WPF's `RestoreBounds` (the outer edges of the window when neither
 /// maximised nor minimised) in device-independent pixels (1/96 inch at the system's scale), and whether it was
 /// maximised. On disk: `{"Left":100,"Top":50,"Width":1400,"Height":880,"Max":false}`.
@@ -176,41 +198,15 @@ impl Placement {
         fs::write(path, self.to_json())
     }
 
-    /// Where the window is now; its normal place even while it's maximised or minimised. Maximised counts when it is,
-    /// or when it's minimised and will come back maximised.
+    /// Where the window is now; its normal place even while it's maximised or minimised. The saved flag reflects its current state.
     pub fn of_window(hwnd: Hwnd) -> Option<Placement> {
-        let h = hwnd.get();
-        let mut wp = WINDOWPLACEMENT {
-            length: size_of::<WINDOWPLACEMENT>() as u32,
-            ..Default::default()
-        };
-        unsafe { GetWindowPlacement(h, &mut wp) }.ok()?;
-        let mut r = wp.rcNormalPosition;
-        // the normal place is in workspace coordinates (beside the taskbar), except for tool windows: to the screen's
-        let ex = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32;
-        if ex & WS_EX_TOOLWINDOW.0 == 0 {
-            let mut mi = MONITORINFO {
-                cbSize: size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            if unsafe { GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi) }
-                .as_bool()
-            {
-                let (dx, dy) = (
-                    mi.rcWork.left - mi.rcMonitor.left,
-                    mi.rcWork.top - mi.rcMonitor.top,
-                );
-                r.left += dx;
-                r.right += dx;
-                r.top += dy;
-                r.bottom += dy;
-            }
-        }
+        Self::read_bounds(|| normal_bounds(hwnd))
+    }
+
+    fn read_bounds(read: impl FnOnce() -> Option<(RECT, bool)>) -> Option<Self> {
+        let _coordinates = WpfCoordinates::enter();
+        let (r, max) = read()?;
         let s = scale();
-        let max = unsafe {
-            IsZoomed(h).as_bool()
-                || (IsIconic(h).as_bool() && wp.flags.0 & WPF_RESTORETOMAXIMIZED.0 != 0)
-        };
         Some(Placement {
             left: r.left as f64 / s,
             top: r.top as f64 / s,
@@ -221,7 +217,7 @@ impl Placement {
     }
 
     /// App.cs's test before using a saved place: at least the minimum size, and the title bar (80 by 16 pixels in from
-    /// its top left corner) on a screen that's there now.
+    /// its top left corner) inside the Windows virtual-screen rectangle.
     pub fn fits(&self, min_width: f64, min_height: f64) -> bool {
         if ![self.left, self.top, self.width, self.height]
             .iter()
@@ -232,33 +228,65 @@ impl Placement {
         if self.width < min_width || self.height < min_height {
             return false;
         }
+        let _coordinates = WpfCoordinates::enter();
         let s = scale();
-        let grip = POINT {
-            x: ((self.left + 80.0) * s).round() as i32,
-            y: ((self.top + 16.0) * s).round() as i32,
-        };
-        !unsafe { MonitorFromPoint(grip, MONITOR_DEFAULTTONULL) }.is_invalid()
+        let x = (self.left + 80.) * s;
+        let y = (self.top + 16.) * s;
+        let metric = |index| unsafe { GetSystemMetrics(index) } as f64;
+        let left = metric(SM_XVIRTUALSCREEN);
+        let top = metric(SM_YVIRTUALSCREEN);
+        x >= left
+            && y >= top
+            && x <= left + metric(SM_CXVIRTUALSCREEN)
+            && y <= top + metric(SM_CYVIRTUALSCREEN)
     }
 
     /// Moves and sizes the window to this place (normal, not maximised; [`show`] maximises). Meant for the hidden
     /// window at start: it neither shows nor activates it.
     pub fn apply(&self, hwnd: Hwnd) -> io::Result<()> {
-        let s = scale();
-        let px = |x: f64| (x * s).round() as i32;
-        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
-        unsafe {
-            SetWindowPos(
-                hwnd.get(),
-                None,
-                px(self.left),
-                px(self.top),
-                px(self.width),
-                px(self.height),
-                flags,
-            )
-        }?;
-        Ok(())
+        self.position(|[x, y, w, h]| {
+            let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+            unsafe { SetWindowPos(hwnd.get(), None, x, y, w, h, flags) }?;
+            Ok(())
+        })
     }
+
+    fn position<T>(&self, place: impl FnOnce([i32; 4]) -> T) -> T {
+        let _coordinates = WpfCoordinates::enter();
+        let s = scale();
+        place([self.left, self.top, self.width, self.height].map(|x| (x * s).round() as i32))
+    }
+}
+
+fn normal_bounds(hwnd: Hwnd) -> Option<(RECT, bool)> {
+    let h = hwnd.get();
+    let mut wp = WINDOWPLACEMENT {
+        length: size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetWindowPlacement(h, &mut wp) }.ok()?;
+    let mut r = wp.rcNormalPosition;
+    // the normal place is in workspace coordinates (beside the taskbar), except for tool windows: to the screen's
+    let ex = unsafe { GetWindowLongPtrW(h, GWL_EXSTYLE) } as u32;
+    if ex & WS_EX_TOOLWINDOW.0 == 0 {
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if unsafe { GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut mi) }
+            .as_bool()
+        {
+            let (dx, dy) = (
+                mi.rcWork.left - mi.rcMonitor.left,
+                mi.rcWork.top - mi.rcMonitor.top,
+            );
+            r.left += dx;
+            r.right += dx;
+            r.top += dy;
+            r.bottom += dy;
+        }
+    }
+    Some((r, unsafe { IsZoomed(h).as_bool() }))
 }
 
 /// App.cs's RestorePlacement, for the hidden window at start: the place in `window.json` if it [`fits`](Placement::fits),
@@ -282,7 +310,11 @@ pub fn restore_placement(
 /// App.cs's SavePlacement, when the window closes.
 pub fn save_placement(hwnd: Hwnd, path: &Path) -> io::Result<()> {
     match Placement::of_window(hwnd) {
-        Some(p) if p.width > 0.0 && p.height > 0.0 => p.save(path),
+        Some(mut p) if p.width > 0.0 && p.height > 0.0 => {
+            p.width = p.width.max(MIN_SIZE.0);
+            p.height = p.height.max(MIN_SIZE.1);
+            p.save(path)
+        }
         _ => Ok(()),
     }
 }
@@ -290,6 +322,7 @@ pub fn save_placement(hwnd: Hwnd, path: &Path) -> io::Result<()> {
 /// The window at `width` by `height` (device-independent pixels) in the middle of the work area of the screen the
 /// pointer is on (WPF's CenterScreen).
 pub fn center(hwnd: Hwnd, width: f64, height: f64) -> io::Result<()> {
+    let _coordinates = WpfCoordinates::enter();
     let mut pt = POINT::default();
     let mut mi = MONITORINFO {
         cbSize: size_of::<MONITORINFO>() as u32,
@@ -511,6 +544,151 @@ mod tests {
         cloak(w.hwnd, true).unwrap();
         cloak(w.hwnd, false).unwrap();
         set_background(w.hwnd, BACKGROUND);
+    }
+
+    #[test]
+    fn mixed_scale_coordinates_are_read_in_the_legacy_context() {
+        use windows::Win32::UI::HiDpi::{
+            AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            GetThreadDpiAwarenessContext,
+        };
+        let _restore = WpfCoordinates(unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        });
+        // The injected monitor reports twice the dimensions to per-monitor callers.
+        // Exercise both placement operations on the same window without changing Windows settings.
+        let virtualized = || unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_SYSTEM_AWARE,
+            )
+            .as_bool()
+        };
+        let p = Placement::read_bounds(|| {
+            let r = if virtualized() {
+                RECT {
+                    left: 2020,
+                    top: 50,
+                    right: 3020,
+                    bottom: 650,
+                }
+            } else {
+                RECT {
+                    left: 2120,
+                    top: 100,
+                    right: 4120,
+                    bottom: 1300,
+                }
+            };
+            Some((r, false))
+        })
+        .unwrap();
+        let system_scale = {
+            let _wpf = WpfCoordinates::enter();
+            scale()
+        };
+        assert_eq!(p.width, 1000. / system_scale);
+        assert!(!virtualized());
+        let physical = p.position(|[x, y, w, h]| {
+            if virtualized() {
+                [1920 + (x - 1920) * 2, y * 2, w * 2, h * 2]
+            } else {
+                [x, y, w, h]
+            }
+        });
+        assert_eq!(physical, [2120, 100, 2000, 1200]);
+        assert!(!virtualized());
+    }
+
+    #[test]
+    fn system_aware_and_per_monitor_windows_share_bounds_on_each_display() {
+        use windows::Win32::Foundation::{LPARAM, RECT};
+        use windows::Win32::Graphics::Gdi::{EnumDisplayMonitors, HDC, HMONITOR};
+        use windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
+        use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        use windows::core::BOOL;
+
+        unsafe extern "system" fn collect(_: HMONITOR, _: HDC, r: *mut RECT, data: LPARAM) -> BOOL {
+            unsafe { (*(data.0 as *mut Vec<RECT>)).push(*r) };
+            BOOL(1)
+        }
+        let _restore = WpfCoordinates(unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        });
+        let native = TestWindow::new();
+        let (legacy, screens, system_scale) = {
+            let _coordinates = WpfCoordinates::enter();
+            let mut screens: Vec<RECT> = vec![];
+            let list = LPARAM((&mut screens as *mut Vec<RECT>) as isize);
+            assert!(unsafe { EnumDisplayMonitors(None, None, Some(collect), list) }.as_bool());
+            (TestWindow::new(), screens, scale())
+        };
+        assert!(!screens.is_empty());
+        for screen in screens {
+            // WPF creates its HWND at system-scale bounds. Compare the two actual outer
+            // rectangles from the per-monitor-aware caller, including the secondary origin.
+            let (x, y) = (screen.left + 32, screen.top + 40);
+            let (w, h) = (
+                (980. * system_scale).round() as i32,
+                (610. * system_scale).round() as i32,
+            );
+            {
+                let _coordinates = WpfCoordinates::enter();
+                unsafe {
+                    SetWindowPos(
+                        legacy.hwnd.get(),
+                        None,
+                        x,
+                        y,
+                        w,
+                        h,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    )
+                }
+                .unwrap();
+            }
+            let saved = Placement {
+                left: x as f64 / system_scale,
+                top: y as f64 / system_scale,
+                width: w as f64 / system_scale,
+                height: h as f64 / system_scale,
+                max: false,
+            };
+            saved.apply(native.hwnd).unwrap();
+            let rect = |win: &TestWindow| {
+                let mut bounds = RECT::default();
+                unsafe { GetWindowRect(win.hwnd.get(), &mut bounds) }.unwrap();
+                bounds
+            };
+            assert_eq!(rect(&native), rect(&legacy));
+            let back = Placement::of_window(native.hwnd).unwrap();
+            for (a, b) in [
+                (back.left, saved.left),
+                (back.top, saved.top),
+                (back.width, saved.width),
+                (back.height, saved.height),
+            ] {
+                assert!((a - b).abs() <= 1., "{back:?} versus {saved:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn small_native_window_saves_a_size_the_web_version_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("window.json");
+        let w = TestWindow::new();
+        let small = Placement {
+            left: 40.,
+            top: 40.,
+            width: 830.,
+            height: 540.,
+            max: false,
+        };
+        small.apply(w.hwnd).unwrap();
+        save_placement(w.hwnd, &path).unwrap();
+        let saved = Placement::load(&path).unwrap();
+        assert!(saved.fits(960., 600.), "{saved:?}");
     }
 
     #[test]

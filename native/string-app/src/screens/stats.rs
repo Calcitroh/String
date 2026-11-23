@@ -15,7 +15,13 @@ use std::{
     time::{Duration, Instant},
 };
 use string_core::stats::{Listening, PeriodKind, PeriodKind::*, Unit};
-use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_IFIRSTDAYOFWEEK};
+use windows::{
+    Win32::Globalization::{
+        GetUserPreferredUILanguages, MUI_LANGUAGE_NAME, U_ZERO_ERROR, UCAL_DEFAULT,
+        UCAL_FIRST_DAY_OF_WEEK, ucal_close, ucal_getAttribute, ucal_open,
+    },
+    core::{PCSTR, PWSTR},
+};
 
 const KINDS: [(PeriodKind, &str, &str, &str); 5] = [
     (Day, "day", "Today", "Yesterday"),
@@ -47,23 +53,54 @@ fn duration(seconds: f64, short: bool) -> String {
 }
 
 fn week_start() -> Weekday {
-    let mut buf = [0u16; 4];
-    // A null locale name reads the user's Windows regional preference (Monday = 0).
-    if unsafe { GetLocaleInfoEx(None, LOCALE_IFIRSTDAYOFWEEK, Some(&mut buf)) } > 0 {
-        [
-            Weekday::Mon,
-            Weekday::Tue,
-            Weekday::Wed,
-            Weekday::Thu,
-            Weekday::Fri,
-            Weekday::Sat,
-            Weekday::Sun,
-        ]
-        .get(buf[0].saturating_sub(48) as usize)
-        .copied()
-        .unwrap_or(Weekday::Mon)
-    } else {
-        Weekday::Mon
+    let (mut count, mut size) = (0, 0);
+    let language = unsafe {
+        GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, None, &mut size)
+            .ok()
+            .and_then(|()| {
+                let mut names = vec![0; size as usize];
+                GetUserPreferredUILanguages(
+                    MUI_LANGUAGE_NAME,
+                    &mut count,
+                    Some(PWSTR(names.as_mut_ptr())),
+                    &mut size,
+                )
+                .ok()?;
+                let first = names.split(|&c| c == 0).next().filter(|s| !s.is_empty())?;
+                String::from_utf16(first).ok()
+            })
+    };
+    week_start_for_language(language.as_deref().unwrap_or("en-US"))
+}
+
+// Intl.Locale's week data comes from the language's territory, without regional-format overrides.
+fn week_start_for_language(language: &str) -> Weekday {
+    let Ok(locale) = std::ffi::CString::new(language) else {
+        return Weekday::Mon;
+    };
+    let mut status = U_ZERO_ERROR;
+    unsafe {
+        let cal = ucal_open(
+            std::ptr::null(),
+            0,
+            PCSTR(locale.as_ptr().cast()),
+            UCAL_DEFAULT,
+            &mut status,
+        );
+        if cal.is_null() {
+            return Weekday::Mon;
+        }
+        let first = ucal_getAttribute(cal.cast(), UCAL_FIRST_DAY_OF_WEEK);
+        ucal_close(cal);
+        match first {
+            1 => Weekday::Sun,
+            3 => Weekday::Tue,
+            4 => Weekday::Wed,
+            5 => Weekday::Thu,
+            6 => Weekday::Fri,
+            7 => Weekday::Sat,
+            _ => Weekday::Mon,
+        }
     }
 }
 struct Bucket {
@@ -590,6 +627,28 @@ fn rank_row(ui: &mut Ui, v: &mut View<'_>, i: usize, item: &Rank, max: f64) -> b
         false
     }
 }
+fn phone_note(phone: &serde_json::Value) -> String {
+    let plays = phone["plays"].as_u64().unwrap_or(0);
+    let noun = if plays == 1 { "play" } else { "plays" };
+    let mut note = format!(
+        "Phone listening comes from Navidrome on this PC: {plays} {noun} counted, as whole songs"
+    );
+    if let Some(at) = phone["at"].as_i64().filter(|&at| at > 0) {
+        let elapsed = Local::now().timestamp_millis().saturating_sub(at).max(0);
+        let minutes = (elapsed + 30_000) / 60_000;
+        let ago = match minutes {
+            0 => "just now".into(),
+            1..60 => format!("{minutes} min ago"),
+            _ => format!("{} h ago", (minutes + 30) / 60),
+        };
+        note.push_str(&format!(" · checked {ago}"));
+    }
+    if phone["error"].as_str().is_some_and(|s| !s.is_empty()) {
+        note.push_str(" · couldn't read it last time");
+    }
+    note.push_str(" ·");
+    note
+}
 struct PhoneSummary {
     show_status: bool,
     note: String,
@@ -598,26 +657,8 @@ struct PhoneSummary {
 impl PhoneSummary {
     fn read(v: &View<'_>) -> Self {
         let phone = v.s.field("phone");
-        let plays = phone["plays"].as_u64().unwrap_or(0);
-        let noun = if plays == 1 { "play" } else { "plays" };
-        let mut note = format!(
-            "Phone listening comes from Navidrome on this PC: {plays} {noun} counted, as whole songs"
-        );
-        if let Some(at) = phone["at"].as_i64().filter(|&at| at > 0) {
-            let elapsed = Local::now().timestamp_millis().saturating_sub(at).max(0);
-            let minutes = (elapsed + 30_000) / 60_000;
-            let ago = match minutes {
-                0 => "just now".into(),
-                1..60 => format!("{minutes} min ago"),
-                _ => format!("{} h ago", (minutes + 30) / 60),
-            };
-            note.push_str(&format!(" ? checked {ago}"));
-        }
         let read_failed = phone["error"].as_str().is_some_and(|s| !s.is_empty());
-        if read_failed {
-            note.push_str(" ? couldn't read it last time");
-        }
-        note.push_str(" ?");
+        let note = phone_note(phone);
         Self {
             show_status: phone["found"] == true || read_failed,
             note,
@@ -651,7 +692,7 @@ fn phone(ui: &mut Ui, v: &mut View<'_>, summary: &PhoneSummary) {
             ui.add_space(8.);
             if selected.is_none() {return;}
         }
-        let (note, action) = if enabled { (summary.note.as_str(), "stop counting") } else { ("Phone listening isn't counted ?", "count it") };
+        let (note, action) = if enabled { (summary.note.as_str(), "stop counting") } else { ("Phone listening isn't counted ·", "count it") };
         ui.horizontal_wrapped(|ui| {
             ui.label(mono(note,11.).color(FAINT)).on_hover_text("Navidrome reports a song after it has played about halfway, so a phone play counts as the whole song.");
             if ui.link(mono(action,11.).color(MUTED)).clicked() {
@@ -664,5 +705,22 @@ fn phone(ui: &mut Ui, v: &mut View<'_>, summary: &PhoneSummary) {
     if v.views.stats.reveal_phone {
         group.response.scroll_to_me(Some(egui::Align::Max));
         v.views.stats.reveal_phone = false;
+    }
+}
+
+#[cfg(test)]
+mod locale_tests {
+    use super::*;
+    #[test]
+    fn week_follows_the_display_language() {
+        assert_eq!(week_start_for_language("en-GB"), Weekday::Mon);
+        assert_eq!(week_start_for_language("en-US"), Weekday::Sun);
+        assert_eq!(week_start_for_language("ar-EG"), Weekday::Sat);
+    }
+
+    #[test]
+    fn phone_status_uses_middle_dots_before_the_check_error_and_link() {
+        let phone = serde_json::json!({"plays":1,"at":Local::now().timestamp_millis(),"error":"unavailable"});
+        assert!(phone_note(&phone).ends_with(" · checked just now · couldn't read it last time ·"));
     }
 }

@@ -107,7 +107,24 @@ fn set(v: &mut View<'_>, key: &str, value: Value) {
 }
 /// New music folders: a parent replaces its subfolders, and a folder already covered is skipped.
 pub fn add_roots(v: &mut View<'_>, list: &[PathBuf]) {
-    let mut roots = strings(v.s.field("roots"));
+    if let Some(message) = add_roots_to(v.s, v.scan, list) {
+        v.views.toast.set(message);
+    }
+}
+/// Songs added one by one.
+pub fn add_songs(v: &mut View<'_>, list: &[PathBuf]) {
+    if let Some(message) = add_songs_to(v.s, v.scan, list) {
+        v.views.toast.set(message);
+    }
+}
+/// The pickers' folder rules, for the pickers and for drops (applied after the add worker checked the paths):
+/// returns what to tell the person.
+pub(crate) fn add_roots_to(
+    s: &mut crate::playback::Session,
+    scan: &mut crate::scan::Scanner,
+    list: &[PathBuf],
+) -> Option<String> {
+    let mut roots = strings(s.field("roots"));
     let mut added = 0;
     for p in list {
         let p = p.to_string_lossy().into_owned();
@@ -124,22 +141,23 @@ pub fn add_roots(v: &mut View<'_>, list: &[PathBuf]) {
         added += 1;
     }
     if added == 0 {
-        if !list.is_empty() {
-            v.views.toast.set("Already in your library");
-        }
-        return;
+        return (!list.is_empty()).then(|| "Already in your library".to_owned());
     }
-    v.s.set_field("roots", roots.into());
-    v.views.toast.set(if added == 1 {
+    s.set_field("roots", roots.into());
+    scan.requested = true;
+    Some(if added == 1 {
         "Folder added: reading its songs".to_owned()
     } else {
         format!("{added} folders added: reading their songs")
-    });
-    v.scan.requested = true;
+    })
 }
-/// Songs added one by one.
-pub fn add_songs(v: &mut View<'_>, list: &[PathBuf]) {
-    let mut files = strings(v.s.field("files"));
+/// The pickers' song rules (songs only, each once, none already in the library): returns what to tell the person.
+pub(crate) fn add_songs_to(
+    s: &mut crate::playback::Session,
+    scan: &mut crate::scan::Scanner,
+    list: &[PathBuf],
+) -> Option<String> {
+    let mut files = strings(s.field("files"));
     let before = files.len();
     for p in list {
         let ext = p
@@ -151,23 +169,18 @@ pub fn add_songs(v: &mut View<'_>, list: &[PathBuf]) {
         let id = p.to_lowercase();
         if AUDIO.contains(&ext.as_str())
             && !files.iter().any(|f| f.to_lowercase() == id)
-            && !v.s.models.by_id.contains_key(&id)
+            && !s.models.by_id.contains_key(&id)
         {
             files.push(p);
         }
     }
     let fresh = files.len() - before;
     if fresh == 0 {
-        if !list.is_empty() {
-            v.views.toast.set("Those are already in your library");
-        }
-        return;
+        return (!list.is_empty()).then(|| "Those are already in your library".to_owned());
     }
-    v.s.set_field("files", files.into());
-    v.views
-        .toast
-        .set(format!("{} added", plural(fresh, "song")));
-    v.scan.requested = true;
+    s.set_field("files", files.into());
+    scan.requested = true;
+    Some(format!("{} added", plural(fresh, "song")))
 }
 impl State {
     fn numbers(&mut self, v: &View<'_>) -> &Numbers {

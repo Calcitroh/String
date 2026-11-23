@@ -157,6 +157,7 @@ impl View<'_> {
         self.s.queue_changed(self.player);
     }
     pub fn add_path(&mut self, path: std::path::PathBuf) {
+        // Checked on the add worker, then added with the pickers' rules (add_work::Adds::poll).
         if !self.adds.window_path(path) {
             self.views.toast.set("String could not take more songs.");
         }

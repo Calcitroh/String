@@ -33,9 +33,12 @@ impl Probe {
         self.frames.lock().unwrap().extend(frames);
     }
     fn click(&self, p: Pos2) {
+        self.mouse_button(p, PointerButton::Primary);
+    }
+    fn mouse_button(&self, p: Pos2, button: PointerButton) {
         let button = |pressed| Event::PointerButton {
             pos: p,
-            button: PointerButton::Primary,
+            button,
             pressed,
             modifiers: Modifiers::NONE,
         };
@@ -47,12 +50,15 @@ impl Probe {
         ]);
     }
     fn key(&self, key: Key) {
+        self.modified_key(key, Modifiers::NONE);
+    }
+    fn modified_key(&self, key: Key, modifiers: Modifiers) {
         let event = |pressed| Event::Key {
             key,
             physical_key: None,
             pressed,
             repeat: false,
-            modifiers: Modifiers::NONE,
+            modifiers,
         };
         self.send([vec![event(true)], vec![event(false)]]);
     }
@@ -167,6 +173,56 @@ impl Probe {
                 {
                     return Err("Enter did not play the first search result".into());
                 }
+                v.views.query.clear();
+                v.go(Route::Songs);
+                v.views.filter = self.term.clone();
+                self.modified_key(Key::F, Modifiers::CTRL);
+            }
+            17 => {
+                if v.views.history.current != Route::Songs
+                    || v.views.filter != self.term
+                    || !ctx.memory(|m| m.has_focus(Id::unique("global search")))
+                {
+                    return Err(
+                        "Ctrl+F must focus search while preserving the filtered page".into(),
+                    );
+                }
+                self.modified_key(Key::ArrowLeft, Modifiers::ALT);
+            }
+            18 => {
+                if v.views.history.current != Route::Songs {
+                    return Err("Alt+Left left the page while typing".into());
+                }
+                self.send([vec![Event::Text(self.term.clone())]]);
+            }
+            19 => self.key(Key::Escape),
+            20 => {
+                if !v.views.query.is_empty() || v.views.history.current != Route::Songs {
+                    return Err("Escape did not clear search and return to Songs".into());
+                }
+                v.go(Route::Albums);
+                self.mouse_button(pos2(360., 140.), PointerButton::Extra1);
+            }
+            21 => {
+                if v.views.history.current != Route::Songs {
+                    return Err("Mouse Back did not return to Songs".into());
+                }
+                self.mouse_button(pos2(360., 140.), PointerButton::Extra2);
+            }
+            22 => {
+                if v.views.history.current != Route::Albums {
+                    return Err("Mouse Forward did not return to Albums".into());
+                }
+                if !v.s.models.catalog.albums.is_empty() {
+                    self.mouse_button(pos2(320., 150.), PointerButton::Secondary);
+                }
+            }
+            23 => {
+                if !v.s.models.catalog.albums.is_empty() && !crate::ui::menus::is_open() {
+                    return Err("Right-clicking an album card did not open its song menu".into());
+                }
+                crate::ui::menus::close_menu();
+                check_dropped_paths(v)?;
                 super::albums::set_sort(v, self.original_album_sort.clone());
                 v.s.set_field("sort", self.original_sort.clone());
                 v.s.models.sort_songs(&v.s.state);
@@ -188,4 +244,31 @@ impl Probe {
     pub fn step(&self) -> usize {
         self.step
     }
+}
+
+fn check_dropped_paths(v: &mut View<'_>) -> Result<(), String> {
+    let temp = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let root = temp.path();
+    let child = root.join("disc");
+    let note = root.join("notes.txt");
+    std::fs::create_dir(&child)
+        .and_then(|_| std::fs::write(&note, ""))
+        .map_err(|e| e.to_string())?;
+    let song = root.join("loose.flac");
+    std::fs::write(&song, "").map_err(|e| e.to_string())?;
+    let fields = std::mem::take(&mut v.s.state.fields);
+    let dirty = v.s.state_dirty;
+    let requested = v.scan.requested;
+    crate::add_work::add_dropped_now(
+        v.s,
+        v.scan,
+        vec![child.clone(), root.into(), child, note, song.clone(), song.clone()],
+    );
+    let ok = *v.s.field("roots") == serde_json::json!([root])
+        && *v.s.field("files") == serde_json::json!([song]);
+    v.s.state.fields = fields;
+    v.s.state_dirty = dirty;
+    v.scan.requested = requested;
+    ok.then_some(())
+        .ok_or_else(|| "Drops retained a nested folder or accepted a non-song file".into())
 }

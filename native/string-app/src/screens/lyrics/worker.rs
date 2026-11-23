@@ -96,11 +96,11 @@ impl Job {
 }
 
 pub(super) struct Translator {
-    service: Arc<Ollama>,
+    pub(super) service: Arc<Ollama>,
     revision: Arc<AtomicU64>,
     jobs: Sender<Job>,
     events: Option<Receiver<Event>>,
-    active: Option<LanguageModel>,
+    active: Option<(String, String, LanguageModel)>,
     model: String,
     models: Option<Result<Vec<String>, String>>,
     listing: Option<Receiver<Result<Vec<String>, String>>>,
@@ -134,6 +134,9 @@ impl Translator {
             layout_revision: 0,
         }
     }
+    pub fn song_changed(&self, song: &str) -> bool {
+        self.active.as_ref().is_some_and(|(id, _, _)| id != song)
+    }
     pub fn clear(&mut self) {
         if self.active.take().is_some() {
             self.revision.fetch_add(1, Ordering::AcqRel);
@@ -151,11 +154,13 @@ impl Translator {
         lyrics: &LyricsResult,
         options: LanguageModel,
     ) {
-        if self.active.as_ref() != Some(&options) {
+        if self.active.as_ref().is_none_or(|(id, text, current)| {
+            id != &song.id || text != &lyrics.text || current != &options
+        }) {
             self.clear();
             let (tx, rx) = unbounded();
             self.events = Some(rx);
-            self.active = Some(options.clone());
+            self.active = Some((song.id.clone(), lyrics.text.clone(), options.clone()));
             self.rows.resize(lyrics.lines.len(), None);
             self.status = format!("Translating into {}…", options.lang);
             let job = Job {
@@ -168,6 +173,12 @@ impl Translator {
             };
             let _ = self.jobs.send(job);
         }
+        self.poll();
+    }
+    pub fn poll(&mut self) {
+        let Some((_, _, options)) = &self.active else {
+            return;
+        };
         let lang = &options.lang;
         for event in self.events.iter().flat_map(|events| events.try_iter()) {
             match event {

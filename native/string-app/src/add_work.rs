@@ -110,9 +110,23 @@ impl Batch {
             _charge: None,
         }
     }
-    pub fn apply(self, s: &mut Session, scan: &mut Scanner) {
+    /// Adds the checked paths; for drops, returns what to tell the person.
+    pub fn apply(self, s: &mut Session, scan: &mut Scanner) -> Option<String> {
         if self.locations.is_empty() {
-            return;
+            return None;
+        }
+        if matches!(self.source, Source::Window) {
+            // Drops follow the pickers' rules: a folder inside a listed one isn't added again, only songs are taken.
+            let (folders, songs): (Vec<_>, Vec<_>) =
+                self.locations.into_iter().partition(|l| l.directory);
+            let folders: Vec<PathBuf> = folders.into_iter().map(|l| l.path).collect();
+            let songs: Vec<PathBuf> = songs.into_iter().map(|l| l.path).collect();
+            let a = crate::screens::settings::add_roots_to(s, scan, &folders);
+            let b = crate::screens::settings::add_songs_to(s, scan, &songs);
+            return match (a, b) {
+                (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+                (a, b) => a.or(b),
+            };
         }
         if let Source::Helper(Some(name)) = &self.source {
             playlist_add::reserve(s, name, &self.locations);
@@ -143,7 +157,22 @@ impl Batch {
             }
         }
         scan.requested = true;
+        None
     }
+}
+
+/// Dropped paths checked and added at once, with the same rules as a drop through the worker (the self-test's way).
+pub(crate) fn add_dropped_now(
+    s: &mut Session,
+    scan: &mut Scanner,
+    paths: Vec<PathBuf>,
+) -> Option<String> {
+    Batch {
+        source: Source::Window,
+        locations: classify(paths),
+        _charge: None,
+    }
+    .apply(s, scan)
 }
 
 pub(crate) struct Adds {
@@ -209,11 +238,35 @@ impl Adds {
         self.startup.is_some() || self.input.state.lock().unwrap().paths != 0
     }
     pub fn poll(&mut self, s: &mut Session, scan: &mut Scanner, toast: &mut crate::ui::Toast) {
+        // Everything dropped that's ready now goes in together, so several songs get one message.
+        let mut dropped = Vec::new();
+        let mut charges = Vec::new();
+        let mut missing = false;
         for batch in self.startup.take().into_iter().chain(self.ready.try_iter()) {
-            if matches!(batch.source, Source::Window) && batch.locations.is_empty() {
+            if matches!(batch.source, Source::Window) {
+                missing |= batch.locations.is_empty();
+                dropped.extend(batch.locations);
+                charges.push(batch._charge);
+            } else {
+                batch.apply(s, scan);
+            }
+        }
+        if dropped.is_empty() {
+            if missing {
                 toast.set("This path does not exist.");
             }
-            batch.apply(s, scan);
+            return;
+        }
+        let message = Batch {
+            source: Source::Window,
+            locations: dropped,
+            _charge: None,
+        }
+        .apply(s, scan);
+        // Their share of the pending limit is released only once they're in the library.
+        drop(charges);
+        if let Some(message) = message {
+            toast.set(message);
         }
     }
     // Normal closes poll until ready. A forced event-loop exit also waits for accepted work, outside the session lock.

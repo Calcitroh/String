@@ -771,7 +771,7 @@ fn entries(v: &View<'_>, m: &Menu) -> Vec<Entry> {
                 out.push(item("Rename", "pencil", Cmd::Rename(key.into())));
                 out.push(item("Delete playlist", "trash", Cmd::Delete(key.into())));
             }
-            if ctx["kind"] == "album"
+            if matches!(ctx["kind"].as_str(), Some("album" | "artist"))
                 && let Some(dir) = list_ids(v, ctx, visible)
                     .first()
                     .and_then(|id| v.s.models.by_id.get(id))

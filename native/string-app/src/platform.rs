@@ -160,7 +160,11 @@ impl Platform {
         }
     }
 
-    pub fn attach(&mut self, cc: &eframe::CreationContext<'_>) -> Result<(), Error> {
+    pub fn attach(
+        &mut self,
+        cc: &eframe::CreationContext<'_>,
+        ollama: std::sync::Arc<string_lyrics::Ollama>,
+    ) -> Result<(), Error> {
         let hwnd = Hwnd::from_window(cc).ok_or("A Windows window is required")?;
         self.hwnd = Some(hwnd);
         self.helpers.attach(&cc.egui_ctx);
@@ -170,7 +174,7 @@ impl Platform {
         self.dialogs = Some(screens::connect(
             &cc.egui_ctx,
             hwnd,
-            &self.root,
+            ollama,
             self.smoke,
             self.updates.clone(),
             self.transport.discord_status(),
@@ -217,7 +221,7 @@ impl Platform {
             hwnd,
             &self.root.join("window.json"),
             (1400., 880.),
-            (820., 520.),
+            window::MIN_SIZE,
         ) {
             self.uncloaking = self
                 .optional("window cloak", window::cloak(hwnd, true))
