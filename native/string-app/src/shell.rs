@@ -58,10 +58,6 @@ pub fn shortcuts(ui: &Ui, v: &mut View<'_>) {
     if ctx.text_edit_focused() {
         return;
     }
-    // Space or Enter on the icon credit's focused Close button are the card's alone
-    if ui::credit::take_keys(ctx) {
-        return;
-    }
     if key(no, Key::Space) {
         v.s.toggle(v.player);
     } else if key(Modifiers::CTRL, Key::ArrowLeft) {

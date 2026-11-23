@@ -1,7 +1,7 @@
 //! A thank-you to the icon's maker: the first time String opens a library with this icon, a small card above the player
 //! bar says who made it, until it's closed (then never again for that library: `set.iconCreditSeen`).
 use crate::{theme::*, ui, view::View};
-use egui::{Align2, Color32, Context, Id, Key, Modifiers, RichText, Sense, TextureHandle, TextureOptions, vec2};
+use egui::{Align2, Color32, Context, Id, Rect, RichText, Sense, TextureHandle, TextureOptions, Vec2, vec2};
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, Ordering},
@@ -10,44 +10,11 @@ use std::sync::{
 const SEEN: &str = "iconCreditSeen";
 const TEXT_CREDIT: &str = "Credits to Discord — awepollyon for the icon!";
 static LOGO: Mutex<Option<TextureHandle>> = Mutex::new(None);
-// The Close button while the card shows, a close asked for by its keys, and a Space held down from that close.
-static CLOSE: Mutex<Option<Id>> = Mutex::new(None);
+// The self-test's way to close it through the same path as the Close button.
 static CLOSE_NOW: AtomicBool = AtomicBool::new(false);
-static HELD_SPACE: AtomicBool = AtomicBool::new(false);
 // The self-test never shows it on its own (its pictures would all have the card); a case asks for it.
 static IN_TEST: AtomicBool = AtomicBool::new(false);
 static DRAWN: AtomicBool = AtomicBool::new(false);
-
-/// First in the shell's shortcuts. Space or Enter on the focused Close button close the card and go no further: not to
-/// the player, not to a selected row. A Space held down from that close stays here until it's let go (its key repeats
-/// would otherwise play and pause). True when the keys were the card's.
-pub fn take_keys(ctx: &Context) -> bool {
-    if HELD_SPACE.load(Ordering::Relaxed) {
-        if ctx.input(|i| i.key_down(Key::Space)) {
-            ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space));
-            return true;
-        }
-        HELD_SPACE.store(false, Ordering::Relaxed);
-    }
-    let focused = CLOSE
-        .lock()
-        .unwrap()
-        .is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
-    if !focused {
-        return false;
-    }
-    let (space, enter) = ctx.input_mut(|i| {
-        (
-            i.consume_key(Modifiers::NONE, Key::Space),
-            i.consume_key(Modifiers::NONE, Key::Enter),
-        )
-    });
-    if space || enter {
-        CLOSE_NOW.store(true, Ordering::Relaxed);
-        HELD_SPACE.store(space, Ordering::Relaxed);
-    }
-    space || enter
-}
 fn logo(ctx: &Context) -> TextureHandle {
     LOGO.lock()
         .unwrap()
@@ -74,12 +41,13 @@ pub fn show(ctx: &Context, v: &mut View<'_>) {
     };
     DRAWN.store(false, Ordering::Relaxed);
     if !wanted {
-        *CLOSE.lock().unwrap() = None;
         CLOSE_NOW.store(false, Ordering::Relaxed);
         return;
     }
-    // the text wraps rather than run off the left edge of a narrow window (the logo, the gaps and Close take the rest)
-    let text_width = (ctx.content_rect().width() - 36. - 24. - 40. - 24. - 28.).clamp(120., 360.);
+    // In a narrow window the text wraps, and without room the logo goes, so the card never runs off the left edge.
+    let room = ctx.content_rect().width() - 36. - 24. - 24. - 28.;
+    let with_logo = room >= 40. + 12. + 160.;
+    let text_width = (room - if with_logo { 52. } else { 0. }).clamp(40., 360.);
     let mut closed = CLOSE_NOW.swap(false, Ordering::Relaxed);
     egui::Area::new(Id::unique("icon credit"))
         .anchor(Align2::RIGHT_BOTTOM, [-18., -BAR - 14.])
@@ -98,7 +66,9 @@ pub fn show(ctx: &Context, v: &mut View<'_>) {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 12.;
-                        ui.add(egui::Image::new(&logo(ctx)).fit_to_exact_size(vec2(40., 40.)));
+                        if with_logo {
+                            ui.add(egui::Image::new(&logo(ctx)).fit_to_exact_size(vec2(40., 40.)));
+                        }
                         ui.scope(|ui| {
                             ui.set_max_width(text_width);
                             ui.add(
@@ -106,16 +76,25 @@ pub fn show(ctx: &Context, v: &mut View<'_>) {
                                     .wrap(),
                             );
                         });
+                        // Close is clicked, never focused: Space and Enter keep doing exactly what they do without the
+                        // card (play and pause, play the selected row), held down or with Ctrl, every frame.
                         let (r, _) = ui.allocate_exact_size(vec2(28., 28.), Sense::hover());
-                        let close = ui::icon_btn(ui, r, "x", "Close", false, v.tint);
-                        *CLOSE.lock().unwrap() = Some(close.id);
-                        closed |= close.clicked();
+                        let close = ui.interact(r, Id::unique("icon credit close"), Sense::CLICK);
+                        if close.hovered() {
+                            ui.painter().rect(r, 0, white(0.05), (1., HAIR), egui::StrokeKind::Inside);
+                        }
+                        ui::glyph::draw(
+                            ui.painter(),
+                            Rect::from_center_size(r.center(), Vec2::splat(16.)),
+                            "x",
+                            if close.hovered() { TEXT } else { MUTED },
+                        );
+                        closed |= close.on_hover_text("Close").clicked();
                     });
                 });
         });
     DRAWN.store(true, Ordering::Relaxed);
     if closed {
-        *CLOSE.lock().unwrap() = None;
         if test {
             IN_TEST.store(false, Ordering::Relaxed);
         } else {
