@@ -2,7 +2,8 @@
 //! device's own rate so nothing but our resampler touches the sound. cpal's default-device
 //! stream follows Windows when the default device changes; when the stream breaks anyway
 //! (headphones pulled with nothing to fall back to, a driver reset) or stops calling back, it is
-//! opened again on whatever the default is then, once a second until one is there.
+//! opened again on whatever the default is then, once a second until one is there. A pause or
+//! queue end closes the stream after the last buffer plays; the next play opens a fresh stream.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,10 +22,11 @@ const RETRY: Duration = Duration::from_secs(1);
 /// The largest block the sound thread renders at once (bigger device periods come in pieces).
 const MAX_BLOCK: usize = 8192;
 
-pub(crate) struct Output<S = cpal::Stream> {
+pub(crate) struct Output<S = (cpal::Stream, cpal::Device)> {
     mixer: Arc<Mutex<Mixer>>,
     stream: Option<S>,
-    waiting_playing: Option<bool>,
+    default_device: Option<cpal::Device>,
+    waiting: bool,
     broken: Arc<AtomicBool>,
     beats: Arc<AtomicU64>,
     last_beats: u64,
@@ -44,7 +46,8 @@ impl<S> Output<S> {
         Output {
             mixer,
             stream: None,
-            waiting_playing: None,
+            default_device: None,
+            waiting: false,
             broken: Arc::new(AtomicBool::new(false)),
             beats: Arc::new(AtomicU64::new(0)),
             last_beats: 0,
@@ -60,25 +63,41 @@ impl<S> Output<S> {
         &mut self,
         now: Instant,
         engine: &mut Engine,
-        open: impl FnOnce(&Self) -> Result<(S, String, u32), Error>,
-        start: impl FnOnce(&S) -> Result<(), Error>,
+        open: impl FnOnce(&mut Self) -> Result<(S, u32), Error>,
+        start: impl FnOnce(&S) -> Result<String, Error>,
     ) {
-        let reopen = self.needs_reopen(now, engine.playing());
+        let now_ns = now.duration_since(self.epoch).as_nanos() as u64;
+        // Keep the last buffer through its playback time, even after its fade has rendered.
+        let drained = self.stream.is_some()
+            && !engine.playing()
+            && self.mixer.lock().unwrap().drained(now_ns);
+        let reopen = drained || self.needs_reopen(now);
         if reopen && self.stream.take().is_some() {
             // Collect anything the retiring stream reported in its final callback.
             engine.pump();
         }
-        // Keep play/pause usable while unplugged, without counting the outage as listening.
-        if self.stream.is_none() && self.waiting_playing != Some(engine.playing()) {
-            self.mixer.lock().unwrap().output_waiting(engine.playing());
-            self.waiting_playing = Some(engine.playing());
+        if self.stream.is_some() {
+            return;
+        }
+        if !engine.playing() {
+            // Cues and paused seeks still publish a position without a device callback.
+            let mut mixer = self.mixer.lock().unwrap();
+            mixer.settle_pause();
+            mixer.render(&mut [], now_ns);
+            self.waiting = false;
+            self.retry_at = now;
+            return;
+        }
+        if !self.waiting {
+            self.mixer.lock().unwrap().output_waiting();
+            self.waiting = true;
         }
         if !reopen {
             return;
         }
         self.retry_at = now + RETRY;
         self.broken.store(false, Ordering::Relaxed);
-        let Ok((stream, name, rate)) = open(self) else {
+        let Ok((stream, rate)) = open(self) else {
             return;
         };
         {
@@ -90,19 +109,20 @@ impl<S> Output<S> {
                 engine.resync(rate, rendered_eras);
             }
         }
-        if !engine.playing() {
-            self.mixer.lock().unwrap().settle_pause();
-        }
-        if start(&stream).is_ok() {
+        self.mixer.lock().unwrap().prime();
+        engine.pump();
+        if engine.playing()
+            && let Ok(name) = start(&stream)
+        {
             self.stream = Some(stream);
-            self.waiting_playing = None;
+            self.waiting = false;
             self.last_beat_at = now;
             self.last_beats = self.beats.load(Ordering::Relaxed);
             engine.notify(Event::Output { name, rate });
         }
     }
 
-    fn needs_reopen(&mut self, now: Instant, playing: bool) -> bool {
+    fn needs_reopen(&mut self, now: Instant) -> bool {
         if self.stream.is_none() {
             return now >= self.retry_at;
         }
@@ -110,7 +130,7 @@ impl<S> Output<S> {
             return true;
         }
         let beats = self.beats.load(Ordering::Relaxed);
-        if beats != self.last_beats || !playing {
+        if beats != self.last_beats {
             self.last_beats = beats;
             self.last_beat_at = now;
             return false;
@@ -121,21 +141,24 @@ impl<S> Output<S> {
 
 impl Output {
     pub fn update(&mut self, engine: &mut Engine) {
-        self.update_with(Instant::now(), engine, Self::open, |s| {
-            s.play().map_err(|e| Error::Output(e.to_string()))
+        self.update_with(Instant::now(), engine, Self::open, |(stream, device)| {
+            stream.play().map_err(|e| Error::Output(e.to_string()))?;
+            // Reading endpoint properties can take longer than a device period. Let
+            // the first callback play while Windows looks up the display name.
+            Ok(device
+                .description()
+                .map(|d| d.name().to_owned())
+                .unwrap_or_else(|_| "Speakers".into()))
         });
     }
 
     /// Build the stream paused. A replacement must never render at the old mixer's rate.
-    fn open(&self) -> Result<(cpal::Stream, String, u32), Error> {
-        let host = cpal::default_host();
-        let device = host
-            .default_output_device()
+    fn open(&mut self) -> Result<((cpal::Stream, cpal::Device), u32), Error> {
+        let device = self
+            .default_device
+            .take()
+            .or_else(|| cpal::default_host().default_output_device())
             .ok_or_else(|| Error::Output("no output device".into()))?;
-        let name = device
-            .description()
-            .map(|d| d.name().to_string())
-            .unwrap_or_else(|_| "Speakers".into());
         let config = device
             .default_output_config()
             .map_err(|e| Error::Output(e.to_string()))?;
@@ -178,7 +201,12 @@ impl Output {
                 None,
             )
             .map_err(|e| Error::Output(e.to_string()))?;
-        Ok((stream, name, rate))
+        // WASAPI's default-device handle resolves the current endpoint on activation.
+        // Once build consumes its audio client, keep only that handle for the next wake.
+        if cfg!(windows) {
+            self.default_device = Some(device.clone());
+        }
+        Ok(((stream, device), rate))
     }
 }
 

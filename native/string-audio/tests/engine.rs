@@ -586,3 +586,84 @@ fn a_broken_song_is_skipped() {
     assert_eq!(names[0], "failed 1");
     assert_eq!(names[1], "started 2");
 }
+
+#[test]
+fn clicking_missing_songs_cuts_the_previous_song_and_reports_the_stop() {
+    let dir = scratch("failed-click");
+    let good = Track::new(1, dir.join("good.wav"));
+    write_wav(&good.path, SR, &level(0.5, SR as usize * 3));
+    for count in [1, 6] {
+        let mut list = vec![good.clone()];
+        list.extend((2..2 + count).map(|key| Track::new(key, dir.join(format!("{key}.wav")))));
+        if count == 6 {
+            list.push(Track::new(10, &good.path));
+        }
+        let (mut p, events) = player(
+            SR,
+            Config {
+                ask_ahead: 0.0,
+                ..Config::default()
+            },
+            list.clone(),
+        );
+        p.play_track(good.clone(), 0.);
+        p.render_secs(0.25);
+        events.lock().unwrap().clear();
+        p.play_track(list[1].clone(), 0.);
+        assert!(
+            p.render_secs(0.5).iter().all(|&s| s == 0.0),
+            "old song still audible"
+        );
+        assert!(!p.status().playing && p.status().key.is_none());
+        let mut want: Vec<_> = (2..2 + count.min(5))
+            .map(|key| format!("failed {key}"))
+            .collect();
+        want.push("stopped".into());
+        assert_eq!(names(&events), want);
+        p.play();
+        assert!(p.render_secs(0.1).iter().all(|&s| s == 0.0));
+    }
+}
+
+#[test]
+fn transport_during_a_crossfade_releases_the_outgoing_song() {
+    let dir = scratch("crossfade-transport");
+    let tracks: Vec<_> = [0.5, 0.25, 0.125]
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let path = dir.join(format!("{i}.wav"));
+            write_wav(&path, SR, &level(v, SR as usize * 15));
+            Track::new(i as u64, path)
+        })
+        .collect();
+    for pause in [false, true] {
+        let (mut p, _) = player(
+            SR,
+            Config {
+                crossfade: 4.0,
+                ..Config::default()
+            },
+            tracks.clone(),
+        );
+        p.play_track(tracks[0].clone(), 10.);
+        p.render_secs(2.);
+        assert_eq!(p.status().key, Some(1));
+        if pause {
+            p.pause();
+            let fall = p.render_secs(0.25);
+            assert!((fall[0] - 0.25).abs() < 1e-4, "pause began at {}", fall[0]);
+            p.play();
+        } else {
+            p.seek(4.);
+        }
+        let out = p.render_secs(0.5);
+        assert!(
+            (out[out.len() - 1] - 0.25).abs() < 1e-4,
+            "outgoing song still audible"
+        );
+        p.seek(15.);
+        p.render_secs(1.);
+        assert_eq!(p.status().key, Some(2));
+    }
+}

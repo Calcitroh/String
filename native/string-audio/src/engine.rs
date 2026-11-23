@@ -62,6 +62,8 @@ pub(crate) struct Engine {
     last_handle: u32,
     /// Decks the mixer has let go of (nothing plays or waits on them).
     free: [bool; 2],
+    /// Ignore callbacks from before a deck was reloaded or sought on the engine thread.
+    assignments: [u32; 2],
     /// The deck and song the engine takes as current.
     cur: Option<usize>,
     current: Option<u32>,
@@ -93,6 +95,7 @@ impl Engine {
             songs: HashMap::new(),
             last_handle: 0,
             free: [true, true],
+            assignments: [0; 2],
             cur: None,
             current: None,
             playing: false,
@@ -112,8 +115,12 @@ impl Engine {
     }
 
     fn send(&mut self, cmd: Cmd) {
-        // the ring holds 256: the mixer takes them every few milliseconds
-        let _ = self.link.cmds.push(cmd);
+        // The mixer takes commands every device period, or on the engine thread while asleep.
+        if self.link.cmds.push(cmd).is_ok()
+            && let Some((deck, era)) = cmd.assignment()
+        {
+            self.assignments[deck] = era;
+        }
     }
 
     fn send_volume(&mut self) {
@@ -131,7 +138,7 @@ impl Engine {
 
     /// Frames wait for room in a ring (the mixer drops stale ones soon): pump again soon.
     pub fn busy(&self) -> bool {
-        self.busy
+        self.playing && self.busy
     }
 
     /// Tells the host something from outside the engine (the output changed).
@@ -144,7 +151,9 @@ impl Engine {
         match cmd {
             Command::Play { track, from, start } => {
                 self.failures = 0;
-                self.play(track, from, start);
+                self.send(Cmd::Selecting);
+                let fade = if from > 0.0 { self.frames(f.play) } else { 0 };
+                self.play(track, from, start.then_some(fade));
             }
             Command::Resume => {
                 if self.current.is_some() && !self.playing {
@@ -161,16 +170,7 @@ impl Engine {
                 }
             }
             Command::Stop => {
-                let out = self.frames(f.pause);
-                self.send(Cmd::Disarm);
-                for d in 0..2 {
-                    self.send(Cmd::Release { deck: d, out });
-                }
-                self.playing = false;
-                self.cur = None;
-                self.current = None;
-                self.next = None;
-                self.loop_deck = None;
+                self.stop(self.frames(f.pause));
             }
             Command::Seek(secs) => self.seek(secs),
             Command::Volume(v) => {
@@ -203,6 +203,24 @@ impl Engine {
         }
     }
 
+    fn stop(&mut self, out: u32) {
+        for d in 0..2 {
+            self.send(Cmd::Release { deck: d, out });
+        }
+        if out == 0 {
+            self.send(Cmd::Transport {
+                play: false,
+                fade: 0,
+            });
+        }
+        self.playing = false;
+        self.cur = None;
+        self.current = None;
+        self.next = None;
+        self.loop_deck = None;
+        self.songs.clear();
+    }
+
     fn new_handle(&mut self) -> u32 {
         self.last_handle = self.last_handle.wrapping_add(1).max(1);
         self.last_handle
@@ -221,16 +239,10 @@ impl Engine {
         }
     }
 
-    /// Plays `track` from `from` seconds now (or makes it ready, paused).
-    fn play(&mut self, track: Track, from: f64, start: bool) {
+    /// Plays from the requested position with the given fade-in, or cues paused.
+    fn play(&mut self, track: Track, from: f64, fade_in: Option<u32>) {
         let Some(source) = self.open(&track) else {
-            self.failures += 1;
-            if start
-                && self.failures < MAX_FAILURES
-                && let Some(next) = self.host.next_after(&track)
-            {
-                self.play(next, 0.0, true);
-            }
+            self.failed_selection(&track, fade_in.is_some());
             return;
         };
         let info = source.info();
@@ -247,13 +259,15 @@ impl Engine {
             Ok(g) => g,
             Err(e) => {
                 self.host.event(Event::Failed {
-                    track,
+                    track: track.clone(),
                     error: e.to_string(),
                 });
+                self.failed_selection(&track, fade_in.is_some());
                 return;
             }
         };
         let keep = self.current;
+        self.failures = 0;
         self.songs.retain(|h, _| Some(*h) == keep);
         self.songs.insert(
             handle,
@@ -272,30 +286,35 @@ impl Engine {
         self.next = None;
         self.loop_deck = None;
         self.asked = false;
-        let f = self.config.fades;
-        let fade_in = if from_frame > 0 {
-            self.frames(f.play)
-        } else {
-            0
-        };
-        let out = self.frames(f.seek_out);
+        let out = self.frames(self.config.fades.seek_out);
         self.send(Cmd::Replace {
             deck,
             era,
             out,
-            in_: fade_in,
+            in_: fade_in.unwrap_or(0),
         });
         self.cur = Some(deck);
         self.current = Some(handle);
         self.free[deck] = false;
-        if start {
-            self.send(Cmd::Transport {
-                play: true,
-                fade: fade_in,
-            });
-            self.playing = true;
-        }
+        self.playing = fade_in.is_some();
+        self.send(Cmd::Transport {
+            play: self.playing,
+            fade: fade_in.unwrap_or(0),
+        });
         self.fill();
+    }
+
+    fn failed_selection(&mut self, track: &Track, start: bool) {
+        self.stop(0);
+        self.failures += 1;
+        if start
+            && self.failures < MAX_FAILURES
+            && let Some(next) = self.host.next_after(track)
+        {
+            self.play(next, 0.0, Some(0));
+        } else {
+            self.host.event(Event::Stopped);
+        }
     }
 
     fn song(&self) -> Option<&Song> {
@@ -443,8 +462,13 @@ impl Engine {
 
     /// One round of the engine's work: the mixer's news, decoding, what's due.
     pub fn pump(&mut self) {
-        while let Ok(e) = self.link.events.pop() {
-            self.on_mixer(e);
+        while let Ok((deck, assignment, e)) = self.link.events.pop() {
+            // A seek may supersede a release, but the same song really did start.
+            let heard_current =
+                matches!(e, Evt::Started { handle } if self.current == Some(handle));
+            if self.assignments[deck] == assignment || heard_current {
+                self.on_mixer(deck, e);
+            }
         }
         self.fill();
         self.plan();
@@ -473,9 +497,12 @@ impl Engine {
         }
     }
 
-    fn on_mixer(&mut self, e: Evt) {
+    fn on_mixer(&mut self, deck: usize, e: Evt) {
         match e {
-            Evt::Current { deck } => {
+            Evt::Current => {
+                if self.current.is_none() {
+                    return;
+                }
                 self.cur = Some(deck);
                 self.free[deck] = false;
                 if self.loop_deck == Some(deck) {
@@ -513,7 +540,7 @@ impl Engine {
                     self.host.event(Event::Ended { track });
                 }
             }
-            Evt::Freed { deck } => {
+            Evt::Freed => {
                 self.free[deck] = true;
                 if self.loop_deck == Some(deck) {
                     self.loop_deck = None;
@@ -530,13 +557,38 @@ impl Engine {
                 self.feeders[deck].clear();
             }
             Evt::Finished { handle } => {
-                self.playing = false;
-                self.next = None;
-                self.host.event(Event::Stopped);
-                // ready again at the start, paused (as the JS player's stop at the end)
-                if let Some(track) = self.songs.get(&handle).map(|s| s.track.clone()) {
-                    self.cur = None;
-                    self.play(track, 0.0, false);
+                if self.current != Some(handle) {
+                    return;
+                }
+                let Some(track) = self.song().map(|s| s.track.clone()) else {
+                    return;
+                };
+                if let Some((start, _)) = self.active_loop() {
+                    self.play(
+                        track,
+                        start,
+                        self.playing.then(|| self.frames(self.config.fades.loop_in)),
+                    );
+                    return;
+                }
+                // The mixer exhausted its frames before a successor was ready. Honor the
+                // answer we already got (including skips past bad files and the failure cap).
+                let next = match self.next.take() {
+                    Some(Next::Want(t)) => Some(t),
+                    Some(Next::Chained { handle } | Next::Armed { handle }) => {
+                        self.songs.get(&handle).map(|s| s.track.clone())
+                    }
+                    None if !self.asked => self.host.next_after(&track),
+                    None => None,
+                };
+                if let Some(next) = next {
+                    self.play(next, 0.0, self.playing.then_some(0));
+                } else {
+                    self.play(track, 0.0, None);
+                    // A failed cue already reported its failure and stop.
+                    if self.current.is_some() {
+                        self.host.event(Event::Stopped);
+                    }
                 }
             }
         }
@@ -725,7 +777,11 @@ impl Engine {
                 .as_ref()
                 .filter(|r| (r.era.wrapping_sub(rendered_eras[r.deck]) as i32) > 0)
                 .map_or(st.position, |r| r.seconds);
-            self.play(song.track.clone(), position, self.playing);
+            self.play(
+                song.track.clone(),
+                position,
+                self.playing.then(|| self.frames(self.config.fades.play)),
+            );
         }
     }
 }
