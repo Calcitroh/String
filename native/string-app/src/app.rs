@@ -198,6 +198,7 @@ impl eframe::App for App {
         };
         let mut s = rt.session.lock().unwrap();
         self.platform.commands(ctx, Some((&mut s, &rt.player)));
+        crate::integration::update_check::tick(ctx, &mut s, &mut self.views, self.smoke.is_some());
         let st = rt.player.status();
         if let Some(lyrics) = &mut self.views.lyrics {
             lyrics.check_visible(self.views.overlay, self.minimized, s.state.queue.current());

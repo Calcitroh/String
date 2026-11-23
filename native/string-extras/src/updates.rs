@@ -17,7 +17,7 @@ use std::{
     str::FromStr,
     time::{Duration, Instant},
 };
-use ureq::{Agent, Body, http::Response};
+use ureq::{Body, http::Response};
 
 const FEED: &str = "https://api.github.com/repos/Calcitroh/String/releases/latest";
 const KEY: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEc1dW08TlzhlcEqhsyFH7VHRAZn4I0I4O4NCTobsdY45jozA5DKGqz7GqVs5f4rtkBzstC78qXU0PM0RTwK3c3Q==";
@@ -124,7 +124,7 @@ impl InstallPlan {
 pub struct Updater {
     install: PathBuf,
     current: Version,
-    agent: Agent,
+    silence: Duration,
     feed: String,
     key: String,
     #[cfg(any(test, feature = "test-feed"))]
@@ -185,7 +185,7 @@ impl Updater {
         Ok(Self {
             install: std::path::absolute(install)?,
             current: current.parse()?,
-            agent: agent(true, SILENCE),
+            silence: SILENCE,
             feed: FEED.into(),
             key: KEY.into(),
             #[cfg(any(test, feature = "test-feed"))]
@@ -219,7 +219,6 @@ impl Updater {
         let mut updater = Self::new(install, current)?;
         updater.fixture = Some(format!("http://{}", uri.authority().unwrap()));
         updater.feed = format!("{}/releases/latest", repository_url.trim_end_matches('/'));
-        updater.agent = agent(false, SILENCE);
         key.clone_into(&mut updater.key);
         Ok(updater)
     }
@@ -257,24 +256,40 @@ impl Updater {
         {
             return Err(invalid("Release asset is outside the fixture's loopback origin").into());
         }
-        let request = self
-            .agent
-            .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("User-Agent", "String-updater/1.0")
-            .config()
-            .timeout_global(Some(SILENCE + within))
-            .timeout_recv_body(Some(within))
-            .build();
+        #[cfg(not(any(test, feature = "test-feed")))]
+        let secure = true;
+        #[cfg(any(test, feature = "test-feed"))]
+        let secure = self.fixture.is_none();
+        let url = url.to_owned();
+        let silence = self.silence;
         // DNS, TLS and all redirects together get one minute to return headers.
         // The response body then has its own (potentially much longer) budget.
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("release-headers".into())
             .spawn(move || {
-                let _ = tx.send(request.call());
+                let response = string_http::HTTP.get(
+                    &url,
+                    silence + within,
+                    if secure { 10 } else { 0 },
+                    |request| {
+                        request
+                            .header("Accept", "application/vnd.github+json")
+                            .header("User-Agent", "String-updater/1.0")
+                            .config()
+                            .https_only(secure)
+                            .timeout_connect(Some(silence))
+                            .timeout_resolve(Some(silence))
+                            .timeout_recv_response(Some(silence))
+                            .timeout_per_read(Some(silence))
+                            .timeout_send_request(Some(silence))
+                            .timeout_recv_body(Some(within))
+                            .build()
+                    },
+                );
+                let _ = tx.send(response);
             })?;
-        match rx.recv_timeout(SILENCE) {
+        match rx.recv_timeout(silence) {
             Ok(response) => response,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 Err(ureq::Error::Timeout(ureq::Timeout::RecvResponse))
@@ -408,19 +423,6 @@ impl Updater {
             version,
         })
     }
-}
-fn agent(secure: bool, silence: Duration) -> Agent {
-    let mut cfg = Agent::config_builder()
-        .https_only(secure)
-        .timeout_connect(Some(silence))
-        .timeout_resolve(Some(silence))
-        .timeout_recv_response(Some(silence))
-        .timeout_per_read(Some(silence))
-        .timeout_send_request(Some(silence));
-    if !secure {
-        cfg = cfg.proxy(None).max_redirects(0);
-    }
-    cfg.build().into()
 }
 fn decode(data: &[u8]) -> io::Result<Vec<u8>> {
     STANDARD

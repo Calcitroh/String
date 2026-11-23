@@ -351,7 +351,7 @@ fn body_deadlines_cover_a_silent_server_and_one_that_never_finishes() {
         });
         let mut u = config(t.path(), &origin, "recent", KEY);
         let (silence, overall) = if trickle { (1000, 180) } else { (150, 1500) };
-        u.agent = agent(false, Duration::from_millis(silence));
+        u.silence = Duration::from_millis(silence);
         let res = u
             .get(&format!("{origin}/asset"), Duration::from_millis(overall))
             .unwrap();

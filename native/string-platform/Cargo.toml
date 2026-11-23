@@ -11,7 +11,7 @@ publish.workspace = true
 serde = "1"
 serde_json = "1"
 # Apple's and Deezer's cover searches (blocking, on a thread of their own).
-ureq = "3"
+string-http = { path = "../string-http" }
 # The window handle, from whichever toolkit made the window.
 raw-window-handle = "0.6"
 # Windows itself: Win32 for the window, shell and pipes; WinRT for the media overlay.

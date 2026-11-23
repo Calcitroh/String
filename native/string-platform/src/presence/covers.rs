@@ -28,7 +28,6 @@ struct Shared {
     file: PathBuf,
     itunes: String,
     deezer: String,
-    http: ureq::Agent,
 }
 
 #[derive(Default)]
@@ -48,10 +47,6 @@ impl Covers {
                 cache.insert(k, v);
             }
         }
-        let config = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(6)))
-            .user_agent("String/1.0")
-            .build();
         Covers {
             shared: Arc::new(Shared {
                 cache: Mutex::new(cache),
@@ -59,7 +54,6 @@ impl Covers {
                 file: file.to_path_buf(),
                 itunes: itunes.to_string(),
                 deezer: deezer.to_string(),
-                http: ureq::Agent::new_with_config(config),
             }),
         }
     }
@@ -160,7 +154,11 @@ impl Shared {
     }
 
     fn json(&self, url: &str) -> Option<Value> {
-        let mut response = self.http.get(url).call().ok()?;
+        let mut response = string_http::HTTP
+            .get(url, Duration::from_secs(6), 10, |r| {
+                r.config().user_agent("String/1.0").build()
+            })
+            .ok()?;
         serde_json::from_str(&response.body_mut().read_to_string().ok()?).ok()
     }
 }

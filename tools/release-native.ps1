@@ -46,8 +46,8 @@ if ($Publish) {
 "building String $Version..."
 # A Rust program keeps the source paths of everything it's built from (for its error messages): the libraries' under
 # this PC's profile folder, String's own under wherever this repository is. The build names them /cargo and /string
-# instead, and the linker keeps only the debug file's name. Separate targets keep the preview's executable, the
-# statically linked release and the everyday build from overwriting one another.
+# instead, and the linker keeps only the debug file's name. Separate targets keep the preview, full release
+# and everyday build from overwriting one another.
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $originalFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $target = Join-Path $out $(if ($Full) { 'native-full-build' } else { 'native-build' })
@@ -65,7 +65,7 @@ try {
     $flags = @("--remap-path-prefix=$($cargoHome.TrimEnd('\'))=/cargo", "--remap-path-prefix=$root=/string")
     foreach ($dir in $registryDirs) { $flags += "--remap-path-prefix=$dir=/cargo" }
     # A clean install cannot assume the Visual C++ redistributable is installed.
-    if ($Full) { $flags += '-Ctarget-feature=+crt-static' }
+    $flags += '-Ctarget-feature=+crt-static'
     $env:CARGO_ENCODED_RUSTFLAGS = ($flags + '-Clink-arg=/PDBALTPATH:%_PDB%') -join [char]0x1f
     cargo build --release --locked -p string-app --target $triple --target-dir $target
     if ($LASTEXITCODE) { 'String build failed'; exit 1 }
@@ -205,10 +205,20 @@ function NativeImports([string]$path) {
         } finally { $image.Dispose() }
     } finally { $stream.Dispose() }
 }
+function ReleaseImports([string]$path) {
+    $imports = @(NativeImports $path)
+    if (-not $imports.Count) { throw 'Missing native imports.' }
+    foreach ($row in $imports) {
+        $dll = ($row -split ' ', 2)[0]
+        if ($dll -match '^(?:vcruntime.*\.dll|msvcp.*\.dll|ucrtbase\.dll|api-ms-win-crt-.*)$') {
+            throw "String.exe requires a separate C runtime ($dll)."
+        }
+    }
+    $imports
+}
+$imports = @(ReleaseImports $exe)
 if ($Full) {
     $setup = New-Item -ItemType Directory -Path (Join-Path $app 'setup')
-    $imports = @(NativeImports $exe)
-    if (-not $imports.Count) { throw 'Missing native imports.' }
     [IO.File]::WriteAllLines((Join-Path $setup.FullName 'imports.txt'), [string[]]$imports)
     foreach ($file in 'install.ps1', 'uninstall.ps1') { CopyText $file (Join-Path $setup.FullName $file) }
     [IO.File]::WriteAllText((Join-Path $setup.FullName 'version.txt'), "$Version`r`n")

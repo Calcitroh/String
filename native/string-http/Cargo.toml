@@ -1,0 +1,13 @@
+[package]
+name = "string-http"
+description = "String's shared HTTP client and Windows proxy settings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ureq = { version = "3", features = ["platform-verifier"] }
+url = "2"
+regex-lite = "0.1"
+windows = { version = "0.62", features = ["Win32_System_Registry"] }
