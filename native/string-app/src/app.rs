@@ -32,7 +32,7 @@ pub struct App {
     runtime: Option<Runtime>,
     error: String,
     platform: Platform,
-    playlist_adds: crate::playlist_add::Requests,
+    adds: crate::add_work::Adds,
     views: Views,
     covers: CoverCache,
     viz: Viz,
@@ -40,8 +40,8 @@ pub struct App {
     smoke: Option<Smoke>,
     exit: Arc<AtomicI32>,
     closing: bool,
-    /// Asked to close while songs were on their way to the Recycle Bin: String closes once they're merged.
-    close_after_recycle: bool,
+    /// Finish accepted adds and pending moves to the Recycle Bin before closing.
+    close_after_work: bool,
     minimized: bool,
     last: Instant,
     save_due: Option<Instant>,
@@ -52,11 +52,12 @@ impl App {
         cc: &eframe::CreationContext<'_>,
         args: Args,
         mut platform: Platform,
-        playlist_adds: crate::playlist_add::Requests,
+        adds: crate::add_work::Adds,
         exit: Arc<AtomicI32>,
     ) -> Result<Self, Error> {
         let ctx = &cc.egui_ctx;
         platform.attach(cc)?;
+        adds.attach(ctx);
         theme::install(ctx);
         let now = Instant::now();
         let lyrics = crate::screens::lyrics::LyricsView::new(&args.root, args.smoke.is_some());
@@ -66,7 +67,7 @@ impl App {
             runtime: None,
             error: String::new(),
             platform,
-            playlist_adds,
+            adds,
             views: Views {
                 lyrics: Some(lyrics),
                 ..Default::default()
@@ -76,7 +77,7 @@ impl App {
             scan: Default::default(),
             exit,
             closing: false,
-            close_after_recycle: false,
+            close_after_work: false,
             minimized: false,
             last: now,
             save_due: None,
@@ -114,6 +115,14 @@ impl App {
         }
     }
     fn flush(&mut self) -> bool {
+        self.adds.set_closed(true);
+        if let Some(rt) = &self.runtime {
+            while let Some(batch) = self.adds.next_at_exit() {
+                batch.apply(&mut rt.session.lock().unwrap(), &mut self.scan);
+            }
+        } else if self.adds.pending() {
+            return false;
+        }
         self.platform.save_placement();
         let deadline = Instant::now() + Duration::from_secs(10);
         if let Some(error) = self.platform.phone.wait(deadline) {
@@ -159,11 +168,13 @@ impl eframe::App for App {
             return;
         }
         if ctx.input(|i| i.viewport().close_requested()) {
+            self.adds.set_closed(true);
             // songs still moving to the Recycle Bin: wait for them, so the copies kept take over their likes,
             // plays and playlist places before the last save
-            if crate::screens::dupes::recycling() {
+            if crate::screens::dupes::recycling() || (self.runtime.is_some() && self.adds.pending())
+            {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-                self.close_after_recycle = true;
+                self.close_after_work = true;
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else if self.flush() {
                 self.closing = true;
@@ -195,13 +206,14 @@ impl eframe::App for App {
         // Songs moved to the Recycle Bin are merged into the copies kept here, which runs while String is minimised
         // too; a close that waited for them goes on once they are. Paths from `--add` are added here too, so a
         // helper's songs come in while String is minimised.
-        let added = self.platform.take_added();
-        let mut playlists = self.playlist_adds.drain().peekable();
+        self.adds
+            .poll(&mut s, &mut self.scan, &mut self.views.toast);
         let recycling = crate::screens::dupes::recycling();
-        if recycling || !added.is_empty() || playlists.peek().is_some() {
+        if recycling {
             let tint = Tint::parse(s.setting("tint").as_str());
             let mono = s.setting("artMono").as_bool().unwrap_or(true);
             let mut v = View {
+                adds: &self.adds.input,
                 platform: &mut self.platform,
                 s: &mut s,
                 player: &rt.player,
@@ -214,25 +226,13 @@ impl eframe::App for App {
                 mono,
                 force_mute: self.smoke.is_some(),
             };
-            if !added.is_empty() {
-                crate::integration::helpers::add(&mut v, added);
-            }
-            for (name, paths) in playlists {
-                let paths = crate::integration::helpers::addable(paths);
-                crate::playlist_add::reserve(v.s, &name, &paths);
-                for path in paths {
-                    v.add_path(path);
-                }
-            }
-            if recycling {
-                crate::screens::dupes::settle(&mut v);
-            }
+            crate::screens::dupes::settle(&mut v);
         }
-        if self.close_after_recycle {
-            if crate::screens::dupes::recycling() {
+        if self.close_after_work {
+            if crate::screens::dupes::recycling() || self.adds.pending() {
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
-                self.close_after_recycle = false;
+                self.close_after_work = false;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
@@ -308,6 +308,22 @@ impl eframe::App for App {
         if self.minimized && self.smoke.is_none() {
             return;
         }
+        if self.views.close_failed
+            && let Some(quit) = ui::confirm(
+                &ctx,
+                "Your latest changes aren’t saved",
+                "Keep String open to retry saving, or close and discard the unsaved changes.",
+                "Close anyway",
+            )
+        {
+            self.views.close_failed = false;
+            if quit {
+                self.closing = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+                return;
+            }
+            self.adds.set_closed(false);
+        }
         if self.runtime.is_none() {
             let mut retry = false;
             ui.vertical_centered(|ui| {
@@ -325,21 +341,6 @@ impl eframe::App for App {
                 self.finish(&ctx, Some(self.error.clone()));
             }
             return;
-        }
-        if self.views.close_failed
-            && let Some(quit) = ui::confirm(
-                &ctx,
-                "Your latest changes aren’t saved",
-                "Keep String open to retry saving, or close and discard the unsaved changes.",
-                "Close anyway",
-            )
-        {
-            self.views.close_failed = false;
-            if quit {
-                self.closing = true;
-                ctx.send_viewport_cmd(ViewportCommand::Close);
-                return;
-            }
         }
         let rt = self.runtime.as_mut().unwrap();
         self.covers.poll(&ctx);
@@ -362,6 +363,7 @@ impl eframe::App for App {
             self.viz.step(&raw, st.playing, dt);
         }
         let mut v = View {
+            adds: &self.adds.input,
             platform: &mut self.platform,
             s: &mut s,
             player: &rt.player,

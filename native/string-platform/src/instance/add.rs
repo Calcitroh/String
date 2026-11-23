@@ -2,23 +2,26 @@
 //! sends it the paths in `WM_COPYDATA` and hears back 1 once that copy has them. Windows finds such a window on the
 //! caller's own desktop only, so a launch never reaches another signed-in person's String.
 
-use super::{Hub, Instance, Names, Signal, lock};
-use std::cell::RefCell;
+use super::{Hub, Instance, Names, Owned, Signal, lock};
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
+use std::{cell::RefCell, collections::VecDeque};
 use std::{io, thread};
 use windows::Win32::Foundation::{
-    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
+    ERROR_CLASS_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, WAIT_OBJECT_0, WPARAM,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{
+    CreateEventW, INFINITE, OpenMutexW, SYNCHRONIZATION_ACCESS_RIGHTS, SetEvent,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, FindWindowExW, GetMessageW, HWND_MESSAGE,
-    MSG, PostMessageW, PostQuitMessage, RegisterClassW, SMTO_ABORTIFHUNG, SMTO_BLOCK,
-    SendMessageTimeoutW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COPYDATA, WM_DESTROY,
-    WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, FindWindowExW, GetWindowThreadProcessId,
+    HWND_MESSAGE, MSG, MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, PM_REMOVE, PeekMessageW,
+    QS_SENDMESSAGE, RegisterClassW, SMTO_ABORTIFHUNG, SMTO_BLOCK, SendMessageTimeoutW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_COPYDATA, WM_NCCREATE, WNDCLASSW,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -40,37 +43,101 @@ struct CopyData {
 }
 
 thread_local! {
-    /// The receiving thread's hub, for the window procedure (which runs on that thread).
-    static HUB: RefCell<Option<Arc<Mutex<Hub>>>> = const { RefCell::new(None) };
-    static PLAYLISTS: RefCell<Option<mpsc::Sender<PlaylistAdd>>> = const { RefCell::new(None) };
+    static ROUTER: RefCell<Option<Arc<Mutex<Router>>>> = const { RefCell::new(None) };
 }
 
 type PlaylistAdd = (String, Vec<PathBuf>);
+type Accept = Box<dyn Fn(Option<String>, Vec<PathBuf>, usize) -> bool + Send>;
+
+struct Router {
+    hub: Arc<Mutex<Hub>>,
+    accept: Option<Accept>,
+    early_named: VecDeque<PlaylistAdd>,
+    early_sizes: VecDeque<usize>,
+    early_paths: usize,
+    early_bytes: usize,
+}
+
+impl Router {
+    fn new(hub: Arc<Mutex<Hub>>) -> Self {
+        Self {
+            hub,
+            accept: None,
+            early_named: VecDeque::new(),
+            early_sizes: VecDeque::new(),
+            early_paths: 0,
+            early_bytes: 0,
+        }
+    }
+    fn deliver(&mut self, name: Option<String>, paths: Vec<PathBuf>, bytes: usize) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        if let Some(accept) = &self.accept {
+            return accept(name, paths, bytes);
+        }
+        let mut hub = lock(&self.hub);
+        if hub.sink.is_none() {
+            if self.early_paths + paths.len() > Instance::MAX_ADD_PATHS
+                || self.early_bytes + bytes > Instance::MAX_ADD_BYTES
+            {
+                return false;
+            }
+            self.early_paths += paths.len();
+            self.early_bytes += bytes;
+            self.early_sizes.push_back(bytes);
+        } else if name.is_some() {
+            return false; // the legacy listener only handles plain paths
+        }
+        if let Some(name) = name {
+            self.early_named.push_back((name, paths));
+            hub.deliver(Signal::Add(Vec::new()));
+        } else {
+            hub.deliver(Signal::Add(paths));
+        }
+        true
+    }
+}
 
 /// The running copy's end: the window and the thread that runs its messages. Dropping it closes both.
 pub(super) struct Receiver {
-    hwnd: isize,
+    stop: Arc<Owned>,
     thread: Option<thread::JoinHandle<()>>,
-    playlists: Option<mpsc::Receiver<PlaylistAdd>>,
+    router: Arc<Mutex<Router>>,
 }
 
 impl Receiver {
     pub(super) fn open(class: &str, hub: Arc<Mutex<Hub>>) -> io::Result<Receiver> {
         let class = HSTRING::from(class);
+        let stop = Arc::new(Owned(unsafe {
+            CreateEventW(None, true, false, PCWSTR::null())
+        }?));
+        let stopping = stop.clone();
         let (tx, rx) = mpsc::channel();
-        let (playlist_tx, playlists) = mpsc::channel();
+        let router = Arc::new(Mutex::new(Router::new(hub)));
+        let incoming = router.clone();
         let thread = thread::Builder::new()
             .name("string-add".into())
             .spawn(move || {
-                HUB.with(|h| *h.borrow_mut() = Some(hub));
-                PLAYLISTS.with(|p| *p.borrow_mut() = Some(playlist_tx));
+                ROUTER.with(|r| *r.borrow_mut() = Some(incoming));
                 match unsafe { window(&class) } {
                     Ok(hwnd) => {
-                        let _ = tx.send(Ok(hwnd.0 as isize));
-                        let mut msg = MSG::default();
-                        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {
-                            unsafe { DispatchMessageW(&msg) };
+                        let _ = tx.send(Ok(()));
+                        // PeekMessage services synchronous sends. Only our unnamed event stops the loop.
+                        while unsafe {
+                            MsgWaitForMultipleObjectsEx(
+                                Some(&[stopping.0]),
+                                INFINITE,
+                                QS_SENDMESSAGE,
+                                MWMO_INPUTAVAILABLE,
+                            )
                         }
+                        .0 == WAIT_OBJECT_0.0 + 1
+                        {
+                            let _ =
+                                unsafe { PeekMessageW(&mut MSG::default(), None, 0, 0, PM_REMOVE) };
+                        }
+                        let _ = unsafe { DestroyWindow(hwnd) };
                     }
                     Err(e) => {
                         let _ = tx.send(Err(e));
@@ -78,10 +145,10 @@ impl Receiver {
                 }
             })?;
         match rx.recv() {
-            Ok(Ok(hwnd)) => Ok(Receiver {
-                hwnd,
+            Ok(Ok(())) => Ok(Receiver {
+                stop,
                 thread: Some(thread),
-                playlists: Some(playlists),
+                router,
             }),
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -97,15 +164,7 @@ impl Receiver {
 
 impl Drop for Receiver {
     fn drop(&mut self) {
-        let posted = unsafe {
-            PostMessageW(
-                Some(HWND(self.hwnd as *mut _)),
-                WM_CLOSE,
-                WPARAM(0),
-                LPARAM(0),
-            )
-        };
-        if let (Ok(()), Some(t)) = (posted, self.thread.take()) {
+        if let (Ok(()), Some(t)) = (unsafe { SetEvent(self.stop.0) }, self.thread.take()) {
             let _ = t.join();
         }
     }
@@ -144,11 +203,8 @@ unsafe fn window(class: &HSTRING) -> io::Result<HWND> {
 unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_COPYDATA => LRESULT(isize::from(unsafe { take(lparam) })),
-        WM_DESTROY => {
-            unsafe { PostQuitMessage(0) };
-            LRESULT(0)
-        }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        WM_NCCREATE => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => LRESULT(0),
     }
 }
 
@@ -171,40 +227,84 @@ unsafe fn take(lparam: LPARAM) -> bool {
     } else {
         unsafe { std::slice::from_raw_parts(cd.data, len) }
     };
-    let paths = if cd.tag == PLAYLIST {
-        let Some(request) = decode_playlist(bytes) else {
+    if bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .filter(|u| **u == [0, 0])
+        .count()
+        > Instance::MAX_ADD_PATHS + usize::from(cd.tag == PLAYLIST)
+    {
+        return false;
+    }
+    let (name, paths) = if cd.tag == PLAYLIST {
+        let Some((name, paths)) = decode_playlist(bytes) else {
             return false;
         };
-        if !PLAYLISTS.with_borrow(|p| p.as_ref().is_some_and(|tx| tx.send(request).is_ok())) {
-            return false;
-        }
-        // Wake the same listener as a plain add. The app drains the named request as one unit.
-        Vec::new()
+        (Some(name), paths)
     } else {
-        decode(bytes)
+        (None, decode(bytes))
     };
-    HUB.with(|h| match &*h.borrow() {
-        Some(hub) => {
-            lock(hub).deliver(Signal::Add(paths));
-            true
-        }
-        None => false,
+    ROUTER.with_borrow(|router| {
+        router
+            .as_ref()
+            .is_some_and(|r| r.lock().unwrap().deliver(name, paths, len))
     })
 }
 
 /// The other launch's end: finds the window (waiting up to `wait` for a copy still starting), sends every part.
 pub(super) fn send(class: &str, paths: &[PathBuf], wait: Duration) -> bool {
-    send_parts(class, MAGIC, &encode(paths), wait)
+    let Some(prefix) = class.strip_suffix(".Add") else {
+        return false;
+    };
+    send_parts(
+        &Names::custom(prefix).mutex,
+        class,
+        MAGIC,
+        &encode(paths),
+        wait,
+    )
 }
 
 impl Instance {
-    /// Take the named adds for this instance, including any received before the app opened.
-    pub fn take_playlist_adds(&mut self) -> Option<mpsc::Receiver<(String, Vec<PathBuf>)>> {
-        self.add.as_mut()?.playlists.take()
+    pub const MAX_ADD_PATHS: usize = 8192;
+    pub const MAX_ADD_BYTES: usize = 8 << 20;
+
+    /// Install before the window listener. Admission, including early handover, is serialized with incoming sends.
+    pub fn route_adds(
+        &mut self,
+        accept: impl Fn(Option<String>, Vec<PathBuf>, usize) -> bool + Send + 'static,
+    ) {
+        let Some(receiver) = &self.add else { return };
+        let mut router = receiver.router.lock().unwrap();
+        assert!(!self.listening && router.accept.is_none());
+        let hub = router.hub.clone();
+        lock(&hub).early.retain_mut(|s| {
+            let Signal::Add(paths) = s else { return true };
+            let (name, paths) = if paths.is_empty() {
+                let (name, paths) = router.early_named.pop_front().unwrap();
+                (Some(name), paths)
+            } else {
+                (None, std::mem::take(paths))
+            };
+            let bytes = router.early_sizes.pop_front().unwrap();
+            assert!(
+                accept(name, paths, bytes),
+                "early adds require an empty receiving queue"
+            );
+            false
+        });
+        router.accept = Some(Box::new(accept));
     }
 }
 
 impl Names {
+    /// Verify the receiver against this instance's mutex before giving it any paths.
+    pub fn send_paths(&self, paths: &[PathBuf], wait: Duration) -> bool {
+        self.add
+            .as_deref()
+            .is_some_and(|class| send_parts(&self.mutex, class, MAGIC, &encode(paths), wait))
+    }
     /// Send a named add in one message so a receiver accepts both the playlist and its paths together.
     pub fn send_playlist_add(&self, name: &str, paths: &[PathBuf], wait: Duration) -> bool {
         let Some(class) = self.add.as_deref() else {
@@ -224,16 +324,64 @@ impl Names {
             }
             part.push(0);
         }
-        send_parts(class, PLAYLIST, &[part], wait)
+        send_parts(&self.mutex, class, PLAYLIST, &[part], wait)
     }
 }
 
-fn send_parts(class: &str, tag: usize, parts: &[Vec<u16>], wait: Duration) -> bool {
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtQueryMutant(
+        handle: HANDLE,
+        class: u32,
+        info: *mut [usize; 2],
+        size: u32,
+        written: *mut u32,
+    ) -> i32;
+}
+
+fn mutex_owner(mutex: HANDLE) -> Option<u32> {
+    // MutantOwnerInformation returns CLIENT_ID (process, thread). A name or a handle alone
+    // does not identify the thread currently owning the mutex.
+    let mut id = [0usize; 2];
+    let size = std::mem::size_of_val(&id) as u32;
+    let mut written = 0;
+    let status = unsafe { NtQueryMutant(mutex, 1, &mut id, size, &mut written) };
+    (status >= 0 && written == size && id[0] != 0)
+        .then(|| u32::try_from(id[0]).ok())
+        .flatten()
+}
+
+fn owned_window(hwnd: HWND, mutex: HANDLE) -> bool {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid != 0 && mutex_owner(mutex) == Some(pid)
+}
+
+fn send_parts(mutex: &str, class: &str, tag: usize, parts: &[Vec<u16>], wait: Duration) -> bool {
+    let Ok(handle) = (unsafe {
+        OpenMutexW(
+            SYNCHRONIZATION_ACCESS_RIGHTS(1),
+            false,
+            &HSTRING::from(mutex),
+        )
+    }) else {
+        return false;
+    };
+    let mutex = Owned(handle);
     let class = HSTRING::from(class);
     let deadline = Instant::now() + wait;
-    let hwnd = loop {
-        if let Ok(h) = unsafe { FindWindowExW(Some(HWND_MESSAGE), None, &class, PCWSTR::null()) } {
-            break h;
+    let hwnd = 'find: loop {
+        let mut after = None;
+        while let Ok(h) =
+            unsafe { FindWindowExW(Some(HWND_MESSAGE), after, &class, PCWSTR::null()) }
+        {
+            if owned_window(h, mutex.0) {
+                break 'find h;
+            }
+            if Some(h) == after || Instant::now() >= deadline {
+                return false;
+            }
+            after = Some(h);
         }
         if Instant::now() >= deadline {
             return false;
@@ -241,6 +389,9 @@ fn send_parts(class: &str, tag: usize, parts: &[Vec<u16>], wait: Duration) -> bo
         thread::sleep(Duration::from_millis(40));
     };
     parts.iter().all(|part| {
+        if !owned_window(hwnd, mutex.0) {
+            return false;
+        }
         let cd = CopyData {
             tag,
             bytes: (part.len() * 2) as u32,
@@ -323,6 +474,55 @@ mod tests {
 
     fn bytes(units: &[u16]) -> Vec<u8> {
         units.iter().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn early_plain_and_named_adds_share_the_same_limits() {
+        let mut r = Router::new(Default::default());
+        let path = || vec![PathBuf::from(r"C:\Music\a.wav")];
+        assert!(r.deliver(None, path(), Instance::MAX_ADD_BYTES - 8));
+        assert!(r.deliver(Some("List".into()), path(), 8));
+        assert!(!r.deliver(None, path(), 1));
+        assert_eq!(lock(&r.hub).early.len(), 2);
+        let mut r = Router::new(Default::default());
+        assert!(r.deliver(None, vec![PathBuf::new(); Instance::MAX_ADD_PATHS], 64));
+        assert!(!r.deliver(Some("List".into()), path(), 2));
+    }
+
+    #[test]
+    fn a_destroy_notification_does_not_end_the_message_thread() {
+        use windows::Win32::UI::WindowsAndMessaging::{WM_DESTROY, WM_QUIT};
+        std::thread::spawn(|| unsafe {
+            proc(HWND::default(), WM_DESTROY, WPARAM(0), LPARAM(0));
+            assert!(
+                !PeekMessageW(&mut MSG::default(), None, WM_QUIT, WM_QUIT, PM_REMOVE).as_bool()
+            );
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn receiver_verification_requires_a_current_kernel_mutex_owner() {
+        use super::super::{Claim, claim_quietly};
+        use windows::Win32::System::Threading::CreateMutexW;
+        let names = Names::custom(&format!("StringOwnerTest.{}", std::process::id()));
+        let Claim::First(me) = claim_quietly(&names).unwrap() else {
+            panic!("expected isolated instance")
+        };
+        let class = HSTRING::from(names.add.as_deref().unwrap());
+        let hwnd =
+            unsafe { FindWindowExW(Some(HWND_MESSAGE), None, &class, PCWSTR::null()) }.unwrap();
+        assert!(owned_window(hwnd, me._mutex.0));
+        let unowned = Owned(unsafe { CreateMutexW(None, false, PCWSTR::null()) }.unwrap());
+        assert!(!owned_window(hwnd, unowned.0));
+        let different = Names {
+            mutex: format!("{}.other", names.mutex),
+            ..names.clone()
+        };
+        let sample = [PathBuf::from(r"C:\Music\example.wav")];
+        assert!(!different.send_paths(&sample, Duration::ZERO));
+        assert!(!different.send_playlist_add("Mix", &sample, Duration::ZERO));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fmt, fs, io,
-    os::windows::fs::MetadataExt,
+    os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -23,6 +23,8 @@ pub const FALLBACK_GLYPH: &str = "plus";
 /// An `addon.json` bigger than this is taken as broken.
 const MAX_MANIFEST: u64 = 1 << 20;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
 /// The glyph names String draws (`ui\glyphs.json`).
 static GLYPHS: LazyLock<HashSet<String>> = LazyLock::new(|| {
@@ -152,7 +154,7 @@ fn read(id: &str, folder: &Path) -> Result<Option<Helper>, Refusal> {
     }
     let json: serde_json::Value = fs::read(&manifest)
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|b| serde_json::from_slice(b.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&b)).ok())
         .ok_or(Refusal::Broken)?;
     let j = json.as_object().ok_or(Refusal::Broken)?;
     let Some(program) = j.get("program") else {
@@ -219,22 +221,50 @@ pub fn check_program(folder: &Path, program: &str) -> Result<PathBuf, Refusal> {
     Ok(path)
 }
 
-/// `--add`'s paths as String takes them: absolute ones that exist, each once. The rest are skipped.
-pub fn addable(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let mut seen = HashSet::new();
-    paths
-        .into_iter()
-        .filter(|p| p.is_absolute() && p.exists())
-        .filter(|p| seen.insert(p.to_string_lossy().to_lowercase()))
-        .collect()
+/// Open the entry itself. Its type comes from the retained handle. Sharing only reads protects
+/// the name and contents (including reparse data) until process creation finishes.
+fn pin_entry(path: &Path, directory: bool) -> io::Result<fs::File> {
+    let handle = fs::OpenOptions::new()
+        // An attributes-only handle does not participate in Windows share checks.
+        .access_mode(0x81) // FILE_READ_ATTRIBUTES | FILE_READ_DATA (FILE_LIST_DIRECTORY on a directory)
+        .share_mode(1) // FILE_SHARE_READ
+        .custom_flags(OPEN_REPARSE_POINT | BACKUP_SEMANTICS)
+        .open(path)?;
+    let m = handle.metadata()?;
+    if is_link(&m) || (directory && !m.is_dir()) || (!directory && !m.is_file()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unexpected helper file type",
+        ));
+    }
+    Ok(handle)
 }
 
-/// Adds `--add`'s paths as if they were dropped on the window (files as songs, folders as library folders), then
-/// scans.
-pub fn add(v: &mut crate::view::View<'_>, paths: Vec<PathBuf>) {
-    for path in addable(paths) {
-        v.add_path(path);
+struct LaunchFiles {
+    helper: Helper,
+    _pins: Vec<fs::File>,
+}
+
+fn prepare_launch(data: &Path, id: &str) -> io::Result<LaunchFiles> {
+    let folder = data.canonicalize()?.join("addons").join(id);
+    let mut dirs: Vec<_> = folder
+        .ancestors()
+        .filter(|p| p.parent().is_some())
+        .collect();
+    dirs.reverse();
+    let mut pins = Vec::with_capacity(dirs.len() + 2);
+    for dir in dirs {
+        pins.push(pin_entry(dir, true)?);
     }
+    pins.push(pin_entry(&folder.join("addon.json"), false)?);
+    let helper = read(id, &folder)
+        .map_err(|why| io::Error::new(io::ErrorKind::PermissionDenied, why.to_string()))?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no longer a helper"))?;
+    pins.push(pin_entry(&helper.program, false)?);
+    Ok(LaunchFiles {
+        helper,
+        _pins: pins,
+    })
 }
 
 /// What a click on a helper's button did.
@@ -328,9 +358,9 @@ impl Helpers {
     /// own folder, not waited for. Not again while the copy started last still runs (its window comes forward
     /// instead), and never in a self-test.
     pub fn start(&mut self, id: &str) -> io::Result<Started> {
-        let Some(h) = self.list.iter().find(|h| h.id == id).cloned() else {
+        if !self.list.iter().any(|h| h.id == id) {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such helper"));
-        };
+        }
         if self.smoke {
             return Ok(Started::SelfTest);
         }
@@ -339,26 +369,8 @@ impl Helpers {
         {
             return Ok(Started::AlreadyOpen(bring_forward(run.pid)));
         }
-        // checked again, whole: the folder may have changed since it was listed
-        let fresh = match fs::symlink_metadata(self.data.join("addons")) {
-            Ok(m) if is_link(&m) => Err(Refusal::Link),
-            _ => read(id, &h.folder),
-        };
-        let h = match fresh {
-            Ok(Some(h)) => h,
-            Ok(None) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "no longer a helper",
-                ));
-            }
-            Err(why) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    why.to_string(),
-                ));
-            }
-        };
+        let launch = prepare_launch(&self.data, id)?;
+        let h = &launch.helper;
         let exe = std::env::current_exe()?;
         let data = std::path::absolute(&self.data)?;
         let mut child = Command::new(&h.program)
@@ -373,6 +385,7 @@ impl Helpers {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;
+        drop(launch);
         let alive = Arc::new(AtomicBool::new(true));
         let pid = child.id();
         let (flag, ctx) = (alive.clone(), self.ctx.clone());
@@ -527,6 +540,43 @@ mod tests {
                 program: dir.join("example-helper.exe"),
             }]
         );
+    }
+
+    #[test]
+    fn a_utf8_bom_manifest_survives_discovery_and_launch_validation() {
+        let t = base();
+        let json = format!("\u{feff}{}", manifest("song.exe"));
+        addon(t.path(), "sample", &json, Some("song.exe"));
+        assert_eq!(list(t.path()).helpers[0].id, "sample");
+        assert_eq!(
+            prepare_launch(t.path(), "sample").unwrap().helper.id,
+            "sample"
+        );
+    }
+
+    #[test]
+    fn launch_keeps_deny_delete_handles_until_creation_finishes() {
+        let t = base();
+        let dir = addon(t.path(), "sample", &manifest("song.exe"), Some("song.exe"));
+        let launch = prepare_launch(t.path(), "sample").unwrap();
+        let delete_access = |path: &Path| {
+            fs::OpenOptions::new()
+                .access_mode(0x0001_0000) // request DELETE access without changing anything
+                .share_mode(7)
+                .custom_flags(BACKUP_SEMANTICS)
+                .open(path)
+        };
+        for path in [
+            t.path().to_owned(),
+            t.path().join("addons"),
+            dir.clone(),
+            dir.join("addon.json"),
+            dir.join("song.exe"),
+        ] {
+            assert_eq!(delete_access(&path).unwrap_err().raw_os_error(), Some(32));
+        }
+        drop(launch);
+        assert!(delete_access(&dir.join("song.exe")).is_ok());
     }
 
     #[test]
@@ -713,14 +763,19 @@ mod tests {
         let song = t.path().join("song.mp3");
         fs::write(&song, b"").unwrap();
         let upper = PathBuf::from(song.to_string_lossy().to_uppercase());
-        let got = addable([
+        let got = crate::add_work::classify(vec![
             song.clone(),
             PathBuf::from("song.mp3"),
             t.path().join("missing.mp3"),
             t.path().to_path_buf(),
             upper,
         ]);
-        assert_eq!(got, vec![song, t.path().to_path_buf()]);
+        assert_eq!(
+            got.into_iter()
+                .map(|p| (p.path, p.directory))
+                .collect::<Vec<_>>(),
+            [(song, false), (t.path().to_path_buf(), true)]
+        );
     }
 
     #[test]

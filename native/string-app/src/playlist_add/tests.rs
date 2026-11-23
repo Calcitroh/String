@@ -11,6 +11,10 @@ fn session(state: State) -> Session {
     Session::new(state, Default::default(), Library::default())
 }
 
+fn reserve(s: &mut Session, name: &str, paths: &[PathBuf]) {
+    super::reserve(s, name, &crate::add_work::classify(paths.to_vec()));
+}
+
 fn file(dir: &Path, name: &str) -> PathBuf {
     let path = dir.join(name);
     fs::write(&path, b"").unwrap();
@@ -51,6 +55,17 @@ fn parses_named_add_and_skips_missing_paths() {
     assert_eq!(a.root, dir.path());
     let missing = args(&["--add", "--playlist", "Mix", "missing.flac"]).unwrap();
     assert_eq!(missing.add, Some(vec![]));
+}
+
+#[test]
+fn forwarding_preserves_unchecked_paths_until_the_receivers_worker_classifies_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let pending = dir.path().join("soon.wav");
+    let cmd = Args::options([OsString::from("--add"), pending.clone().into()]).unwrap();
+    let paths = cmd.add.unwrap();
+    assert_eq!(paths, [pending.clone()]);
+    finish_wav(&pending);
+    assert_eq!(crate::add_work::classify(paths)[0].path, pending);
 }
 
 #[test]
@@ -161,7 +176,8 @@ fn playlist_sender() {
     };
     let prefix = std::env::var("STRING_PLAYLIST_TEST_PREFIX").unwrap();
     assert!(prefix.starts_with("PlaylistAddTest."));
-    let args = Args::parse_from([
+    let names = Names::custom(&prefix);
+    let args = Args::options([
         OsString::from("--add"),
         "--playlist".into(),
         " Études ".into(),
@@ -169,11 +185,26 @@ fn playlist_sender() {
         Path::new(&dir).join("one.flac").into(),
     ])
     .unwrap();
+    let paths = args.add.as_ref().unwrap();
+    // Both instances are real. The sender owns this second mutex, and the parent owns the window.
+    let local = Names {
+        add: None,
+        ..Names::custom(&format!("{prefix}.Sender"))
+    };
+    let Claim::First(_local_instance) = instance::claim_quietly(&local).unwrap() else {
+        panic!("expected an isolated sender mutex")
+    };
+    let mismatched = Names {
+        mutex: local.mutex,
+        ..names.clone()
+    };
+    assert!(!mismatched.send_paths(paths, Duration::ZERO));
+    assert!(!mismatched.send_playlist_add("Wrong owner", paths, Duration::ZERO));
     assert!(matches!(
         claim(
-            &Names::custom(&prefix),
-            args.playlist.as_deref().unwrap(),
-            args.add.as_ref().unwrap(),
+            &names,
+            args.playlist.as_deref(),
+            paths,
             Duration::from_secs(5)
         )
         .unwrap(),
@@ -197,7 +228,7 @@ fn named_add_crosses_processes() {
     .unwrap();
     let Start::Run(mut first) = claim(
         &names,
-        "Startup",
+        Some("Startup"),
         args.add.as_ref().unwrap(),
         Duration::ZERO,
     )
@@ -221,25 +252,34 @@ fn named_add_crosses_processes() {
         String::from_utf8_lossy(&child.stdout)
     );
 
-    // Delivery can precede both the window and the profile. Cold and warm requests emerge in order.
-    let (tx, wake) = mpsc::channel();
-    first.listen(move |s| tx.send(s).unwrap());
-    assert_eq!(
-        wake.recv_timeout(Duration::from_secs(2)),
-        Ok(instance::Signal::Add(vec![]))
-    );
-    args.root = dir.path().to_owned();
-    let received = first.take_playlist_adds();
-    let log = string_platform::errors_log::ErrorLog::new(&args.root);
-    let mut platform = Platform::new(first, &args, std::sync::Arc::new(log));
-    let mut requests = Requests::new(args.playlist.take(), &mut platform, received);
-    assert!(platform.take_added().is_empty());
-    assert_eq!(
-        requests.drain().collect::<Vec<_>>(),
-        [
-            ("Startup".into(), vec![one.clone()]),
-            ("Études".into(), vec![two, one]),
-        ]
-    );
-    assert_eq!(requests.drain().count(), 0);
+    // The early request and the one accepted immediately before close must reach the saved profile.
+    let mut adds = crate::add_work::Adds::new().unwrap();
+    let input = adds.input.clone();
+    first.route_adds(move |n, p, b| input.submit(n, p, b));
+    adds.startup = Some(crate::add_work::Batch::startup(
+        args.playlist.take(),
+        args.classify_startup().unwrap(),
+    ));
+    let three = file(dir.path(), "three.flac");
+    assert!(names.send_paths(std::slice::from_ref(&three), Duration::ZERO));
+    adds.set_closed(true);
+    assert!(!names.send_paths(std::slice::from_ref(&two), Duration::ZERO));
+    assert!(!names.send_playlist_add("Late", std::slice::from_ref(&two), Duration::ZERO));
+    let folder = crate::storage::folder(&dir.path().join("profile"), true);
+    let (mut store, mut s) =
+        crate::storage::Storage::open(&folder, &egui::Context::default()).unwrap();
+    let mut scan = crate::scan::Scanner::default();
+    while let Some(batch) = adds.next_at_exit() {
+        batch.apply(&mut s, &mut scan);
+    }
+    assert!(scan.requested);
+    assert!(!store.flush(&mut s).failed());
+    let saved = folder.open().unwrap().state.value;
+    assert_eq!(saved.fields["files"], json!([one, two, three]));
+    let lists = saved.fields["playlists"].as_array().unwrap();
+    assert_eq!(lists.len(), 2);
+    assert_eq!(lists[0]["name"], "Startup");
+    assert_eq!(lists[1]["name"], "Études");
+    assert_eq!(lists[1]["items"][0]["id"], id(&two));
+    assert_eq!(lists[1]["items"][1]["id"], id(&one));
 }

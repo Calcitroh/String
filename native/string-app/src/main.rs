@@ -1,4 +1,5 @@
 #![windows_subsystem = "windows"]
+mod add_work;
 pub mod app;
 #[cfg(test)]
 mod checks;
@@ -33,7 +34,7 @@ pub struct Args {
     pub explicit: bool,
     pub smoke: Option<PathBuf>,
     pub quit: bool,
-    /// `--add <paths>`: absolute, the ones that exist (each once). `None`: no `--add`.
+    /// Absolute path arguments. A first instance keeps the existing ones after its worker checks them.
     pub add: Option<Vec<PathBuf>>,
     pub playlist: Option<String>,
 }
@@ -59,9 +60,28 @@ fn resolved(path: &Path) -> std::io::Result<PathBuf> {
 }
 impl Args {
     fn parse() -> Result<Self, Error> {
-        Self::parse_from(std::env::args_os().skip(1))
+        Self::options(std::env::args_os().skip(1))
     }
+    /// The arguments of a first instance, after its worker has checked the locations.
+    #[cfg(test)]
     pub(crate) fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<Self, Error> {
+        let mut args = Self::options(args)?;
+        args.classify_startup()?;
+        Ok(args)
+    }
+    fn classify_startup(&mut self) -> Result<Vec<add_work::Location>, Error> {
+        let Some(paths) = self.add.take() else {
+            return Ok(Vec::new());
+        };
+        let locations = std::thread::Builder::new()
+            .name("string-start-paths".into())
+            .spawn(move || add_work::classify(paths))?
+            .join()
+            .map_err(|_| "Path worker stopped")?;
+        self.add = Some(locations.iter().map(|p| p.path.clone()).collect());
+        Ok(locations)
+    }
+    fn options(args: impl IntoIterator<Item = OsString>) -> Result<Self, Error> {
         let mut args = args.into_iter().peekable();
         let (mut root, mut out, mut smoke) = (None, None, false);
         let mut quit = false;
@@ -116,7 +136,6 @@ impl Args {
         if playlist.is_some() && add.as_ref().is_none_or(Vec::is_empty) {
             return Err(PlaylistUsage.into());
         }
-        let add = add.map(integration::helpers::addable);
         let explicit = root.is_some();
         let default = string_core::data::default_data_dir().ok_or("Missing profile location")?;
         let root = root.unwrap_or_else(|| default.clone());
@@ -163,7 +182,7 @@ fn run() -> Result<i32, Error> {
     let mut args = Args::parse()?;
     let auto = args.smoke.is_some();
     let start = if !args.quit
-        && let (Some(name), Some(paths)) = (&args.playlist, &args.add)
+        && let Some(paths) = &args.add
     {
         use string_platform::instance::Names;
         let names = if auto {
@@ -171,7 +190,12 @@ fn run() -> Result<i32, Error> {
         } else {
             Names::string()
         };
-        playlist_add::claim(&names, name, paths, std::time::Duration::from_secs(5))?
+        playlist_add::claim(
+            &names,
+            args.playlist.as_deref(),
+            paths,
+            std::time::Duration::from_secs(5),
+        )?
     } else {
         platform::claim(&args)?
     };
@@ -179,13 +203,21 @@ fn run() -> Result<i32, Error> {
         platform::Start::Run(instance) => instance,
         platform::Start::Done(code) => return Ok(code),
     };
-    let received_playlists = instance.take_playlist_adds();
+    let mut adds = add_work::Adds::new()?;
+    let input = adds.input.clone();
+    instance.route_adds(move |name, paths, bytes| input.submit(name, paths, bytes));
+    if args.add.is_some() {
+        let locations = args.classify_startup()?;
+        if locations.is_empty() && adds.close_if_idle() {
+            return Ok(0);
+        }
+        adds.startup = Some(add_work::Batch::startup(args.playlist.take(), locations));
+    }
     std::fs::create_dir_all(&args.root)?;
     let log = Arc::new(string_platform::errors_log::ErrorLog::new(&args.root));
     string_platform::errors_log::log_panics(log.clone());
     let mut platform = platform::Platform::new(instance, &args, log.clone());
-    let playlist_adds =
-        playlist_add::Requests::new(args.playlist.take(), &mut platform, received_playlists);
+    platform.take_added(); // the classified startup batch owns these paths
     let exit = Arc::new(AtomicI32::new(i32::from(auto)));
     let result = exit.clone();
     let opts = eframe::NativeOptions {
@@ -214,15 +246,7 @@ fn run() -> Result<i32, Error> {
     eframe::run_native(
         "String",
         opts,
-        Box::new(move |cc| {
-            Ok(Box::new(app::App::new(
-                cc,
-                args,
-                platform,
-                playlist_adds,
-                exit,
-            )?))
-        }),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, args, platform, adds, exit)?))),
     )
     .map_err(|e| {
         log.write("startup", &e);

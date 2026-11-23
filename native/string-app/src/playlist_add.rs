@@ -1,13 +1,9 @@
-use crate::{
-    platform::{Platform, Start},
-    playback::Session,
-};
+use crate::{add_work::Location, platform::Start, playback::Session};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashSet},
     io,
     path::PathBuf,
-    sync::mpsc,
     time::Duration,
 };
 use string_core::library::track_id;
@@ -15,7 +11,7 @@ use string_platform::instance::{self, Claim, Names};
 
 pub(crate) fn claim(
     names: &Names,
-    name: &str,
+    name: Option<&str>,
     paths: &[PathBuf],
     wait: Duration,
 ) -> io::Result<Start> {
@@ -25,42 +21,18 @@ pub(crate) fn claim(
     Ok(match instance::claim_quietly(names)? {
         Claim::First(instance) => Start::Run(instance),
         Claim::AlreadyRunning => {
-            let taken = names.send_playlist_add(name, paths, wait);
+            let taken = match name {
+                Some(name) => names.send_playlist_add(name, paths, wait),
+                None => names.send_paths(paths, wait),
+            };
             Start::Done(if taken { 0 } else { 1 })
         }
     })
 }
 
-type Request = (String, Vec<PathBuf>);
-
-pub(crate) struct Requests {
-    startup: Option<Request>,
-    received: Option<mpsc::Receiver<Request>>,
-}
-
-impl Requests {
-    pub(crate) fn new(
-        name: Option<String>,
-        platform: &mut Platform,
-        received: Option<mpsc::Receiver<Request>>,
-    ) -> Self {
-        Self {
-            startup: name.map(|n| (n, platform.take_added())),
-            received,
-        }
-    }
-
-    pub(crate) fn drain(&mut self) -> impl Iterator<Item = Request> + '_ {
-        self.startup
-            .take()
-            .into_iter()
-            .chain(self.received.iter().flat_map(|rx| rx.try_iter()))
-    }
-}
-
 /// Reserve ordinary playlist entries immediately. The playlist view already hides IDs until the scan finds them.
 /// A trailing separator reserves a directory's position; no song ID can end in a directory separator.
-pub(crate) fn reserve(s: &mut Session, name: &str, paths: &[PathBuf]) {
+pub(crate) fn reserve(s: &mut Session, name: &str, paths: &[Location]) {
     let folded = name.trim().to_lowercase();
     let key = s
         .models
@@ -76,13 +48,11 @@ pub(crate) fn reserve(s: &mut Session, name: &str, paths: &[PathBuf]) {
     let ids: Vec<_> = paths
         .iter()
         .filter_map(|path| {
-            let id = track_id(path.to_str()?);
-            if path.is_dir() {
+            let id = track_id(path.path.to_str()?);
+            if path.directory {
                 Some(format!("{}\\", id.trim_end_matches(['/', '\\'])))
-            } else if path.is_file() {
-                Some(id)
             } else {
-                None
+                Some(id)
             }
         })
         .filter(|id| seen.insert(id.clone()))

@@ -69,16 +69,21 @@ where String is: `--string-exe` is the exact String to call back, and `--string-
 ## Adding songs
 
 ```
-"<String.exe>" --add "<absolute path>" ["<absolute path>" ...]
+"<String.exe>" --data "<string-data>" --add "<absolute path>" ["<absolute path>" ...]
 ```
 
+- Pass the folder from `--string-data` back as `--data` on every callback. If the original player has closed,
+  the new instance opens that profile. A running instance continues to use its open profile.
 - Files are added as single songs and folders as library folders, exactly as if they were dropped on String's window.
   Then String scans.
-- Give absolute paths. Paths that don't exist are skipped; `--add` with none left does nothing and exits 0.
+- Give absolute paths. String checks them on a worker and skips missing paths. With no arguments, plain
+  `--add` exits 0. With no running copy and only missing paths, it exits 0 without opening a window.
 - If String is running, the paths go to it: it takes them even while minimised, and stays where it is (it doesn't
   come to the front over the helper's window). The `--add` process exits at once without opening a window: **0** once
   String has them, **1** if the String running didn't take them (String 1.x, which has no `--add`, or a String that
-  is closing).
+  is closing or whose pending add queue is full).
+- Plain and named adds share a limit of 8,192 pending paths and 8 MiB of request data. Space becomes available
+  after the player has checked and applied a request. Closing stops admission before the final save.
 - If none is running, that `--add` process becomes String, with those paths added. So don't wait for it to exit:
   start it and go on.
 - Path arguments continue up to the next option starting with `--`. Windows keeps a command line under
@@ -87,7 +92,7 @@ where String is: `--string-exe` is the exact String to call back, and `--string-
 ### Adding to a playlist
 
 ```
-"<String.exe>" --add --playlist "<name>" "<absolute path>" ["<absolute path>" ...]
+"<String.exe>" --data "<string-data>" --add --playlist "<name>" "<absolute path>" ["<absolute path>" ...]
 ```
 
 String adds the paths to the library as usual. It also appends the songs to the named playlist in argument order,
@@ -99,8 +104,8 @@ scanned songs at the folder's place, sorted by path. Repeating a song or a whole
 The playlist is stored in the same profile format that String 1.x reads.
 
 Supply a non-empty name and at least one path. A missing or blank name or a missing path list refuses the whole
-call with exit **2**, before String adds anything. Missing files are skipped. If every supplied path is missing,
-the call exits **0**. Delivery uses the same running-instance channel as plain `--add`. An older copy that only
+call with exit **2**, before String adds anything. Missing files are skipped. An accepted request containing
+only missing paths leaves the playlist alone. Delivery uses the same running-instance channel as plain `--add`. An older copy that only
 understands plain `--add` declines the entire playlist request with exit **1**. If no copy is running and there
 are paths to add, the new String handles the request at startup.
 
@@ -109,8 +114,10 @@ In Rust, for example:
 ```rust
 use std::process::Command;
 
-fn add_to_string(string_exe: &str, paths: &[std::path::PathBuf]) -> std::io::Result<()> {
-    let mut child = Command::new(string_exe).arg("--add").args(paths).spawn()?;
+fn add_to_string(string_exe: &std::path::Path, string_data: &std::path::Path,
+                 paths: &[std::path::PathBuf]) -> std::io::Result<()> {
+    let mut child = Command::new(string_exe)
+        .arg("--data").arg(string_data).arg("--add").args(paths).spawn()?;
     // String running: this ends at once with 0 (taken) or 1 (not taken). None running: this child is String now.
     std::thread::spawn(move || child.wait());
     Ok(())

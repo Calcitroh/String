@@ -41,6 +41,7 @@ pub struct ListCache {
     pub ids: Ids,
 }
 pub struct View<'a> {
+    pub(crate) adds: &'a crate::add_work::Input,
     pub platform: &'a mut crate::platform::Platform,
     pub s: &'a mut Session,
     pub player: &'a Player,
@@ -154,23 +155,8 @@ impl View<'_> {
         self.s.queue_changed(self.player);
     }
     pub fn add_path(&mut self, path: std::path::PathBuf) {
-        let key = if path.is_dir() {
-            "roots"
-        } else if path.is_file() {
-            "files"
-        } else {
-            self.views.toast.set("This path does not exist.");
-            return;
-        };
-        let p = path.to_string_lossy().into_owned();
-        let mut values = self.s.field(key).as_array().cloned().unwrap_or_default();
-        if !values
-            .iter()
-            .any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&p)))
-        {
-            values.push(p.into());
-            self.s.set_field(key, values.into());
+        if !self.adds.window_path(path) {
+            self.views.toast.set("String could not take more songs.");
         }
-        self.scan.requested = true;
     }
 }
