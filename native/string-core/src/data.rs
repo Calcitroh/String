@@ -305,9 +305,18 @@ impl DataFolder {
 }
 
 fn validate_locations(fields: &crate::Fields) -> io::Result<()> {
-    if !fields.contains_key("roots") && !fields.contains_key("files") {
+    let has = |key: &str| fields.contains_key(key);
+    if !has("roots") && !has("files") {
         return Err(invalid(
             "The library locations are missing. Restore state.json from backup before scanning.",
+        ));
+    }
+    // One list lost and the other empty would prune every cached song; neither version writes that next to a cache
+    // that still holds songs (this check runs only then), so it's damage, not a library the person emptied.
+    let empty = |key: &str| fields.get(key).and_then(Value::as_array).is_some_and(|a| a.is_empty());
+    if (!has("roots") && empty("files")) || (!has("files") && empty("roots")) {
+        return Err(invalid(
+            "A library location list is missing. Restore state.json from backup before scanning.",
         ));
     }
     let valid_path = |v: &Value| v.as_str().is_some_and(|p| !p.is_empty());

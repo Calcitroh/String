@@ -127,6 +127,48 @@ impl InstallPlan {
         )
     }
 }
+/// What a drive letter points at, as Windows' DOS device names report it: a SUBST letter (`\??\C:\…`) or a network
+/// mapping can be pointed elsewhere while an update runs, and the installer takes the install folder by its path.
+fn remappable(device: &str) -> bool {
+    device.starts_with(r"\??\")
+        || device.contains("LanmanRedirector")
+        || device.contains(r"\Device\Mup")
+        || device.contains("WebDavRedirector")
+}
+
+/// Automatic updates need String on a letter Windows gives a local volume; anywhere else the person installs the new
+/// version with its installer.
+fn fixed_drive(path: &Path) -> io::Result<()> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn QueryDosDeviceW(name: *const u16, target: *mut u16, max: u32) -> u32;
+    }
+    let refuse = || {
+        invalid(
+            "String is installed on a SUBST or network drive, so it doesn't update itself: install the new version \
+             with its installer",
+        )
+    };
+    let letter = match path.components().next() {
+        Some(std::path::Component::Prefix(p)) => match p.kind() {
+            std::path::Prefix::Disk(l) | std::path::Prefix::VerbatimDisk(l) => l as char,
+            _ => return Err(refuse()),
+        },
+        _ => return Err(refuse()),
+    };
+    let name: Vec<u16> = format!("{letter}:").encode_utf16().chain([0]).collect();
+    let mut target = vec![0u16; 4096];
+    let n = unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+    if n == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let end = target.iter().position(|&c| c == 0).unwrap_or(n as usize);
+    if remappable(&String::from_utf16_lossy(&target[..end])) {
+        return Err(refuse());
+    }
+    Ok(())
+}
+
 pub struct Updater {
     install: PathBuf,
     current: Version,
@@ -369,6 +411,7 @@ impl Updater {
         let (to, install_dir, install_parents) = self
             .installed_at()
             .ok_or_else(|| invalid("Only an installed String updates itself"))?;
+        fixed_drive(&to)?;
         let release = self
             .latest()?
             .ok_or_else(|| invalid("There is no release to install"))?;

@@ -1321,7 +1321,9 @@ mod player_tests {
     }
 
     /// The same with the real-time, muted player and its threads: the skip button mid-song and near the end.
+    /// It needs a working audio output (a muted player still waits for one), so it runs only when asked for.
     #[test]
+    #[ignore = "needs an audio output device: cargo test -- --ignored"]
     fn next_button_in_an_album_moves_on_in_real_time() {
         for (mode, press_at) in [
             ("repeat one", 1.5),

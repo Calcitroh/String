@@ -663,6 +663,9 @@ impl State {
         });
         service.event(Event::Removed(std::slice::from_ref(&copy.drop_id)));
         progress.merged_ids.insert(copy.drop_id.clone());
+        // The merge changed playlists: open lists rebuild their rows now, so a row's place never points at another
+        // song (the full catalog rebuild still waits for the batch).
+        v.s.generation += 1;
         v.s.models.catalog.tracks.remove(&copy.drop_id);
         v.s.library.tracks.retain(|t| t.path != copy.path);
         v.s.library_dirty = true;

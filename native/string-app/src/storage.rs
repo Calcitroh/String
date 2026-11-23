@@ -352,6 +352,9 @@ mod tests {
             r#"{"roots":null,"files":["loose.wav"]}"#,
             r#"{"v":1,"queue":{}}"#,
             r#"{"roots":[""],"files":[]}"#,
+            // one list lost and the other empty: 1.x and 2.0 never write that next to cached songs
+            r#"{"v":1,"files":[]}"#,
+            r#"{"v":1,"roots":[]}"#,
         ] {
             fs::write(&state, damaged).unwrap();
             assert!(

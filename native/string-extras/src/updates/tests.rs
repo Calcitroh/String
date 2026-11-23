@@ -76,6 +76,17 @@ impl Drop for Server {
 fn config(install: &Path, origin: &str, repo: &str, key: &str) -> Updater {
     Updater::for_test_feed(install, "2.0.0", &format!("{origin}/repos/{repo}"), key).unwrap()
 }
+/// The final review's case: an install on a SUBST or network letter could be redirected mid-update, so such a copy
+/// doesn't update itself. A letter on a local volume (this PC's temporary folder's drive) still does.
+#[test]
+fn automatic_updates_refuse_a_drive_letter_that_can_be_pointed_elsewhere() {
+    assert!(remappable(r"\??\C:\Users\someone\String"));
+    assert!(remappable(r"\Device\LanmanRedirector\;Z:000000000001a2b3\server\share"));
+    assert!(remappable(r"\Device\Mup\;WebDavRedirector\;W:0000\host\dav"));
+    assert!(!remappable(r"\Device\HarddiskVolume3"));
+    assert!(fixed_drive(&std::env::temp_dir()).is_ok());
+    assert!(fixed_drive(Path::new(r"\\server\share\String")).is_err());
+}
 #[test]
 fn windows_installer_marker_matches_the_verbatim_exe_directory() {
     let tmp = tempdir().unwrap();

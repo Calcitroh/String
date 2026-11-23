@@ -509,6 +509,34 @@ fn final_shell_success_for_a_substituted_file_must_not_authorize_a_merge() {
     assert_eq!(f.history(), history);
 }
 
+/// The final review's case: a playlist page left open during a batch keeps its rows while the batch merges a copy
+/// out of that playlist, so Delete on a shown row could remove another song. Each confirmed merge moves the page
+/// generation on, so open lists rebuild their rows at once (the full catalog rebuild can still wait).
+#[test]
+fn each_confirmed_merge_makes_open_lists_rebuild_their_rows() {
+    let mut f = Fixture::new();
+    f.page.drop = HashSet::from([f.ids[1].clone()]);
+    let mut checked = f.act(Intent::Recycle).unwrap();
+    let bin = f._dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let moved = checked.move_one(
+        0,
+        |path| fs::rename(path, bin.join(path.file_name().unwrap())),
+        |path| path.parent().unwrap().ends_with("bin"),
+    );
+    assert!(moved.is_ok());
+    let original = f.session.library.tracks[1].clone();
+    let before = f.session.generation;
+    let playlist_before = f.session.field("playlists").clone();
+    f.with_view(|page, v| {
+        let mut progress = Progress::default();
+        page.finish_move(&checked.plan[0], &original, Ok(()), &mut progress, v);
+        assert_eq!(progress.moved, 1);
+    });
+    assert_ne!(f.session.field("playlists"), &playlist_before, "the merge changed the playlist");
+    assert!(f.session.generation > before, "open lists keep stale rows after a merge");
+}
+
 #[test]
 #[ignore = "uses the Windows Recycle Bin and restores one generated song"]
 fn windows_recycle_restores_the_checked_song_to_its_original_path() {
@@ -1012,7 +1040,8 @@ fn final_batch_rebuilds_models_once_and_transfers_history_per_move() {
         }
         assert_eq!(progress.moved, 2);
         page.dispatch(checked, progress, v);
-        assert_eq!(v.s.generation - start, 1);
+        // one step per merge (open lists rebuild their rows) and one for the batch's single catalog rebuild
+        assert_eq!(v.s.generation - start, 2 + 1);
         assert_eq!(v.s.library.tracks.len(), 2);
         assert_eq!(v.s.models.by_id.len(), 2);
     });

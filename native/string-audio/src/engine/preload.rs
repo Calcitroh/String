@@ -1,19 +1,15 @@
 use crate::{Error, source::Source};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 
 type Opened = Result<Source, Error>;
+type Open = Arc<dyn Fn(&Path) -> Opened + Send + Sync>;
 
-struct Job {
-    path: PathBuf,
-    reply: mpsc::Sender<Opened>,
-}
-
-/// One open in progress and at most one queued replacement. Each request owns its
-/// reply channel. Replacing a request drops the old receiver even if I/O is stuck.
+/// The next song's file opened off the engine thread. Each request opens on a thread of its own and owns its reply
+/// channel: a replaced request is dropped at once, and a read stuck on a slow drive never holds up its replacement
+/// (it finishes later into a channel nobody reads).
 pub(super) struct Preload {
-    queued: Arc<Mutex<Option<Job>>>,
-    wake: mpsc::SyncSender<()>,
+    open: Open,
     pending: Option<(PathBuf, mpsc::Receiver<Opened>)>,
     ready: Option<Source>,
     /// The offline renderer advances a virtual clock, independently of wall time.
@@ -21,24 +17,9 @@ pub(super) struct Preload {
 }
 
 impl Preload {
-    pub fn new(open: impl Fn(&Path) -> Opened + Send + 'static) -> Self {
-        let (wake, signal) = mpsc::sync_channel(1);
-        let queued = Arc::new(Mutex::new(None::<Job>));
-        let jobs = queued.clone();
-        let _ = std::thread::Builder::new()
-            .name("audio preload".into())
-            .spawn(move || {
-                while signal.recv().is_ok() {
-                    // Release the lock before touching the file. Queue edits never wait for I/O.
-                    let job = jobs.lock().unwrap().take();
-                    if let Some(job) = job {
-                        let _ = job.reply.send(open(&job.path));
-                    }
-                }
-            });
+    pub fn new(open: impl Fn(&Path) -> Opened + Send + Sync + 'static) -> Self {
         Self {
-            queued,
-            wake,
+            open: Arc::new(open),
             pending: None,
             ready: None,
             wait: false,
@@ -54,13 +35,13 @@ impl Preload {
             let (reply, rx) = mpsc::channel();
             self.ready = None;
             self.pending = Some((path.to_owned(), rx));
-            *self.queued.lock().unwrap() = Some(Job {
-                path: path.to_owned(),
-                reply,
-            });
-            if let Err(mpsc::TrySendError::Disconnected(())) = self.wake.try_send(()) {
-                self.queued.lock().unwrap().take();
-            }
+            let (open, path) = (self.open.clone(), path.to_owned());
+            // If no thread can be made, the reply is dropped with the closure and `poll` reports the open failed.
+            let _ = std::thread::Builder::new()
+                .name("audio preload".into())
+                .spawn(move || {
+                    let _ = reply.send(open(&path));
+                });
         }
     }
 
@@ -88,7 +69,40 @@ impl Preload {
     pub fn clear(&mut self) {
         if self.pending.take().is_some() {
             self.ready = None;
-            self.queued.lock().unwrap().take();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// The final review's case: B's open hangs on a slow share, the queue then wants C instead. C must arrive while
+    /// B is still stuck, or Next (and the song's natural end) waits in silence.
+    #[test]
+    fn a_replacement_open_never_waits_behind_a_stuck_one() {
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let mut preload = Preload::new(move |path: &Path| {
+            if path == Path::new("slow-share.mp3") {
+                let _ = gate.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            }
+            Err(Error::Open(path.display().to_string()))
+        });
+        preload.request(Path::new("slow-share.mp3"));
+        std::thread::sleep(Duration::from_millis(50));
+        preload.request(Path::new("local.mp3"));
+        let end = Instant::now() + Duration::from_secs(3);
+        let got = loop {
+            if let Some(result) = preload.poll() {
+                break result;
+            }
+            assert!(Instant::now() < end, "the replacement waited behind the stuck open");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert!(matches!(got, Err(Error::Open(p)) if p == "local.mp3"));
+        drop(release);
     }
 }

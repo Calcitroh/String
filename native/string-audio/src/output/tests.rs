@@ -80,10 +80,11 @@ fn check_blocked_open(skip_again: bool) {
     );
     let (entered, opening) = mpsc::channel();
     let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
     let (finished, done) = mpsc::channel();
     engine.set_preload_opener(move |path| {
         entered.send(()).unwrap();
-        gate.recv_timeout(Duration::from_secs(3))
+        gate.lock().unwrap().recv_timeout(Duration::from_secs(3))
             .expect("source open blocked the engine until the deadline");
         let result = Source::open(path);
         finished.send(()).unwrap();
@@ -182,13 +183,14 @@ fn late_preload_plays_the_resampled_tail_and_can_be_superseded() {
         position.clone(),
     );
     let (release, gate) = mpsc::channel();
+    let gate = Mutex::new(gate);
     let (finished, done) = mpsc::channel();
     let (entered, opening) = mpsc::channel();
     let blocked_path = second.0.clone();
     engine.set_preload_opener(move |path| {
         if path == blocked_path {
             entered.send(()).unwrap();
-            gate.recv_timeout(Duration::from_secs(3)).unwrap();
+            gate.lock().unwrap().recv_timeout(Duration::from_secs(3)).unwrap();
             finished.send(()).unwrap();
         }
         crate::source::Source::open(path)

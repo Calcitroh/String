@@ -154,7 +154,7 @@ impl Engine {
     #[cfg(test)]
     pub fn set_preload_opener(
         &mut self,
-        open: impl Fn(&std::path::Path) -> Result<Source, crate::Error> + Send + 'static,
+        open: impl Fn(&std::path::Path) -> Result<Source, crate::Error> + Send + Sync + 'static,
     ) {
         self.preload = Preload::new(open);
     }
