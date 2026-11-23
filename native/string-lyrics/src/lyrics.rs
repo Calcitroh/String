@@ -109,6 +109,14 @@ impl Session {
         self.songs.entry(id.into()).or_default().clone()
     }
 }
+/// Whether this lookup is offline, awaiting the view delay, or allowed to ask LRCLIB.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Lookup {
+    Offline,
+    BeforeOnlineDelay,
+    Online,
+}
+
 pub struct Lyrics {
     dir: PathBuf,
     service: Lrclib,
@@ -132,6 +140,19 @@ impl Lyrics {
     /// `force` bypasses both caches, as for an explicit retry. On ordinary calls, concurrent
     /// requests for a song share one lookup. Transient failures can be retried after a minute.
     pub fn get(&self, song: &Song<'_>, allow_online: bool, force: bool) -> LyricsResult {
+        self.lookup(
+            song,
+            if allow_online {
+                Lookup::Online
+            } else {
+                Lookup::Offline
+            },
+            force,
+        )
+    }
+    /// Before the online delay elapses, unfinished local results leave both caches intact.
+    pub fn lookup(&self, song: &Song<'_>, mode: Lookup, force: bool) -> LyricsResult {
+        let allow_online = mode == Lookup::Online;
         let slot = self.session.lock().unwrap().slot(song.id);
         let mut current = slot.lock().unwrap();
         if !force
@@ -141,7 +162,10 @@ impl Lyrics {
         {
             return m.result.clone();
         }
-        let (result, asked) = self.find(song, allow_online, force);
+        let (result, asked) = self.find(song, mode, force);
+        if mode == Lookup::BeforeOnlineDelay && result.needs_online(asked) {
+            return result;
+        }
         let temporary = result.retry || result.busy || result.source == Source::None;
         *current = Some(Memo {
             result: result.clone(),
@@ -159,7 +183,8 @@ impl Lyrics {
         }
     }
 
-    fn find(&self, song: &Song<'_>, allow_online: bool, force: bool) -> (LyricsResult, bool) {
+    fn find(&self, song: &Song<'_>, mode: Lookup, force: bool) -> (LyricsResult, bool) {
+        let allow_online = mode == Lookup::Online;
         const MONTH_MS: i64 = 30 * 86_400_000;
         let path = self.dir.join(format!(
             "{:x}-{}.json",
@@ -179,6 +204,9 @@ impl Lyrics {
             }
         }
         let mut found = local(song.path);
+        if mode == Lookup::BeforeOnlineDelay && !found.synced {
+            return (found, false);
+        }
         let mut asked = false;
         if allow_online && !found.synced {
             match self.service.lookup(song) {

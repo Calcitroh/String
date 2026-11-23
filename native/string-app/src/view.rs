@@ -154,23 +154,12 @@ impl View<'_> {
         self.s.queue_changed(self.player);
     }
     pub fn add_path(&mut self, path: std::path::PathBuf) {
-        let key = if path.is_dir() {
-            "roots"
+        if path.is_dir() {
+            crate::screens::settings::add_roots(self, &[path]);
         } else if path.is_file() {
-            "files"
+            crate::screens::settings::add_songs(self, &[path]);
         } else {
             self.views.toast.set("This path does not exist.");
-            return;
-        };
-        let p = path.to_string_lossy().into_owned();
-        let mut values = self.s.field(key).as_array().cloned().unwrap_or_default();
-        if !values
-            .iter()
-            .any(|v| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case(&p)))
-        {
-            values.push(p.into());
-            self.s.set_field(key, values.into());
         }
-        self.scan.requested = true;
     }
 }

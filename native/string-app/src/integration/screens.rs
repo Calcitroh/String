@@ -34,13 +34,13 @@ struct Screens {
     smoke: bool,
     updates: Arc<Updates>,
     discord: Arc<Mutex<Discord>>,
-    root: PathBuf,
+    ollama: Arc<string_lyrics::Ollama>,
 }
 
 pub fn connect(
     ctx: &Context,
     hwnd: Hwnd,
-    root: &Path,
+    ollama: Arc<string_lyrics::Ollama>,
     smoke: bool,
     updates: Arc<Updates>,
     discord: Arc<Mutex<Discord>>,
@@ -55,7 +55,7 @@ pub fn connect(
         smoke,
         updates,
         discord,
-        root: root.into(),
+        ollama,
     }));
     rx
 }
@@ -130,10 +130,7 @@ impl Services for Screens {
         (!self.smoke).then(|| self.discord.lock().unwrap().clone())
     }
     fn translation_models(&self) -> io::Result<Vec<String>> {
-        if self.smoke {
-            return Ok(Vec::new());
-        }
-        string_lyrics::Ollama::new(&self.root).models()
+        self.ollama.models()
     }
 }
 
@@ -151,7 +148,9 @@ mod tests {
             smoke: false,
             updates: Arc::new(Updates::new(&root, true)),
             discord: Default::default(),
-            root,
+            ollama: Arc::new(
+                string_lyrics::Ollama::with_base_url(&root, "http://127.0.0.1:0").unwrap(),
+            ),
         };
         let worker = std::thread::spawn(move || {
             screen.pick_files("Cover", "Pictures|*.png", Some(Path::new("album")), false)

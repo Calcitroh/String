@@ -357,13 +357,32 @@ fn draw(
         Rect::from_min_size(cover.right_bottom() - Vec2::splat(52.), Vec2::splat(44.))
     };
     let mut fab = false;
+    let mut menu_at = ui::menus::menu_pos(&response);
     if hover || now {
         p.circle_filled(
             button.center(),
             button.width() / 2.,
             Color32::from_black_alpha(198),
         );
-        fab = ui::play_big(&mut u, button, now && v.st.playing, v.tint).clicked();
+        let play = ui::play_big(&mut u, button, now && v.st.playing, v.tint);
+        fab = play.clicked();
+        menu_at = menu_at.or_else(|| ui::menus::menu_pos(&play));
+    }
+    if let Some(at) = menu_at
+        && let Some(ctx) = &ctx
+        && matches!(
+            card.target,
+            Target::Page(Route::Album(_) | Route::Artist(_))
+        )
+    {
+        ui::menus::track_menu(
+            v.s.models.context_ids(ctx),
+            at,
+            ui::menus::Origin {
+                ctx: Some(ctx.clone()),
+                ..Default::default()
+            },
+        );
     }
     if !fab && !response.clicked() {
         return;

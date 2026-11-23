@@ -4,7 +4,7 @@
 //! on workers and dispatch updates to the screen. Supply the shared data folder
 //! and the displayed song metadata (including title/artist/album edits).
 //! Call [`Lyrics::get`] with online access only after the same song has stayed in the
-//! lyrics view for 1.2 seconds. An earlier call with online access off can show local
+//! lyrics view for 1.2 seconds. An earlier call with [`Lookup::BeforeOnlineDelay`] can show local
 //! lyrics immediately. Use [`Ollama::stop`] on a song change and [`Ollama::shutdown`]
 //! when the application closes.
 //!
@@ -37,7 +37,7 @@ mod unicode;
 
 pub use lrc::{Line, ParsedLyrics, line_at, parse_lrc};
 pub use lrclib::{Candidate, norm, pick_best};
-pub use lyrics::{Lyrics, LyricsResult, Song, Source};
+pub use lyrics::{Lookup, Lyrics, LyricsResult, Song, Source};
 pub use ollama::Ollama;
 pub use translation::{
     LANGUAGES, Plan, Translation, TranslationOptions, messages, parse_reply, pick_model, plan,

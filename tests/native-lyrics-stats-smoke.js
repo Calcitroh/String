@@ -63,8 +63,15 @@ async function main() {
   assert.equal(seen.length, 1, JSON.stringify(seen));
   assert.equal(seen[0].query.track_name, 'Glass Orbit');
   assert.equal(seen[0].query.artist_name, 'Test Signal');
-  assert(fs.readdirSync(path.join(data, 'translations')).some(p => p.endsWith('.json')));
-  for (const name of ['15-lyrics-synced', '15b-lyrics-plain', '16-lyrics-ask', '17-lyrics-online', '18-lyrics-translated', '20-stats-today', '21-stats-week', '22-stats-table', '30-stats-phone']) {
+  const translations = path.join(data, 'translations');
+  const cache = fs.readdirSync(translations).filter(p => p.endsWith('.json'));
+  assert.equal(cache.length, 1);
+  const saved = JSON.parse(fs.readFileSync(path.join(translations, cache[0]), 'utf8'));
+  assert.deepEqual(saved.out, [
+    '[EN] Low tide line one', '[EN] Low tide line two', '[EN] Third line at five',
+    '[EN] Fourth line at eight', '[EN] Last line at twelve'
+  ]);
+  for (const name of ['15-lyrics-synced', '15b-lyrics-plain', '16-lyrics-ask', '17-lyrics-online', '17b-translation-models', '17c-translation-away', '18-lyrics-translated', '20-stats-today', '21-stats-week', '22-stats-table', '30-stats-phone']) {
     assert(results.checks.includes(name), name);
     assert(fs.statSync(path.join(out, name + '.png')).size > 0, name);
   }

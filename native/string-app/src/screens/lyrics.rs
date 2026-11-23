@@ -15,7 +15,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use string_lyrics::{Lyrics, LyricsResult, Ollama, Source};
+use string_lyrics::{Lookup, Lyrics, LyricsResult, Ollama, Source};
 use worker::{LanguageModel, Translator};
 
 const SETTLE: Duration = Duration::from_millis(1200);
@@ -31,6 +31,7 @@ struct Page {
     entered: Instant,
     permission: Option<bool>,
     online_started: bool,
+    force: bool,
     lookup: Option<Receiver<LyricsResult>>,
     found: Option<LyricsResult>,
     scroll: lines::Follow,
@@ -73,6 +74,10 @@ impl LyricsView {
         }
     }
 
+    pub(crate) fn ollama(&self) -> Arc<Ollama> {
+        self.translator.service.clone()
+    }
+
     pub fn check_visible(&mut self, overlay: Option<Overlay>, minimized: bool, song: Option<&str>) {
         if self
             .page
@@ -80,18 +85,33 @@ impl LyricsView {
             .is_some_and(|p| minimized || overlay != Some(Overlay::Lyrics) || song != Some(&p.id))
         {
             self.page = None;
-            self.translator.clear();
+        }
+        if self.page.is_none() {
+            self.translator.poll();
         }
     }
 
     fn open(&mut self, ctx: &Context, song: &Song, permission: Option<bool>, force: bool) {
-        self.translator.clear();
+        if force || self.translator.song_changed(&song.id) {
+            self.translator.clear();
+        }
         self.page = Some(Page {
             id: song.id.clone(),
             entered: Instant::now(),
             permission,
             online_started: false,
-            lookup: Some(lookup(ctx, &self.lyrics, song, false, force)),
+            force,
+            lookup: Some(lookup(
+                ctx,
+                &self.lyrics,
+                song,
+                if permission == Some(true) {
+                    Lookup::BeforeOnlineDelay
+                } else {
+                    Lookup::Offline
+                },
+                force,
+            )),
             found: None,
             scroll: Default::default(),
         });
@@ -121,7 +141,7 @@ impl LyricsView {
         if let Some(wait) = page.online_wait(Instant::now()) {
             if wait.is_zero() {
                 page.online_started = true;
-                page.lookup = Some(lookup(ctx, &self.lyrics, song, true, false));
+                page.lookup = Some(lookup(ctx, &self.lyrics, song, Lookup::Online, page.force));
             } else {
                 ctx.request_repaint_after(wait);
             }
@@ -133,13 +153,14 @@ fn lookup(
     ctx: &Context,
     service: &Arc<Lyrics>,
     song: &Song,
-    online: bool,
+    phase: Lookup,
     force: bool,
 ) -> Receiver<LyricsResult> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     let (ctx, service, song) = (ctx.clone(), service.clone(), song.clone());
     std::thread::spawn(move || {
-        let result = service.get(&song.lyrics_song(), online, force);
+        let song = song.lyrics_song();
+        let result = service.lookup(&song, phase, force);
         let _ = tx.send(result);
         ctx.request_repaint();
     });
@@ -280,7 +301,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     let is_on = v.s.setting("translate").as_bool() == Some(true);
     if let Some(found) = found.filter(|_| has && is_on) {
         state.translator.update(ui.ctx(), &song, found, options);
-    } else {
+    } else if !is_on || found.is_some() {
         state.translator.clear();
     }
     let status = &state.translator.status;
@@ -421,6 +442,72 @@ fn empty(ui: &mut Ui, allow: Option<bool>, result: &LyricsResult) -> Option<Acti
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixture() -> (tempfile::TempDir, Song, LyricsView, LanguageModel) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.flac");
+        let lib =
+            serde_json::from_value(serde_json::json!({"v":1,"tracks":[{"path":path}]})).unwrap();
+        let session = crate::playback::Session::new(Default::default(), Default::default(), lib);
+        let song = session.models.by_id.values().next().unwrap().clone();
+        let view = LyricsView::new(dir.path(), true);
+        let options = LanguageModel::from_settings(&session);
+        (dir, song, view, options)
+    }
+
+    #[test]
+    fn hiding_lyrics_preserves_the_translation_job() {
+        let (_dir, song, mut view, options) = fixture();
+        let ctx = Context::default();
+        for (overlay, minimized) in [
+            (Some(Overlay::Record), false),
+            (Some(Overlay::Lyrics), true),
+        ] {
+            view.open(&ctx, &song, None, false);
+            let result = view.lyrics.get(&song.lyrics_song(), false, false);
+            view.translator
+                .update(&ctx, &song, &result, options.clone());
+            view.check_visible(overlay, minimized, Some(&song.id));
+            assert!(!view.translator.status.is_empty());
+        }
+    }
+
+    #[test]
+    fn leaving_during_look_again_keeps_the_cached_online_answer() {
+        let (dir, song, mut view, _) = fixture();
+        let ctx = Context::default();
+        view.lyrics.get(&song.lyrics_song(), false, false);
+        let file = std::fs::read_dir(dir.path().join("lyrics"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let record = serde_json::json!({"v":1,"source":"none","online":true,"asked":true,"at":chrono::Utc::now().timestamp_millis()}).to_string();
+        std::fs::write(&file, &record).unwrap();
+        view.lyrics.forget(&song.id);
+        view.open(&ctx, &song, Some(true), true);
+        view.page
+            .as_mut()
+            .unwrap()
+            .lookup
+            .take()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        view.check_visible(None, false, Some(&song.id));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), record);
+        view.open(&ctx, &song, Some(true), false);
+        let page = view.page.as_mut().unwrap();
+        page.found = Some(
+            page.lookup
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+        );
+        assert_eq!(page.online_wait(Instant::now() + SETTLE), None);
+    }
+
     #[test]
     fn leaving_lyrics_discards_the_online_deadline() {
         let now = Instant::now();
@@ -430,6 +517,7 @@ mod tests {
             entered: now,
             permission: None,
             online_started: false,
+            force: false,
             lookup: None,
             found: Some(LyricsResult {
                 source: Source::None,

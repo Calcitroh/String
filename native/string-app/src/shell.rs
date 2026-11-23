@@ -14,17 +14,32 @@ pub fn shortcuts(ui: &Ui, v: &mut View<'_>) {
     if ui::menus::takes_keys(ctx) {
         return;
     }
-    if key(Modifiers::ALT, Key::ArrowLeft) {
-        v.views.history.back();
-        v.route_changed();
-        return;
-    }
-    if key(Modifiers::ALT, Key::ArrowRight) {
-        v.views.history.forward();
-        v.route_changed();
+    let typing = ctx.text_edit_focused();
+    let back = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Extra1))
+        || (!typing && key(Modifiers::ALT, Key::ArrowLeft));
+    let forward = ctx.input(|i| i.pointer.button_released(egui::PointerButton::Extra2))
+        || (!typing && key(Modifiers::ALT, Key::ArrowRight));
+    if back || forward {
+        if back && v.views.history.has_back() {
+            v.views.history.back();
+            v.route_changed();
+        } else if forward && v.views.history.has_forward() {
+            v.views.history.forward();
+            v.route_changed();
+        }
         return;
     }
     if key(no, Key::Escape) {
+        let search = egui::Id::unique("global search");
+        if ctx.memory(|m| m.has_focus(search) || m.had_focus_last_frame(search)) {
+            v.views.query.clear();
+            ctx.memory_mut(|m| m.surrender_focus(search));
+            if v.views.history.current == Route::Search && v.views.history.has_back() {
+                v.views.history.back();
+                v.route_changed();
+            }
+            return;
+        }
         let filter = match v.views.history.current {
             Route::Songs => Some("Filter songs"),
             Route::Liked => Some("Filter liked songs"),
@@ -50,12 +65,11 @@ pub fn shortcuts(ui: &Ui, v: &mut View<'_>) {
     if v.views.adding_playlist || v.views.close_failed {
         return;
     }
-    if key(Modifiers::CTRL, Key::F) || (!ctx.text_edit_focused() && key(no, Key::Slash)) {
-        v.go(Route::Search);
-        v.views.search_focus = true;
+    if typing {
         return;
     }
-    if ctx.text_edit_focused() {
+    if key(Modifiers::CTRL, Key::F) || key(no, Key::Slash) {
+        v.views.search_focus = v.views.overlay.is_none();
         return;
     }
     if key(no, Key::Space) {
@@ -385,6 +399,14 @@ fn topbar(ui: &mut Ui, v: &mut View<'_>) {
     );
     if std::mem::take(&mut v.views.search_focus) {
         edit.request_focus();
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), edit.id) {
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::select_all_str(
+                    &v.views.query,
+                )));
+            egui::TextEdit::store_state(ui.ctx(), edit.id, state);
+        }
     }
     if edit.changed() {
         v.views.selection = Default::default();
