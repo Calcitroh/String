@@ -81,8 +81,28 @@ where String is: `--string-exe` is the exact String to call back, and `--string-
   is closing).
 - If none is running, that `--add` process becomes String, with those paths added. So don't wait for it to exit:
   start it and go on.
-- Everything after `--add` up to the next argument starting with `--` is a path. Windows keeps a command line under
+- Path arguments continue up to the next option starting with `--`. Windows keeps a command line under
   about 32,000 characters: for more paths than that, run `--add` more than once, or add their folder.
+
+### Adding to a playlist
+
+```
+"<String.exe>" --add --playlist "<name>" "<absolute path>" ["<absolute path>" ...]
+```
+
+String adds the paths to the library as usual. It also appends the songs to the named playlist in argument order,
+keeping each song's first place. It matches playlist names case-insensitively after trimming surrounding whitespace.
+If several playlists match, it uses the first. If none matches, it creates one with the trimmed name.
+
+A file's place is saved immediately and the song appears there once the scan reads it. A folder contributes its
+scanned songs at the folder's place, sorted by path. Repeating a song or a whole request keeps the existing order.
+The playlist is stored in the same profile format that String 1.x reads.
+
+Supply a non-empty name and at least one path. A missing or blank name or a missing path list refuses the whole
+call with exit **2**, before String adds anything. Missing files are skipped. If every supplied path is missing,
+the call exits **0**. Delivery uses the same running-instance channel as plain `--add`. An older copy that only
+understands plain `--add` declines the entire playlist request with exit **1**. If no copy is running and there
+are paths to add, the new String handles the request at startup.
 
 In Rust, for example:
 

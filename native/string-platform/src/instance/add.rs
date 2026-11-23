@@ -2,7 +2,7 @@
 //! sends it the paths in `WM_COPYDATA` and hears back 1 once that copy has them. Windows finds such a window on the
 //! caller's own desktop only, so a launch never reaches another signed-in person's String.
 
-use super::{Hub, Signal, lock};
+use super::{Hub, Instance, Names, Signal, lock};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -24,6 +24,8 @@ use windows::core::{HSTRING, PCWSTR};
 
 /// "SADD": the tag String's `WM_COPYDATA` carries, so a stray message from something else is turned down.
 const MAGIC: usize = 0x5341_4444;
+/// "SPLS": one playlist name followed by its paths. Older receivers refuse the entire message.
+const PLAYLIST: usize = 0x5350_4c53;
 /// UTF-16 units in one message at most (1 MiB); a longer list goes in several.
 const MAX_UNITS: usize = 1 << 19;
 /// How long one message may take to be answered.
@@ -40,22 +42,28 @@ struct CopyData {
 thread_local! {
     /// The receiving thread's hub, for the window procedure (which runs on that thread).
     static HUB: RefCell<Option<Arc<Mutex<Hub>>>> = const { RefCell::new(None) };
+    static PLAYLISTS: RefCell<Option<mpsc::Sender<PlaylistAdd>>> = const { RefCell::new(None) };
 }
+
+type PlaylistAdd = (String, Vec<PathBuf>);
 
 /// The running copy's end: the window and the thread that runs its messages. Dropping it closes both.
 pub(super) struct Receiver {
     hwnd: isize,
     thread: Option<thread::JoinHandle<()>>,
+    playlists: Option<mpsc::Receiver<PlaylistAdd>>,
 }
 
 impl Receiver {
     pub(super) fn open(class: &str, hub: Arc<Mutex<Hub>>) -> io::Result<Receiver> {
         let class = HSTRING::from(class);
         let (tx, rx) = mpsc::channel();
+        let (playlist_tx, playlists) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("string-add".into())
             .spawn(move || {
                 HUB.with(|h| *h.borrow_mut() = Some(hub));
+                PLAYLISTS.with(|p| *p.borrow_mut() = Some(playlist_tx));
                 match unsafe { window(&class) } {
                     Ok(hwnd) => {
                         let _ = tx.send(Ok(hwnd.0 as isize));
@@ -73,6 +81,7 @@ impl Receiver {
             Ok(Ok(hwnd)) => Ok(Receiver {
                 hwnd,
                 thread: Some(thread),
+                playlists: Some(playlists),
             }),
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -149,7 +158,7 @@ unsafe fn take(lparam: LPARAM) -> bool {
         return false;
     };
     let len = cd.bytes as usize;
-    if cd.tag != MAGIC
+    if !matches!(cd.tag, MAGIC | PLAYLIST)
         || !len.is_multiple_of(2)
         || len > MAX_UNITS * 2
         || (len > 0 && cd.data.is_null())
@@ -162,7 +171,18 @@ unsafe fn take(lparam: LPARAM) -> bool {
     } else {
         unsafe { std::slice::from_raw_parts(cd.data, len) }
     };
-    let paths = decode(bytes);
+    let paths = if cd.tag == PLAYLIST {
+        let Some(request) = decode_playlist(bytes) else {
+            return false;
+        };
+        if !PLAYLISTS.with_borrow(|p| p.as_ref().is_some_and(|tx| tx.send(request).is_ok())) {
+            return false;
+        }
+        // Wake the same listener as a plain add. The app drains the named request as one unit.
+        Vec::new()
+    } else {
+        decode(bytes)
+    };
     HUB.with(|h| match &*h.borrow() {
         Some(hub) => {
             lock(hub).deliver(Signal::Add(paths));
@@ -174,6 +194,41 @@ unsafe fn take(lparam: LPARAM) -> bool {
 
 /// The other launch's end: finds the window (waiting up to `wait` for a copy still starting), sends every part.
 pub(super) fn send(class: &str, paths: &[PathBuf], wait: Duration) -> bool {
+    send_parts(class, MAGIC, &encode(paths), wait)
+}
+
+impl Instance {
+    /// Take the named adds for this instance, including any received before the app opened.
+    pub fn take_playlist_adds(&mut self) -> Option<mpsc::Receiver<(String, Vec<PathBuf>)>> {
+        self.add.as_mut()?.playlists.take()
+    }
+}
+
+impl Names {
+    /// Send a named add in one message so a receiver accepts both the playlist and its paths together.
+    pub fn send_playlist_add(&self, name: &str, paths: &[PathBuf], wait: Duration) -> bool {
+        let Some(class) = self.add.as_deref() else {
+            return false;
+        };
+        let name = name.trim();
+        let mut part: Vec<_> = name.encode_utf16().collect();
+        if part.is_empty() || part.contains(&0) || paths.is_empty() {
+            return false;
+        }
+        part.push(0);
+        for path in paths {
+            let start = part.len();
+            part.extend(path.as_os_str().encode_wide());
+            if part.len() == start || part[start..].contains(&0) || part.len() >= MAX_UNITS {
+                return false;
+            }
+            part.push(0);
+        }
+        send_parts(class, PLAYLIST, &[part], wait)
+    }
+}
+
+fn send_parts(class: &str, tag: usize, parts: &[Vec<u16>], wait: Duration) -> bool {
     let class = HSTRING::from(class);
     let deadline = Instant::now() + wait;
     let hwnd = loop {
@@ -185,9 +240,9 @@ pub(super) fn send(class: &str, paths: &[PathBuf], wait: Duration) -> bool {
         }
         thread::sleep(Duration::from_millis(40));
     };
-    encode(paths).iter().all(|part| {
+    parts.iter().all(|part| {
         let cd = CopyData {
-            tag: MAGIC,
+            tag,
             bytes: (part.len() * 2) as u32,
             data: part.as_ptr().cast(),
         };
@@ -229,17 +284,37 @@ fn encode(paths: &[PathBuf]) -> Vec<Vec<u16>> {
 }
 
 fn decode(bytes: &[u8]) -> Vec<PathBuf> {
-    let units: Vec<u16> = bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|&b| u16::from_le_bytes(b))
-        .collect();
-    units
+    wide_units(bytes)
         .split(|&u| u == 0)
         .filter(|p| !p.is_empty())
         .map(|p| PathBuf::from(OsString::from_wide(p)))
         .collect()
+}
+
+fn wide_units(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&b| u16::from_le_bytes(b))
+        .collect()
+}
+
+fn decode_playlist(bytes: &[u8]) -> Option<PlaylistAdd> {
+    let units = wide_units(bytes);
+    let mut fields = units.strip_suffix(&[0])?.split(|&u| u == 0);
+    let name = String::from_utf16(fields.next()?).ok()?;
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let paths = fields
+        .map(|field| {
+            let path = PathBuf::from(OsString::from_wide(field));
+            path.is_absolute().then_some(path)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!paths.is_empty()).then(|| (name.to_owned(), paths))
 }
 
 #[cfg(test)]
@@ -248,6 +323,28 @@ mod tests {
 
     fn bytes(units: &[u16]) -> Vec<u8> {
         units.iter().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn playlist_message_requires_a_name_and_complete_absolute_paths() {
+        let payload = |s: &str| bytes(&s.encode_utf16().collect::<Vec<_>>());
+        for bad in [
+            "",
+            "Mix\0",
+            " \0C:\\a\0",
+            "Mix\0C:\\a",
+            "Mix\0C:\\a\0\0",
+            "Mix\0relative\0",
+        ] {
+            assert!(decode_playlist(&payload(bad)).is_none(), "{bad:?}");
+        }
+        assert_eq!(
+            decode_playlist(&payload(" Études \0C:\\z\0D:\\a\0")),
+            Some((
+                "Études".into(),
+                vec![PathBuf::from(r"C:\z"), PathBuf::from(r"D:\a")]
+            ))
+        );
     }
 
     #[test]

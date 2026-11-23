@@ -32,6 +32,7 @@ pub struct App {
     runtime: Option<Runtime>,
     error: String,
     platform: Platform,
+    playlist_adds: crate::playlist_add::Requests,
     views: Views,
     covers: CoverCache,
     viz: Viz,
@@ -47,10 +48,11 @@ pub struct App {
     transport_until: Instant,
 }
 impl App {
-    pub fn new(
+    pub(crate) fn new(
         cc: &eframe::CreationContext<'_>,
         args: Args,
         mut platform: Platform,
+        playlist_adds: crate::playlist_add::Requests,
         exit: Arc<AtomicI32>,
     ) -> Result<Self, Error> {
         let ctx = &cc.egui_ctx;
@@ -64,6 +66,7 @@ impl App {
             runtime: None,
             error: String::new(),
             platform,
+            playlist_adds,
             views: Views {
                 lyrics: Some(lyrics),
                 ..Default::default()
@@ -193,8 +196,9 @@ impl eframe::App for App {
         // too; a close that waited for them goes on once they are. Paths from `--add` are added here too, so a
         // helper's songs come in while String is minimised.
         let added = self.platform.take_added();
+        let mut playlists = self.playlist_adds.drain().peekable();
         let recycling = crate::screens::dupes::recycling();
-        if recycling || !added.is_empty() {
+        if recycling || !added.is_empty() || playlists.peek().is_some() {
             let tint = Tint::parse(s.setting("tint").as_str());
             let mono = s.setting("artMono").as_bool().unwrap_or(true);
             let mut v = View {
@@ -212,6 +216,13 @@ impl eframe::App for App {
             };
             if !added.is_empty() {
                 crate::integration::helpers::add(&mut v, added);
+            }
+            for (name, paths) in playlists {
+                let paths = crate::integration::helpers::addable(paths);
+                crate::playlist_add::reserve(v.s, &name, &paths);
+                for path in paths {
+                    v.add_path(path);
+                }
             }
             if recycling {
                 crate::screens::dupes::settle(&mut v);
@@ -232,7 +243,11 @@ impl eframe::App for App {
             s.load_current(&rt.player, st.playing, pos);
         }
         let generation = s.generation;
+        let scans = self.scan.completed;
         let errors = self.scan.poll(&mut s, ctx);
+        if self.scan.completed != scans && !self.scan.running() {
+            crate::playlist_add::resolve_folders(&mut s);
+        }
         if generation != s.generation {
             rt.player.queue_changed();
             if st.key.is_none() && s.current().is_some() {

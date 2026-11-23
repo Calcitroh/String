@@ -7,6 +7,7 @@ pub mod model;
 pub mod platform;
 pub mod playback;
 pub mod player_bar;
+mod playlist_add;
 pub mod route;
 pub mod scan;
 pub mod screens;
@@ -34,7 +35,16 @@ pub struct Args {
     pub quit: bool,
     /// `--add <paths>`: absolute, the ones that exist (each once). `None`: no `--add`.
     pub add: Option<Vec<PathBuf>>,
+    pub playlist: Option<String>,
 }
+#[derive(Debug)]
+struct PlaylistUsage;
+impl std::fmt::Display for PlaylistUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Usage: String --add --playlist <non-empty name> <path>...")
+    }
+}
+impl std::error::Error for PlaylistUsage {}
 fn resolved(path: &Path) -> std::io::Result<PathBuf> {
     if path.exists() {
         return path.canonicalize();
@@ -56,16 +66,33 @@ impl Args {
         let (mut root, mut out, mut smoke) = (None, None, false);
         let mut quit = false;
         let mut add: Option<Vec<PathBuf>> = None;
+        let mut playlist = None;
         while let Some(k) = args.next() {
             match k.to_str() {
                 Some("--smoke-test") => smoke = true,
                 Some("--quit") => quit = true,
                 // every argument up to the next option: no absolute path starts with "--"
-                Some("--add") => {
+                Some("--add" | "--playlist") => {
+                    if k == "--playlist" {
+                        if add.is_none() || playlist.is_some() {
+                            return Err(PlaylistUsage.into());
+                        }
+                        let name = args
+                            .next()
+                            .and_then(|n| n.into_string().ok())
+                            .ok_or(PlaylistUsage)?;
+                        let name = name.trim();
+                        if name.is_empty() {
+                            return Err(PlaylistUsage.into());
+                        }
+                        playlist = Some(name.to_owned());
+                    }
                     let list = add.get_or_insert_with(Vec::new);
                     while let Some(p) = args.next_if(|a| !a.to_string_lossy().starts_with("--")) {
                         // one that can't be made absolute (an empty one) is skipped, as a missing one is
-                        if let Ok(p) = std::path::absolute(PathBuf::from(p)) {
+                        if !p.is_empty()
+                            && let Ok(p) = std::path::absolute(PathBuf::from(p))
+                        {
                             list.push(p);
                         }
                     }
@@ -80,11 +107,14 @@ impl Args {
                 }
                 _ => {
                     return Err(
-                        "Usage: String [--quit] [--data <dir>] [--smoke-test --out <dir>] [--add <path>...]"
+                        "Usage: String [--quit] [--data <dir>] [--smoke-test --out <dir>] [--add [--playlist <name>] <path>...]"
                             .into(),
                     );
                 }
             }
+        }
+        if playlist.is_some() && add.as_ref().is_none_or(Vec::is_empty) {
+            return Err(PlaylistUsage.into());
         }
         let add = add.map(integration::helpers::addable);
         let explicit = root.is_some();
@@ -113,6 +143,7 @@ impl Args {
                 smoke: Some(out),
                 quit,
                 add,
+                playlist,
             });
         }
         if out.is_some() {
@@ -124,20 +155,37 @@ impl Args {
             smoke: None,
             quit,
             add,
+            playlist,
         })
     }
 }
 fn run() -> Result<i32, Error> {
-    let args = Args::parse()?;
+    let mut args = Args::parse()?;
     let auto = args.smoke.is_some();
-    let instance = match platform::claim(&args)? {
+    let start = if !args.quit
+        && let (Some(name), Some(paths)) = (&args.playlist, &args.add)
+    {
+        use string_platform::instance::Names;
+        let names = if auto {
+            Names::smoke()
+        } else {
+            Names::string()
+        };
+        playlist_add::claim(&names, name, paths, std::time::Duration::from_secs(5))?
+    } else {
+        platform::claim(&args)?
+    };
+    let mut instance = match start {
         platform::Start::Run(instance) => instance,
         platform::Start::Done(code) => return Ok(code),
     };
+    let received_playlists = instance.take_playlist_adds();
     std::fs::create_dir_all(&args.root)?;
     let log = Arc::new(string_platform::errors_log::ErrorLog::new(&args.root));
     string_platform::errors_log::log_panics(log.clone());
-    let platform = platform::Platform::new(instance, &args, log.clone());
+    let mut platform = platform::Platform::new(instance, &args, log.clone());
+    let playlist_adds =
+        playlist_add::Requests::new(args.playlist.take(), &mut platform, received_playlists);
     let exit = Arc::new(AtomicI32::new(i32::from(auto)));
     let result = exit.clone();
     let opts = eframe::NativeOptions {
@@ -166,7 +214,15 @@ fn run() -> Result<i32, Error> {
     eframe::run_native(
         "String",
         opts,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, args, platform, exit)?))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::App::new(
+                cc,
+                args,
+                platform,
+                playlist_adds,
+                exit,
+            )?))
+        }),
     )
     .map_err(|e| {
         log.write("startup", &e);
@@ -179,7 +235,7 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(1)
+            std::process::exit(if e.is::<PlaylistUsage>() { 2 } else { 1 })
         }
     }
 }
