@@ -19,6 +19,7 @@ pub mod ui;
 pub mod view;
 pub mod viz;
 use std::{
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -31,6 +32,8 @@ pub struct Args {
     pub explicit: bool,
     pub smoke: Option<PathBuf>,
     pub quit: bool,
+    /// `--add <paths>`: absolute, the ones that exist (each once). `None`: no `--add`.
+    pub add: Option<Vec<PathBuf>>,
 }
 fn resolved(path: &Path) -> std::io::Result<PathBuf> {
     if path.exists() {
@@ -46,13 +49,27 @@ fn resolved(path: &Path) -> std::io::Result<PathBuf> {
 }
 impl Args {
     fn parse() -> Result<Self, Error> {
-        let mut args = std::env::args_os().skip(1);
+        Self::parse_from(std::env::args_os().skip(1))
+    }
+    pub(crate) fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<Self, Error> {
+        let mut args = args.into_iter().peekable();
         let (mut root, mut out, mut smoke) = (None, None, false);
         let mut quit = false;
+        let mut add: Option<Vec<PathBuf>> = None;
         while let Some(k) = args.next() {
             match k.to_str() {
                 Some("--smoke-test") => smoke = true,
                 Some("--quit") => quit = true,
+                // every argument up to the next option: no absolute path starts with "--"
+                Some("--add") => {
+                    let list = add.get_or_insert_with(Vec::new);
+                    while let Some(p) = args.next_if(|a| !a.to_string_lossy().starts_with("--")) {
+                        // one that can't be made absolute (an empty one) is skipped, as a missing one is
+                        if let Ok(p) = std::path::absolute(PathBuf::from(p)) {
+                            list.push(p);
+                        }
+                    }
+                }
                 Some("--data") => {
                     root = Some(PathBuf::from(
                         args.next().ok_or("Missing --data directory")?,
@@ -63,11 +80,13 @@ impl Args {
                 }
                 _ => {
                     return Err(
-                        "Usage: String [--quit] [--data <dir>] [--smoke-test --out <dir>]".into(),
+                        "Usage: String [--quit] [--data <dir>] [--smoke-test --out <dir>] [--add <path>...]"
+                            .into(),
                     );
                 }
             }
         }
+        let add = add.map(integration::helpers::addable);
         let explicit = root.is_some();
         let default = string_core::data::default_data_dir().ok_or("Missing profile location")?;
         let root = root.unwrap_or_else(|| default.clone());
@@ -93,6 +112,7 @@ impl Args {
                 explicit,
                 smoke: Some(out),
                 quit,
+                add,
             });
         }
         if out.is_some() {
@@ -103,14 +123,16 @@ impl Args {
             explicit,
             smoke: None,
             quit,
+            add,
         })
     }
 }
 fn run() -> Result<i32, Error> {
     let args = Args::parse()?;
     let auto = args.smoke.is_some();
-    let Some(instance) = platform::claim(auto, args.quit)? else {
-        return Ok(0);
+    let instance = match platform::claim(&args)? {
+        platform::Start::Run(instance) => instance,
+        platform::Start::Done(code) => return Ok(code),
     };
     std::fs::create_dir_all(&args.root)?;
     let log = Arc::new(string_platform::errors_log::ErrorLog::new(&args.root));
