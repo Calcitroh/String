@@ -28,14 +28,14 @@ fn manifest_row(name: &str, contents: &str) -> String {
     )
 }
 
-fn archive(file: File, version: &str, symlink: bool) -> File {
+fn archive(file: File, version: &str, setup: &str, symlink: bool) -> File {
     let mut z = ZipWriter::new(file);
     let opts = SimpleFileOptions::default();
     let files = [
         ("setup/version.txt", version),
         ("setup/imports.txt", "kernel32.dll GetLastError"),
         ("String.exe", "fixture"),
-        ("setup/install.ps1", FIXTURE_SETUP),
+        ("setup/install.ps1", setup),
         (
             "setup/isolated.ps1",
             include_str!("../../../../tools/share/install.ps1"),
@@ -84,7 +84,10 @@ fn windows_installer_marker_matches_the_verbatim_exe_directory() {
     .unwrap();
     let exe_dir = fs::canonicalize(&install).unwrap();
     let updater = Updater::new(&exe_dir, "2.0.0").unwrap();
-    assert_eq!(updater.installed_at().as_deref(), Some(install.as_path()));
+    assert_eq!(
+        updater.installed_at().map(|(path, _)| path).as_deref(),
+        Some(install.as_path())
+    );
     fs::write(
         install.join("setup/installed.txt"),
         tmp.path().to_str().unwrap(),
@@ -99,7 +102,10 @@ fn marker_spelling_does_not_select_the_installer_destination() {
     fs::create_dir_all(install.join("setup")).unwrap();
     let marker = install.join("setup/installed.txt");
     // Exercise the volume/file ID query even when the host folds case.
-    assert!(directory_id(&install).unwrap() != directory_id(tmp.path()).unwrap());
+    assert!(
+        directory_id(&unpack::open_dir(&install).unwrap()).unwrap()
+            != directory_id(&unpack::open_dir(tmp.path()).unwrap()).unwrap()
+    );
     let other_spelling = tmp.path().join("player");
     fs::write(&marker, other_spelling.to_str().unwrap()).unwrap();
     let updater = Updater::new(&fs::canonicalize(&install).unwrap(), "2.0").unwrap();
@@ -108,17 +114,122 @@ fn marker_spelling_does_not_select_the_installer_destination() {
         fs::create_dir(&other_spelling).unwrap();
         assert!(!updater.installed());
     } else {
-        assert_eq!(updater.installed_at().as_deref(), Some(install.as_path()));
+        assert_eq!(
+            updater.installed_at().map(|(path, _)| path).as_deref(),
+            Some(install.as_path())
+        );
     }
 }
 #[test]
 fn signed_release_feed_end_to_end() {
+    with_prepared_release(FIXTURE_SETUP, |plan, root, install, origin, key| {
+        let child = plan
+            .command()
+            .creation_flags(0x08000000)
+            .env("STRING_TEST_TARGET", install)
+            .env("LOCALAPPDATA", root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(plan);
+        let run = child.wait_with_output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let version = fs::read_to_string(install.join("setup/version.txt")).unwrap();
+        assert_eq!(version, "9.9.9", "{}", String::from_utf8_lossy(&run.stdout));
+        assert_eq!(fs::read(install.join("String.exe")).unwrap(), b"fixture");
+        let updated =
+            Updater::for_test_feed(install, &version, &format!("{origin}/repos/good"), key)
+                .unwrap();
+        assert!(!updated.check().unwrap().newer);
+    });
+}
+
+fn delete_handle(dir: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .access_mode(0x0001_0000) // DELETE
+        .share_mode(7)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+        .open(dir)
+}
+
+fn assert_delete_denied(dir: &Path) {
+    let error = delete_handle(dir).expect_err("guarded folder allowed a delete handle");
+    assert_eq!(error.raw_os_error(), Some(32), "{}", dir.display());
+}
+
+#[test]
+fn prepared_release_holds_checked_folders_until_launch() {
+    // This signed fixture entry point only checks its working directory and the target marker.
+    let probe = r#"param([string]$To)
+$release = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($PSScriptRoot))
+if ($PWD.Path -eq $release -and (Test-Path -LiteralPath (Join-Path $To 'setup/installed.txt'))) {
+    [Console]::Write('prepared')
+}
+"#;
+    with_prepared_release(probe, |plan, _, install, _, _| {
+        let dirs = [
+            install.to_owned(),
+            plan.release.path.clone(),
+            plan.release.path.join("app"),
+            plan.release.path.join("app/setup"),
+        ];
+        for dir in &dirs {
+            assert_delete_denied(dir);
+        }
+        let child = plan
+            .command()
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        drop(plan);
+        let run = child.wait_with_output().unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            run.stdout,
+            b"prepared",
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        for dir in &dirs {
+            delete_handle(dir).unwrap();
+        }
+    });
+}
+
+#[test]
+fn update_folder_guard_denies_delete_access() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path().join("updates");
+    let folder = unpack::UpdateFolder::open(tmp.path()).unwrap();
+    assert_delete_denied(&dir);
+    drop(folder);
+    delete_handle(&dir).unwrap();
+}
+
+fn with_prepared_release(
+    setup: &str,
+    check_plan: impl FnOnce(InstallPlan, &Path, &Path, &str, &str),
+) {
     let runs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-runs");
     fs::create_dir_all(&runs).unwrap();
     let tmp = tempfile::tempdir_in(std::path::absolute(runs).unwrap()).unwrap();
     let root = tmp.path();
     for (name, ver) in [("good.zip", "9.9.9"), ("liar.zip", "9.9.8")] {
-        archive(File::create(root.join(name)).unwrap(), ver, false);
+        archive(File::create(root.join(name)).unwrap(), ver, setup, false);
     }
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
@@ -169,38 +280,33 @@ fn signed_release_feed_end_to_end() {
     );
     assert!(good.prepare(&data, "9.9.8", |_| {}).is_err());
     let mut events = vec![];
-    let plan = good.prepare(&data, "9.9.9", |p| events.push(p)).unwrap();
+    let plan = good
+        .prepare(&data, "9.9.9", |p| {
+            assert_delete_denied(&install);
+            events.push(p);
+        })
+        .unwrap();
     assert!(
         matches!(events.first(),Some(Progress::Receiving{got,total}) if got> &0 && *total==latest.size)
     );
     assert!(matches!(events.last(), Some(Progress::Verifying)));
-    assert_eq!(plan.ready, data.join(r"updates\String-9.9.9"));
-    assert_eq!(fs::read_to_string(&plan.script).unwrap(), FIXTURE_SETUP);
+    assert_eq!(plan.release.path, data.join(r"updates\String-9.9.9"));
+    let prepared_script = plan.release.path.join("app/setup/install.ps1");
+    assert_eq!(fs::read_to_string(&prepared_script).unwrap(), setup);
     assert_eq!(plan.to, install);
     assert!(
         plan.command()
             .get_args()
             .all(|s| !s.to_string_lossy().contains(install.to_str().unwrap()))
     );
-    // Use the same PowerShell command and working directory as the app, with no console.
-    let run = plan
-        .command()
-        .creation_flags(0x08000000)
-        .env("STRING_TEST_TARGET", &install)
-        .env("LOCALAPPDATA", root)
-        .output()
-        .unwrap();
-    assert!(
-        run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
+    // Another preparation must wait while the pending plan owns its release.
+    assert_eq!(
+        unpack::UpdateFolder::open(&data)
+            .unwrap_err()
+            .raw_os_error(),
+        Some(32)
     );
-    let version = fs::read_to_string(install.join("setup/version.txt")).unwrap();
-    assert_eq!(version, "9.9.9", "{}", String::from_utf8_lossy(&run.stdout));
-    assert_eq!(fs::read(install.join("String.exe")).unwrap(), b"fixture");
-    let updated =
-        Updater::for_test_feed(&install, &version, &format!("{origin}/repos/good"), &key).unwrap();
-    assert!(!updated.check().unwrap().newer);
+    check_plan(plan, root, &install, &origin, &key);
     for (repo, message) in [
         ("tampered", "signature"),
         ("liar", "version inside"),
@@ -213,12 +319,18 @@ fn signed_release_feed_end_to_end() {
         assert_eq!(check.latest.is_none(), repo == "none");
         let error = u.prepare(&data, "", |_| {}).unwrap_err().to_string();
         assert!(error.contains(message), "{repo}: {error}");
-        assert!(plan.script.exists());
+        assert!(prepared_script.exists());
     }
     // Preparing the same good release twice also cleans up an older preparation.
     let old = data.join("updates/previous");
     fs::create_dir(&old).unwrap();
-    good.prepare(&data, "", |_| {}).unwrap();
+    let retry = good.prepare(&data, "", |_| {}).unwrap();
+    assert_delete_denied(&retry.release.path);
+    assert_eq!(
+        fs::read_to_string(retry.release.path.join("app/setup/install.ps1")).unwrap(),
+        setup
+    );
+    assert!(!prepared_script.exists());
     assert!(!old.exists());
 }
 #[test]
@@ -240,7 +352,7 @@ fn archive_paths_and_links_are_refused() {
     assert!(unpack::entry_path("app/setup/install.ps1").is_ok());
     let tmp = tempdir().unwrap();
     let folder = unpack::UpdateFolder::open(tmp.path()).unwrap();
-    let f = archive(tempfile::tempfile().unwrap(), "9.9.9", true);
+    let f = archive(tempfile::tempfile().unwrap(), "9.9.9", FIXTURE_SETUP, true);
     assert!(
         folder
             .unpack(f, "9.9.9".parse().unwrap())
