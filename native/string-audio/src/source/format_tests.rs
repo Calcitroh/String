@@ -381,6 +381,38 @@ fn lock_middle(file: &std::fs::File) {
 #[cfg(windows)]
 #[test]
 fn reopening_an_unindexed_mp3_reuses_the_verified_length() {
+    // Process I/O counters include all threads. Run the two opens alone so other
+    // parallel tests cannot contribute reads. A byte-range lock also breaks an oplock.
+    if let Some(path) = std::env::var_os("STRING_TEST_MP3_IO_CHILD") {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetProcessIoCounters(process: *mut std::ffi::c_void, out: *mut [u64; 6]) -> i32;
+        }
+        let read_bytes = || {
+            let mut counts = [0u64; 6];
+            // The current-process pseudo handle and an IO_COUNTERS output buffer.
+            assert_ne!(
+                unsafe { GetProcessIoCounters(-1isize as *mut _, &mut counts) },
+                0
+            );
+            counts[3]
+        };
+        let path = PathBuf::from(path);
+        let start = std::time::Instant::now();
+        let expected = Source::open(&path).unwrap().info().frames.unwrap();
+        eprintln!("Unindexed MP3 first open: {:?}", start.elapsed());
+        let before = read_bytes();
+        let start = std::time::Instant::now();
+        assert_eq!(Source::open(&path).unwrap().info().frames, Some(expected));
+        let elapsed = start.elapsed();
+        let requested = read_bytes() - before;
+        eprintln!("Unindexed MP3 reopen: {elapsed:?}, {requested} bytes read");
+        assert!(
+            requested < std::fs::metadata(&path).unwrap().len() / 4,
+            "reopen read {requested} bytes"
+        );
+        return;
+    }
     let Some(songs) = Songs::new("mp3-reopen") else {
         return;
     };
@@ -393,14 +425,21 @@ fn reopening_an_unindexed_mp3_reuses_the_verified_length() {
                 &["-c:a", "libmp3lame", "-b:a", "128k", "-write_xing", "0"],
             )
         });
-    let file = std::fs::File::open(&path).unwrap();
-    let start = std::time::Instant::now();
-    let expected = Source::open(&path).unwrap().info().frames.unwrap();
-    eprintln!("Unindexed MP3 first open: {:?}", start.elapsed());
-    lock_middle(&file);
-    let start = std::time::Instant::now();
-    assert_eq!(Source::open(&path).unwrap().info().frames, Some(expected));
-    eprintln!("Unindexed MP3 reopen: {:?}", start.elapsed());
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "source::format_tests::reopening_an_unindexed_mp3_reuses_the_verified_length",
+            "--nocapture",
+        ])
+        .env("STRING_TEST_MP3_IO_CHILD", path)
+        .output()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stdout)
+    );
 }
 
 #[cfg(windows)]
@@ -421,6 +460,8 @@ fn tagged_mp3_open_skips_audio_bodies() {
     let file = std::fs::File::open(&path).unwrap();
     let size = file.metadata().unwrap().len();
     lock_middle(&file);
+    Source::open(&path).unwrap();
+    drop(file);
     for _ in 0..3 {
         let start = std::time::Instant::now();
         let frames = Source::open(&path).unwrap().info().frames.unwrap();
@@ -631,17 +672,24 @@ fn rewriting_an_unindexed_mp3_invalidates_its_cached_offsets() {
     let expected = Source::open(&b).unwrap().info().frames;
     let mut old = std::fs::read(&a).unwrap();
     old.resize(bytes.len(), 0);
-    std::fs::write(&a, old).unwrap();
+    std::fs::write(&a, &old).unwrap();
     let modified = std::fs::metadata(&a).unwrap().modified().unwrap();
-    assert_ne!(Source::open(&a).unwrap().info().frames, expected);
-    std::fs::write(&a, bytes).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(&a)
-        .unwrap()
-        .set_modified(modified)
-        .unwrap();
-    assert_eq!(Source::open(&a).unwrap().info().frames, expected);
+    let first = Source::open(&a).unwrap().info().frames;
+    assert_ne!(first, expected);
+    for (contents, want) in [(&bytes, expected), (&old, first)]
+        .into_iter()
+        .cycle()
+        .take(8)
+    {
+        // An editor can keep its writer open across the next selection.
+        use std::io::Write;
+        let mut writer = std::fs::File::options().write(true).open(&a).unwrap();
+        writer.write_all(contents).unwrap();
+        writer.set_modified(modified).unwrap();
+        assert_eq!(Source::open(&a).unwrap().info().frames, want);
+        drop(writer);
+        assert_eq!(Source::open(&a).unwrap().info().frames, want);
+    }
 }
 
 #[test]

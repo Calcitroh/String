@@ -1,9 +1,10 @@
 //! Count MPEG audio frames before publishing the duration. The first header can describe only
 //! the first part of a joined file, or give a stale frame count even with the correct byte size.
+#[cfg(windows)]
+mod cache;
+
 use super::codecs;
 use crate::resample::Resampler;
-use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
@@ -176,90 +177,13 @@ struct Index {
     audio_bytes: u64,
 }
 
-#[derive(PartialEq)]
-struct Stamp {
-    volume_and_id: [u64; 3],
-    change_time: i64,
-    write_time: i64,
-    bytes: u64,
-}
-
-#[cfg(windows)]
-fn stamp(file: &File, bytes: u64) -> Option<Stamp> {
-    use std::ffi::c_void;
-    use std::os::windows::io::AsRawHandle;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandleEx(
-            file: *mut c_void,
-            class: i32,
-            buffer: *mut c_void,
-            len: u32,
-        ) -> i32;
-    }
-    // FILE_BASIC_INFO is four LARGE_INTEGERs followed by attributes and alignment
-    // padding. FILE_ID_INFO is a volume serial and a 128-bit file ID.
-    let mut basic = [0i64; 5];
-    let mut id = [0u64; 3];
-    let ok = unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            0,
-            basic.as_mut_ptr().cast(),
-            size_of_val(&basic) as u32,
-        ) != 0
-            && GetFileInformationByHandleEx(
-                file.as_raw_handle(),
-                18,
-                id.as_mut_ptr().cast(),
-                size_of_val(&id) as u32,
-            ) != 0
-    };
-    (ok && basic[3] != 0 && id[1..] != [0, 0]).then_some(Stamp {
-        volume_and_id: id,
-        change_time: basic[3],
-        write_time: basic[2],
-        bytes,
-    })
-}
-
-#[cfg(not(windows))]
-fn stamp(_: &File, _: u64) -> Option<Stamp> {
-    None
-}
-
-// Loop and successor preparation reuse the most recent verified scans on this feeder.
-// Key by the open file identity and change time. Replacing a path or restoring its
-// modification time cannot reuse offsets from an older file.
-thread_local! {
-    static RECENT: RefCell<VecDeque<(Stamp, Index)>> = const { RefCell::new(VecDeque::new()) };
-}
-
 pub(super) fn length(mut file: File, track: &Track, rate: u32) -> Result<(Length, AudioBytes)> {
-    let bytes = file.metadata()?.len();
-    let before = stamp(&file, bytes);
-    let cached = before.as_ref().and_then(|key| {
-        RECENT.with_borrow(|items| {
-            items
-                .iter()
-                .find(|(s, _)| s == key)
-                .map(|(_, index)| index.clone())
-        })
-    });
-    let index = if let Some(index) = cached {
-        index
-    } else {
-        let (index, walked) = scan(&mut file, bytes, track, rate)?;
-        if walked
-            && let Some(key) = before
-            && stamp(&file, file.metadata()?.len()).as_ref() == Some(&key)
-        {
-            RECENT.with_borrow_mut(|items| {
-                items.truncate(3);
-                items.push_front((key, index.clone()));
-            });
-        }
-        index
+    #[cfg(windows)]
+    let index = cache::index(&mut file, track, rate)?;
+    #[cfg(not(windows))]
+    let index = {
+        let len = file.metadata()?.len();
+        scan(&mut file, len, track, rate)?.0
     };
     let mut audio = AudioBytes {
         file,
