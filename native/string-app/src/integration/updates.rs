@@ -107,7 +107,7 @@ impl Updates {
         if self.smoke || !updater()?.installed() {
             return Err(io::Error::other("Only an installed String updates itself"));
         }
-        plan.command().spawn()?;
+        plan.spawn()?;
         *ready = None;
         Ok(())
     }

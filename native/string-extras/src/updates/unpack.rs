@@ -12,33 +12,41 @@ const REPARSE: u32 = 0x400;
 const OPEN_REPARSE: u32 = 0x0020_0000;
 const DIRECTORY: u32 = 0x0200_0000;
 
-// Open the directory itself and deny delete sharing until its children are
-// finished. A checked directory cannot be renamed out from under extraction.
-fn pin_dir(path: &Path) -> io::Result<File> {
-    let open = || {
-        OpenOptions::new()
-            .access_mode(0x80)
-            .share_mode(1)
-            .custom_flags(OPEN_REPARSE | DIRECTORY)
-            .open(path)
-    };
-    let f = match open() {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            match fs::create_dir(path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e),
-            }
-            open()?
-        }
-        r => r?,
-    };
+// Attributes-only handles do not participate in Windows' delete-sharing checks.
+pub(super) fn open_dir(path: &Path) -> io::Result<File> {
+    let f = OpenOptions::new()
+        .access_mode(0x81) // FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES
+        .share_mode(1) // FILE_SHARE_READ
+        .custom_flags(OPEN_REPARSE | DIRECTORY)
+        .open(path)?;
     let m = f.metadata()?;
     if !m.is_dir() || m.file_attributes() & REPARSE != 0 {
         return Err(invalid("Updates require a directory without links"));
     }
     Ok(f)
 }
+fn pin_or_create_dir(path: &Path) -> io::Result<File> {
+    match open_dir(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match fs::create_dir(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+            open_dir(path)
+        }
+        result => result,
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedRelease {
+    pub path: PathBuf,
+    _directories: HashMap<PathBuf, File>,
+    _folder: UpdateFolder,
+}
+
+#[derive(Debug)]
 pub(super) struct UpdateFolder {
     pub path: PathBuf,
     _parents: Vec<File>,
@@ -50,7 +58,7 @@ impl UpdateFolder {
         // every directory we own below it, including the updates directory.
         let data = std::path::absolute(data)?;
         let path = data.join("updates");
-        let parents = vec![pin_dir(&data)?, pin_dir(&path)?];
+        let parents = vec![pin_or_create_dir(&data)?, pin_or_create_dir(&path)?];
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -69,12 +77,22 @@ impl UpdateFolder {
         })
     }
 
-    pub fn unpack(&self, archive: File, version: Version) -> io::Result<PathBuf> {
+    pub fn unpack(self, archive: File, version: Version) -> io::Result<PreparedRelease> {
+        // Extract under the final name so publishing never requires releasing the guards.
+        // A retry keeps the previous preparation intact until the new one passes validation.
+        let name = format!("String-{version}");
         let stage = tempfile::Builder::new()
-            .prefix(".stage-")
-            .tempdir_in(&self.path)?;
+            .prefix(&name)
+            .rand_bytes(0)
+            .tempdir_in(&self.path)
+            .or_else(|e| match e.kind() {
+                io::ErrorKind::AlreadyExists => tempfile::Builder::new()
+                    .prefix(&format!("{name}-"))
+                    .tempdir_in(&self.path),
+                _ => Err(e),
+            })?;
         let mut pinned = HashMap::new();
-        pinned.insert(PathBuf::new(), pin_dir(stage.path())?);
+        pinned.insert(PathBuf::new(), open_dir(stage.path())?);
         let mut zip = ZipArchive::new(archive)?;
         let required = [
             r"app\String.exe",
@@ -100,7 +118,7 @@ impl UpdateFolder {
             };
             for p in directory.ancestors().collect::<Vec<_>>().into_iter().rev() {
                 if !pinned.contains_key(p) {
-                    pinned.insert(p.to_owned(), pin_dir(&stage.path().join(p))?);
+                    pinned.insert(p.to_owned(), pin_or_create_dir(&stage.path().join(p))?);
                 }
             }
             if !entry.is_dir() {
@@ -151,7 +169,6 @@ impl UpdateFolder {
                 "The version inside the signed release differs from the release name",
             ));
         }
-        drop(pinned);
         // Only clear old preparations after the new signed payload is ready.
         for item in fs::read_dir(&self.path)? {
             let item = item?;
@@ -172,9 +189,11 @@ impl UpdateFolder {
                 fs::remove_file(p)?;
             }
         }
-        let ready = self.path.join(format!("String-{version}"));
-        fs::rename(stage.path(), &ready)?;
-        Ok(ready)
+        Ok(PreparedRelease {
+            path: stage.keep(),
+            _directories: pinned,
+            _folder: self,
+        })
     }
 }
 pub(super) fn entry_path(name: &str) -> io::Result<PathBuf> {

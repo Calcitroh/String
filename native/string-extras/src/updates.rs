@@ -98,13 +98,17 @@ pub enum Progress {
 #[derive(Debug)]
 pub struct InstallPlan {
     pub version: Version,
-    pub ready: PathBuf,
-    pub script: PathBuf,
-    pub to: PathBuf,
+    release: unpack::PreparedRelease,
+    to: PathBuf,
+    _install_dir: fs::File,
 }
 impl InstallPlan {
-    /// A prepared command. The app chooses when to open its installer console.
-    pub fn command(&self) -> Command {
+    /// Keep the verified directories open throughout Windows process creation.
+    pub fn spawn(&self) -> io::Result<std::process::Child> {
+        self.command().spawn()
+    }
+
+    fn command(&self) -> Command {
         use std::os::windows::process::CommandExt;
         let mut cmd = Command::new("powershell.exe");
         const RUN: &str = concat!(
@@ -112,9 +116,12 @@ impl InstallPlan {
             "& $env:STRING_UPDATE_SCRIPT -To $env:STRING_UPDATE_TO; ",
             "if ($LASTEXITCODE) { Read-Host 'Press Enter to close' }"
         );
-        cmd.current_dir(&self.ready)
+        cmd.current_dir(&self.release.path)
             .env_remove("PSModulePath")
-            .env("STRING_UPDATE_SCRIPT", &self.script)
+            .env(
+                "STRING_UPDATE_SCRIPT",
+                self.release.path.join("app/setup/install.ps1"),
+            )
             .env("STRING_UPDATE_TO", &self.to)
             .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", RUN])
             .creation_flags(0x10); // CREATE_NEW_CONSOLE
@@ -138,8 +145,8 @@ struct FileId {
     volume: u64,
     id: [u8; 16],
 }
-fn directory_id(path: &Path) -> Option<FileId> {
-    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+fn directory_id(file: &fs::File) -> Option<FileId> {
+    use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetFileInformationByHandleEx(
@@ -149,11 +156,6 @@ fn directory_id(path: &Path) -> Option<FileId> {
             size: u32,
         ) -> i32;
     }
-    let file = fs::OpenOptions::new()
-        .access_mode(0x80) // FILE_READ_ATTRIBUTES
-        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS opens directories
-        .open(path)
-        .ok()?;
     let mut info = FileId::default();
     // The live file handle and writable buffer cover the entire FileIdInfo call.
     let ok = unsafe {
@@ -225,7 +227,8 @@ impl Updater {
     pub fn installed(&self) -> bool {
         self.installed_at().is_some()
     }
-    fn installed_at(&self) -> Option<PathBuf> {
+    fn installed_at(&self) -> Option<(PathBuf, fs::File)> {
+        let install_dir = unpack::open_dir(&self.install).ok()?;
         let bytes = fs::read(self.install.join("setup/installed.txt")).ok()?;
         let text = crate::text::host_text(&bytes);
         let marked = Path::new(text.trim());
@@ -239,13 +242,12 @@ impl Updater {
         if !crate::text::same_windows_path(&powershell_directory(&marked)?, &to) {
             return None;
         }
-        let running = directory_id(&self.install)?;
-        if directory_id(&marked)? != running
-            || (to != self.install && directory_id(&to)? != running)
-        {
+        let running = directory_id(&install_dir)?;
+        let id_at = |path: &Path| directory_id(&unpack::open_dir(path).ok()?);
+        if id_at(&marked)? != running || (to != self.install && id_at(&to)? != running) {
             return None;
         }
-        Some(to)
+        Some((to, install_dir))
     }
     fn get(&self, url: &str, within: Duration) -> Result<Response<Body>, ureq::Error> {
         #[cfg(any(test, feature = "test-feed"))]
@@ -364,7 +366,7 @@ impl Updater {
         want: &str,
         mut progress: impl FnMut(Progress),
     ) -> io::Result<InstallPlan> {
-        let to = self
+        let (to, install_dir) = self
             .installed_at()
             .ok_or_else(|| invalid("Only an installed String updates itself"))?;
         let release = self
@@ -415,10 +417,10 @@ impl Updater {
         key.verify_prehash(&hash.finalize(), &signature)
             .map_err(|_| invalid("The release signature does not match String's key"))?;
         archive.rewind()?;
-        let ready = folder.unpack(archive, version)?;
+        let release = folder.unpack(archive, version)?;
         Ok(InstallPlan {
-            script: ready.join("app/setup/install.ps1"),
-            ready,
+            release,
+            _install_dir: install_dir,
             to,
             version,
         })
