@@ -1,0 +1,865 @@
+//! The Duplicates page: songs the library has more than once. For each, play the copies, pick the one to keep and
+//! tick the ones to drop, then hide those in String or move them to the Recycle Bin. Either way the kept copy takes
+//! over their likes, plays, loops, listening time and playlist places.
+use super::settings::plural;
+use crate::{
+    services::{self, Event, Task},
+    theme::*,
+    ui::{
+        self,
+        panel::{self, Btn, Kind},
+    },
+    view::View,
+};
+use chrono::Local;
+use egui::{
+    Align, Context, Layout, Rect, Sense, Stroke, StrokeKind, Ui, pos2, text::LayoutJob, vec2,
+};
+use serde_json::Value;
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{LazyLock, Mutex, MutexGuard},
+};
+use string_extras::{
+    duplicates::{
+        CopyToMerge, Disposition, DuplicateGroup, duplicates, forget_not_same, mark_not_same,
+        merge_copy, unhide_all,
+    },
+    edit::display_names,
+};
+
+struct Copy {
+    id: String,
+    path: String,
+    name: String,
+    dir: String,
+    /// "MP3 · 161 kbps · 0.5 MB · 0:24"
+    sound: String,
+    title: String,
+    artist: String,
+    size: u64,
+}
+struct Group {
+    found: DuplicateGroup,
+    copies: Vec<Copy>,
+    artists: String,
+}
+/// What the list was made from: a change to any of it means looking again.
+type Basis = (usize, Option<i64>, usize, usize);
+/// How each file of a plan fared on its way to the Recycle Bin.
+type Moved = Vec<Result<(), String>>;
+#[derive(Default)]
+pub struct State {
+    groups: Vec<Group>,
+    basis: Option<Basis>,
+    looking: Option<(Basis, Task<Vec<DuplicateGroup>>)>,
+    keep: Vec<String>,
+    drop: HashSet<String>,
+    pub ask: bool,
+    recycling: Option<(Vec<CopyToMerge>, Task<Moved>)>,
+}
+static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
+pub fn state() -> MutexGuard<'static, State> {
+    STATE.lock().unwrap()
+}
+fn copies(n: usize) -> String {
+    if n == 1 {
+        "1 copy".into()
+    } else {
+        format!("{} copies", super::settings::num(n as u64))
+    }
+}
+fn megabytes(bytes: u64) -> String {
+    format!("{:.1} MB", bytes as f64 / 1_048_576.)
+}
+fn count(v: &View<'_>, field: &str) -> usize {
+    v.s.field(field).as_object().map_or(0, |m| m.len())
+}
+fn basis(v: &View<'_>) -> Basis {
+    (
+        v.s.library.tracks.len(),
+        v.s.library.saved,
+        count(v, "hidden"),
+        count(v, "notDupes"),
+    )
+}
+/// "N songs hidden from String · show them again", for this page and the Library page.
+pub fn hidden_note(ui: &mut Ui, v: &mut View<'_>) {
+    let n = count(v, "hidden");
+    if n == 0 {
+        return;
+    }
+    ui.add_space(8.);
+    if panel::note_link(
+        ui,
+        &format!("{} hidden from String", plural(n, "song")),
+        "show them again",
+    ) {
+        unhide_all(&mut v.s.state);
+        v.s.rebuild();
+        v.s.queue_changed(v.player);
+        v.views.toast.set("Hidden songs are back");
+    }
+}
+fn apart_note(ui: &mut Ui, v: &mut View<'_>) {
+    let n = count(v, "notDupes");
+    if n == 0 {
+        return;
+    }
+    ui.add_space(8.);
+    let pairs = if n == 1 {
+        "1 pair".into()
+    } else {
+        format!("{n} pairs")
+    };
+    if panel::note_link(
+        ui,
+        &format!("{pairs} you marked as not the same"),
+        "list them again",
+    ) {
+        forget_not_same(&mut v.s.state);
+        v.s.state_dirty = true;
+    }
+}
+impl State {
+    fn look(&mut self, ctx: &Context, v: &View<'_>) {
+        let (lib, state) = (v.s.library.clone(), v.s.state.clone());
+        self.looking = Some((basis(v), Task::run(ctx, move |_| duplicates(&lib, &state))));
+    }
+    /// The copies surely the same as the kept one are ticked; "maybe" ones wait for the person.
+    fn tick(&mut self, gi: usize) {
+        let g = &self.groups[gi];
+        let keep = g
+            .copies
+            .iter()
+            .position(|c| c.id == self.keep[gi])
+            .unwrap_or(0);
+        for c in &g.copies {
+            self.drop.remove(&c.id);
+        }
+        self.drop
+            .extend(g.found.suggested_drops(keep).map(str::to_owned));
+    }
+    fn take(&mut self, found: Vec<DuplicateGroup>, v: &View<'_>) {
+        let tracks: HashMap<_, _> = v.s.library.tracks.iter().map(|t| (t.id(), t)).collect();
+        self.groups = found
+            .into_iter()
+            .filter_map(|found| {
+                let copies = found
+                    .ids
+                    .iter()
+                    .map(|id| {
+                        let t = tracks.get(id)?;
+                        let path = std::path::Path::new(&t.path);
+                        let names = display_names(&v.s.state, t);
+                        let kbps = if t.tags.duration > 0. && t.size > 0 {
+                            (t.size as f64 * 8. / t.tags.duration / 1000.).round() as u64
+                        } else {
+                            0
+                        };
+                        let format = if t.tags.format.is_empty() {
+                            "?".into()
+                        } else {
+                            t.tags.format.to_uppercase()
+                        };
+                        Some(Copy {
+                            id: id.clone(),
+                            path: t.path.clone(),
+                            name: path.file_name()?.to_string_lossy().into_owned(),
+                            dir: path.parent()?.to_string_lossy().into_owned(),
+                            sound: format!(
+                                "{format}{} · {} · {}",
+                                if kbps > 0 {
+                                    format!(" · {kbps} kbps")
+                                } else {
+                                    String::new()
+                                },
+                                megabytes(t.size),
+                                time(t.tags.duration)
+                            ),
+                            title: names.title,
+                            artist: names.artist,
+                            size: t.size,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let mut artists: Vec<&str> = vec![];
+                for c in &copies {
+                    if !c.artist.is_empty() && !artists.contains(&c.artist.as_str()) {
+                        artists.push(&c.artist);
+                    }
+                }
+                Some(Group {
+                    artists: artists.join(" / "),
+                    found,
+                    copies,
+                })
+            })
+            .collect();
+        self.keep = self.groups.iter().map(|g| g.copies[0].id.clone()).collect();
+        self.drop.clear();
+        for gi in 0..self.groups.len() {
+            self.tick(gi);
+        }
+    }
+    fn plan(&self, v: &View<'_>) -> Vec<CopyToMerge> {
+        let tracks: HashMap<_, _> = v.s.library.tracks.iter().map(|t| (t.id(), t)).collect();
+        let mut plan = vec![];
+        for (g, keep) in self.groups.iter().zip(&self.keep) {
+            let Some(k) = tracks.get(keep) else { continue };
+            for c in &g.copies {
+                if c.id != *keep
+                    && self.drop.contains(&c.id)
+                    && let Some(d) = tracks.get(&c.id)
+                    && let Some(copy) = CopyToMerge::new(k, d)
+                {
+                    plan.push(copy);
+                }
+            }
+        }
+        plan
+    }
+    fn ticked(&self) -> (usize, u64) {
+        let mut total = (0, 0);
+        for c in self.groups.iter().flat_map(|g| &g.copies) {
+            if self.drop.contains(&c.id) {
+                total = (total.0 + 1, total.1 + c.size);
+            }
+        }
+        total
+    }
+    /// The list matches the library and nothing is under way.
+    pub fn settled(&self, v: &View<'_>) -> bool {
+        self.looking.is_none() && self.recycling.is_none() && self.basis == Some(basis(v))
+    }
+    pub fn hide(&mut self, v: &mut View<'_>) {
+        let plan = self.plan(v);
+        if plan.is_empty() {
+            return;
+        }
+        let now = Local::now().timestamp_millis();
+        let svc = services::get();
+        for copy in &plan {
+            merge_copy(
+                &mut v.s.state,
+                &mut v.s.listening,
+                copy,
+                Disposition::Hide,
+                now,
+            );
+            svc.event(Event::Merged {
+                from: &copy.drop_id,
+                to: &copy.keep_id,
+            });
+        }
+        v.s.listening_dirty = true;
+        v.s.rebuild();
+        v.s.queue_changed(v.player);
+        v.views.toast.set(format!(
+            "{} hidden from String: the files are still there",
+            copies(plan.len())
+        ));
+    }
+    fn recycle(&mut self, ctx: &Context, v: &View<'_>) {
+        let plan = self.plan(v);
+        let paths: Vec<PathBuf> = plan.iter().map(|c| PathBuf::from(&c.path)).collect();
+        self.recycling = Some((
+            plan,
+            Task::run(ctx, move |s| {
+                paths
+                    .iter()
+                    .map(|p| s.recycle(p).map_err(|e| e.to_string()))
+                    .collect()
+            }),
+        ));
+    }
+    /// The files that really moved are merged into the copies kept. A copy that was playing hands over to the
+    /// kept one at the same moment of the song.
+    fn recycled(
+        &mut self,
+        plan: Vec<CopyToMerge>,
+        done: Vec<Result<(), String>>,
+        v: &mut View<'_>,
+    ) {
+        let now = Local::now().timestamp_millis();
+        let svc = services::get();
+        let (mut moved, mut swap, mut failed) = (vec![], false, vec![]);
+        for (copy, result) in plan.iter().zip(done) {
+            match result {
+                Ok(()) => {
+                    swap |= merge_copy(
+                        &mut v.s.state,
+                        &mut v.s.listening,
+                        copy,
+                        Disposition::Recycled,
+                        now,
+                    )
+                    .is_some();
+                    svc.event(Event::Merged {
+                        from: &copy.drop_id,
+                        to: &copy.keep_id,
+                    });
+                    moved.push(copy.drop_id.clone());
+                }
+                Err(e) => failed.push(e),
+            }
+        }
+        if !moved.is_empty() {
+            svc.event(Event::Removed(&moved));
+            v.s.removals += 1;
+            v.s.library.tracks.retain(|t| !moved.contains(&t.id()));
+            v.s.library_dirty = true;
+            v.s.listening_dirty = true;
+            v.s.rebuild();
+            v.s.queue_changed(v.player);
+            if swap {
+                v.s.load_current(v.player, v.st.playing, v.st.position);
+            }
+            v.scan.requested = true;
+        }
+        v.views.toast.set(match failed.first() {
+            Some(e) => format!(
+                "{} moved to the Recycle Bin; {} couldn't be: {e}",
+                copies(moved.len()),
+                failed.len()
+            ),
+            None => format!("{} moved to the Recycle Bin", copies(moved.len())),
+        });
+    }
+}
+/// Once the files are in the Recycle Bin, the copies kept take over their likes, plays and playlist places, whichever
+/// page is open by then (the shell calls this every frame), so leaving Duplicates never leaves them on files that are
+/// gone. Closing String waits while `recycling()`.
+pub fn settle(v: &mut View<'_>) {
+    let mut st = state();
+    if let Some((_, task)) = &st.recycling
+        && let Some(done) = task.poll()
+    {
+        let (plan, _) = st.recycling.take().unwrap();
+        st.recycled(plan, done, v);
+    }
+}
+pub fn recycling() -> bool {
+    state().recycling.is_some()
+}
+pub fn show(ui: &mut Ui, v: &mut View<'_>) {
+    settle(v);
+    let mut st = state();
+    let st = &mut *st;
+    let tint = v.tint;
+    if let Some((_, task)) = &st.looking
+        && let Some(found) = task.poll()
+    {
+        let (made_from, _) = st.looking.take().unwrap();
+        st.basis = Some(made_from);
+        st.take(found, v);
+    }
+    if st.looking.is_none() && st.recycling.is_none() && st.basis != Some(basis(v)) {
+        st.look(ui.ctx(), v);
+    }
+    let mut again = false;
+    panel::page_title(ui, "Duplicates", "Songs you have more than once", |ui| {
+        ui.add_space(2.);
+        again = Btn::new("Look again", tint)
+            .icon("reload")
+            .sm()
+            .enabled(st.looking.is_none())
+            .show(ui)
+            .clicked();
+    });
+    if again {
+        st.look(ui.ctx(), v);
+    }
+    if st.ask {
+        let (n, bytes) = st.ticked();
+        if let Some(yes) = panel::ask(
+            ui.ctx(),
+            &format!("Move {} to the Recycle Bin?", copies(n)),
+            &format!(
+                "{} of song files. You can put them back from the Recycle Bin; the copies you keep take over their likes, plays and playlist places.",
+                megabytes(bytes)
+            ),
+            "Move to the Recycle Bin",
+            true,
+            tint,
+        ) {
+            st.ask = false;
+            if yes {
+                st.recycle(ui.ctx(), v);
+            }
+        }
+    }
+    if st.basis.is_none() {
+        panel::empty_note(ui, "Looking through your songs");
+        return;
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink(false)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width() - 12.);
+            if st.groups.is_empty() {
+                panel::empty_note(ui, "No duplicates: every song is here once");
+            } else {
+                summary(ui, v, st);
+                ui.add_space(20.);
+                let mut apart = None;
+                for gi in 0..st.groups.len() {
+                    if group(ui, v, st, gi) {
+                        apart = Some(gi);
+                    }
+                    ui.add_space(16.);
+                }
+                if let Some(gi) = apart {
+                    mark_not_same(
+                        &mut v.s.state,
+                        &st.groups[gi].found,
+                        Local::now().timestamp_millis(),
+                    );
+                    v.s.state_dirty = true;
+                }
+            }
+            hidden_note(ui, v);
+            apart_note(ui, v);
+        });
+}
+fn summary(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
+    let tint = v.tint;
+    let groups = st.groups.len();
+    let extra: usize = st.groups.iter().map(|g| g.copies.len() - 1).sum();
+    let maybes = st.groups.iter().filter(|g| !g.found.sure).count();
+    let (ticked, bytes) = st.ticked();
+    let busy = st.recycling.is_some();
+    panel::panel(ui, 0., |ui| {
+        let big = panel::line(ui, &super::settings::num(groups as u64), "HUD", 34., 0.02);
+        let words = panel::line(
+            ui,
+            &format!(
+                "{} {} TOO MANY",
+                if groups == 1 {
+                    "SONG HAS"
+                } else {
+                    "SONGS HAVE"
+                },
+                copies(extra).to_uppercase()
+            ),
+            "HUD",
+            12.,
+            0.14,
+        );
+        let (r, _) = ui.allocate_exact_size(
+            vec2(big.size().x + 12. + words.size().x, big.size().y),
+            Sense::hover(),
+        );
+        let p = ui.painter();
+        p.galley(
+            pos2(
+                r.left() + big.size().x + 12.,
+                r.bottom() - words.size().y - 7.,
+            ),
+            words,
+            SECONDARY,
+        );
+        p.galley(r.min, big, TEXT);
+        ui.add_space(6.);
+        let mut job = LayoutJob::default();
+        job.wrap.max_width = ui.available_width().min(760.);
+        let plain = egui::TextFormat::simple(font("UI", 13.), MUTED);
+        job.append(
+            "For each song, String picks the copy to keep: the best sound, then the one in the folder with most of your songs. Copies that are surely the same song are ticked.",
+            0.,
+            plain.clone(),
+        );
+        if maybes > 0 {
+            job.append(
+                &if maybes == 1 {
+                    " One song is only ".to_owned()
+                } else {
+                    format!(" {maybes} songs are only ")
+                },
+                0.,
+                plain.clone(),
+            );
+            job.append(
+                "maybe",
+                0.,
+                egui::TextFormat {
+                    color: TEXT,
+                    underline: Stroke::new(1., HAIR3),
+                    ..plain.clone()
+                },
+            );
+            job.append(
+                " the same: the same name and length, but another credit or version. Play them to compare: tick what you want gone, or press Not the same and they stop being listed.",
+                0.,
+                plain,
+            );
+        }
+        ui.allocate_ui(vec2(job.wrap.max_width, 0.), |ui| ui.label(job));
+        ui.add_space(12.);
+        let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.), Sense::hover());
+        ui.painter().rect_filled(line, 0, HAIR);
+        ui.add_space(10.);
+        ui.horizontal(|ui| {
+            let note = if ticked > 0 {
+                format!("{} ticked · {}", copies(ticked), megabytes(bytes))
+            } else {
+                "nothing ticked".into()
+            };
+            ui.label(mono(&note, 10.5).color(FAINT));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.;
+                if Btn::new("Move to the Recycle Bin", tint)
+                    .icon("trash")
+                    .kind(Kind::Danger)
+                    .sm()
+                    .enabled(ticked > 0 && !busy)
+                    .show(ui)
+                    .clicked()
+                {
+                    st.ask = true;
+                }
+                if Btn::new("Hide in String", tint)
+                    .sm()
+                    .enabled(ticked > 0 && !busy)
+                    .hint("The files stay where they are; String leaves them out")
+                    .show(ui)
+                    .clicked()
+                {
+                    st.hide(v);
+                }
+            });
+        });
+        ui.add_space(6.);
+        ui.label(
+            mono(
+                "Either way, the copy you keep takes over their likes, plays, loops, listening time and playlist places.",
+                11.,
+            )
+            .color(FAINT),
+        );
+    });
+}
+fn used_for(v: &View<'_>, id: &str) -> String {
+    let mut bits = vec![];
+    if v.s.models.liked.iter().any(|l| l == id) {
+        bits.push("liked".to_owned());
+    }
+    let lists =
+        v.s.field("playlists")
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| {
+                p["items"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|x| x["id"] == id || x.as_str() == Some(id))
+            })
+            .count();
+    if lists > 0 {
+        bits.push(format!("in {}", plural(lists, "playlist")));
+    }
+    let plays = v.s.field("plays")[id][0].as_u64().unwrap_or(0);
+    if plays > 0 {
+        bits.push(plural(plays as usize, "play"));
+    }
+    bits.join(" · ")
+}
+/// One song's copies. True when the person pressed "Not the same".
+fn group(ui: &mut Ui, v: &mut View<'_>, st: &mut State, gi: usize) -> bool {
+    let tint = v.tint;
+    let mut apart = false;
+    let sure = st.groups[gi].found.sure;
+    ui.push_id(("group", gi), |ui| {
+        ui.spacing_mut().item_spacing.y = 0.;
+        let g = &st.groups[gi];
+        let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.), Sense::hover());
+        let p = ui.painter().clone();
+        p.line_segment([head.left_bottom(), head.right_bottom()], (1., HAIR2));
+        let inner = head.shrink2(vec2(12., 0.));
+        let mut right = inner.right();
+        if sure {
+            let n = panel::line(
+                ui,
+                &format!("{} COPIES", g.copies.len()),
+                "Mono",
+                10.5,
+                0.08,
+            );
+            right -= n.size().x;
+            p.galley(pos2(right, inner.center().y - n.size().y * 0.5), n, FAINT);
+        } else {
+            let mut cell = ui::child(
+                ui,
+                ui::area(inner.right() - 132., head.top() + 4., 132., 26.),
+                "apart",
+            );
+            cell.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                apart = Btn::new("Not the same", tint)
+                    .kind(Kind::Ghost)
+                    .sm()
+                    .hint("They're different songs or versions: stop listing them")
+                    .show(ui)
+                    .clicked();
+            });
+            right -= 132.;
+            let tag = panel::line(ui, "MAYBE THE SAME", "Mono", 10.5, 0.08);
+            let boxed = Rect::from_min_size(
+                pos2(right - tag.size().x - 14., inner.center().y - 11.),
+                tag.size() + vec2(14., 8.),
+            );
+            let c = [
+                boxed.left_top(),
+                boxed.right_top(),
+                boxed.right_bottom(),
+                boxed.left_bottom(),
+                boxed.left_top(),
+            ];
+            p.extend(egui::Shape::dashed_line(&c, (1., HAIR3), 3., 2.));
+            p.galley(boxed.min + vec2(7., 4.), tag, SECONDARY);
+            right = boxed.left();
+        }
+        let names = Rect::from_min_max(inner.left_top(), pos2(right - 12., inner.bottom()));
+        let clip = p.with_clip_rect(names.intersect(ui.clip_rect()));
+        let title = panel::line(ui, &g.copies[0].title, "Strong", 15., 0.);
+        let w = title.size().x;
+        clip.galley(
+            pos2(names.left(), names.center().y - title.size().y * 0.5),
+            title,
+            TEXT,
+        );
+        clip.text(
+            pos2(names.left() + w + 12., names.center().y + 1.),
+            egui::Align2::LEFT_CENTER,
+            &g.artists,
+            font("UI", 13.),
+            MUTED,
+        );
+        for ci in 0..st.groups[gi].copies.len() {
+            row(ui, v, st, gi, ci);
+        }
+    });
+    apart
+}
+fn row(ui: &mut Ui, v: &mut View<'_>, st: &mut State, gi: usize, ci: usize) {
+    let tint = v.tint;
+    let c = &st.groups[gi].copies[ci];
+    let (keep, drop) = (st.keep[gi] == c.id, st.drop.contains(&c.id));
+    let current = v.s.state.queue.current() == Some(c.id.as_str());
+    let (r, hover) = ui.allocate_exact_size(vec2(ui.available_width(), 54.), Sense::hover());
+    let p = ui.painter().clone();
+    if hover.hovered() {
+        p.rect_filled(r, 0, panel::white(0.025));
+    }
+    p.line_segment([r.left_bottom(), r.right_bottom()], (1., HAIR));
+    if keep {
+        p.rect_filled(
+            Rect::from_min_max(
+                pos2(r.left(), r.top() + 10.),
+                pos2(r.left() + 2., r.bottom() - 10.),
+            ),
+            0,
+            tint.ink(1.),
+        );
+    }
+    let inner = r.shrink2(vec2(12., 0.));
+    let y = r.center().y;
+    let wide = r.width() >= 700.;
+    let pick = if wide { 92. } else { 84. };
+    let fixed = 34. + pick * 2. + 34. + 12. * if wide { 5. } else { 4. };
+    let flex = (inner.width() - fixed).max(60.);
+    let names_w = if wide { flex * 1.3 / 2.3 } else { flex };
+    let names = ui::area(inner.left() + 46., r.top(), names_w, r.height());
+    let folder = ui::area(inner.right() - 32., y - 16., 32., 32.);
+    let remove = ui::area(folder.left() - 13. - pick, r.top(), pick, r.height());
+    let keeping = ui::area(remove.left() - 12. - pick, r.top(), pick, r.height());
+    let mut action = None;
+    ui.push_id(ci, |ui| {
+        let play = ui::area(inner.left(), y - 16., 32., 32.);
+        let resp = ui::hit(ui, play, "play", "Play this copy");
+        if current || resp.hovered() {
+            p.circle_stroke(
+                play.center(),
+                15.5,
+                (1., if current { tint.ink(0.4) } else { HAIR2 }),
+            );
+        }
+        ui::glyph::draw(
+            &p,
+            Rect::from_center_size(play.center(), vec2(13., 13.)),
+            if current && v.st.playing {
+                "pausef"
+            } else {
+                "playf"
+            },
+            if current { tint.ink(1.) } else { MUTED },
+        );
+        if resp.on_hover_text("Play this copy").clicked() {
+            action = Some(0);
+        }
+        let fade = if drop { 0.45 } else { 1. };
+        let text = p.with_clip_rect(names.intersect(ui.clip_rect()));
+        let name = panel::line(ui, &c.name, "UI", 13.5, 0.);
+        let at = pos2(names.left(), y - 17.);
+        if drop {
+            let end = (at.x + name.size().x).min(names.right());
+            text.line_segment(
+                [pos2(at.x, at.y + 10.), pos2(end, at.y + 10.)],
+                (1., panel::white(0.35)),
+            );
+        }
+        text.galley(at, name, TEXT.gamma_multiply(fade));
+        ui::label(
+            &p,
+            ui::area(names.left(), y + 2., names.width(), 16.),
+            &c.dir,
+            "Mono",
+            11.,
+            FAINT.gamma_multiply(fade),
+        );
+        ui.interact(names, ui.scope_id().with("path"), Sense::hover())
+            .on_hover_text(&c.path);
+        if wide {
+            let meta = ui::area(names.right() + 12., r.top(), flex - names_w, r.height());
+            ui::label(
+                &p,
+                ui::area(meta.left(), y - 17., meta.width(), 16.),
+                &c.sound,
+                "Mono",
+                11.5,
+                MUTED.gamma_multiply(fade),
+            );
+            let mut bits = vec![];
+            if !st.groups[gi].found.sure {
+                bits.push(if c.artist.is_empty() {
+                    c.title.clone()
+                } else {
+                    format!("{} · {}", c.title, c.artist)
+                });
+            }
+            let used = used_for(v, &c.id);
+            if !used.is_empty() {
+                bits.push(used);
+            }
+            ui::label(
+                &p,
+                ui::area(meta.left(), y + 2., meta.width(), 16.),
+                &bits.join(" · "),
+                "UI",
+                11.5,
+                FAINT.gamma_multiply(fade),
+            );
+        }
+        let resp = ui::hit(ui, keeping, "keep", "Keep this copy");
+        let ink = if keep { tint.ink(1.) } else { MUTED };
+        let dot = pos2(keeping.left() + 7., y);
+        p.circle_stroke(dot, 6.5, (1., if keep { ink } else { FAINT }));
+        if keep {
+            p.circle_filled(dot, 3.5, ink);
+        } else {
+            p.circle_filled(dot, 6., GHOST);
+        }
+        let word = panel::line(ui, if keep { "KEEPING" } else { "KEEP" }, "HUD", 10.5, 0.12);
+        p.galley(
+            pos2(keeping.left() + 21., y - word.size().y * 0.5),
+            word,
+            ink,
+        );
+        if resp
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+            && !keep
+        {
+            action = Some(1);
+        }
+        let off = if keep { 0.25 } else { 1. };
+        let boxed = Rect::from_center_size(pos2(remove.left() + 7., y), vec2(13., 13.));
+        p.rect(
+            boxed,
+            2,
+            if drop {
+                tint.ink(1.)
+            } else {
+                GHOST.gamma_multiply(off)
+            },
+            (1., FAINT.gamma_multiply(off)),
+            StrokeKind::Inside,
+        );
+        if drop {
+            let c = boxed.center();
+            p.add(egui::Shape::line(
+                vec![c + vec2(-3.5, 0.), c + vec2(-1., 2.5), c + vec2(3.5, -2.5)],
+                Stroke::new(1.8, panel::INK),
+            ));
+        }
+        let word = panel::line(ui, "REMOVE", "HUD", 10.5, 0.12);
+        p.galley(
+            pos2(remove.left() + 21., y - word.size().y * 0.5),
+            word,
+            MUTED.gamma_multiply(off),
+        );
+        if !keep
+            && ui::hit(ui, remove, "remove", "Remove this copy")
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .clicked()
+        {
+            action = Some(2);
+        }
+        if ui::icon_btn(ui, folder, "folder", "Show in Explorer", false, tint).clicked() {
+            action = Some(3);
+        }
+    });
+    let id = c.id.clone();
+    match action {
+        Some(0) if current => v.s.toggle(v.player),
+        Some(0) => v.s.play_ids(v.player, &[id], 0, Value::Null),
+        Some(1) => {
+            st.keep[gi] = id;
+            st.tick(gi);
+        }
+        Some(2) if drop => {
+            st.drop.remove(&id);
+        }
+        Some(2) => {
+            st.drop.insert(id);
+        }
+        Some(3) => {
+            let path = PathBuf::from(&c.path);
+            services::fire(ui.ctx(), move |s| s.reveal(&path));
+        }
+        _ => {}
+    }
+}
+/// Smoke cases for this page.
+pub mod smoke {
+    use super::*;
+    use crate::route::Route;
+    pub fn open(v: &mut View<'_>) {
+        crate::screens::settings::smoke::tidy();
+        v.go(Route::Dupes);
+    }
+    pub fn settled(v: &mut View<'_>) -> bool {
+        v.views.history.current == Route::Dupes && state().settled(v)
+    }
+    pub fn ask(_: &mut View<'_>) {
+        state().ask = true;
+    }
+    pub fn asking(_: &mut View<'_>) -> bool {
+        state().ask
+    }
+    /// Hide the ticked copies, the way the button does.
+    pub fn hide(v: &mut View<'_>) {
+        let mut st = state();
+        st.ask = false;
+        st.hide(v);
+    }
+    /// Put the hidden songs back, the way the link does.
+    pub fn back(v: &mut View<'_>) {
+        unhide_all(&mut v.s.state);
+        v.s.rebuild();
+        v.s.queue_changed(v.player);
+        v.views.toast.set("Hidden songs are back");
+    }
+}

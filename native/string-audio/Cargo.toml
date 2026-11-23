@@ -1,0 +1,21 @@
+[package]
+name = "string-audio"
+description = "String's sound: decoding, two decks, gapless hand-over, crossfade, fades, loops and the spectrum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Decoding: MP3, FLAC, AAC and ALAC in MP4, Ogg Vorbis, WAV; pure Rust.
+symphonia = { version = "0.6.1", default-features = false, features = ["opt-simd", "mp3", "flac", "aac", "alac", "isomp4", "ogg", "vorbis", "pcm", "wav"] }
+# Opus for symphonia, pure safe Rust (no libopus to build).
+symphonia-opus = "0.1.3"
+# Resampling to the device's rate (its FFT resampler).
+rubato = "5.1.0"
+# The visualizer's FFT.
+realfft = "3.5.1"
+# Lock-free rings between the engine thread and the sound thread.
+rtrb = "0.4.1"
+# WASAPI shared-mode output; `realtime` gives the sound thread MMCSS priority.
+cpal = { version = "0.18.2", features = ["realtime"] }

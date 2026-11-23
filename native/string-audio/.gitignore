@@ -1,0 +1,2 @@
+# The repo ignores .NET bin/ folders; this crate's binaries live in src/bin/.
+!src/bin/

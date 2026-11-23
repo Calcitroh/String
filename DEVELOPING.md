@@ -231,6 +231,46 @@ would take over its Start menu entry and its data), and never start an installed
 `--quit` and the single-instance signals are shared with a running String. Use `-To -Menu -Desktop -AppsKey -Data`
 and `-NoStart`, and `tests\run-selftest.ps1 -Exe <installed copy>`.
 
+## String 2.0 (native, preview)
+
+`native\` is String rebuilt as a native program in Rust: a Cargo workspace on the MSVC toolchain
+(`native\rust-toolchain.toml`; it needs Visual Studio Build Tools' C++ tools). It reads and writes the same data
+folder and files as the web version, with the same single-instance names (`StringApp.*`), so only one of the two runs
+at a time.
+
+- `string-core`: the library scan and tag reading (lofty), the saved documents (state.json, listening.json,
+  library.json: guarded reads, atomic writes, the daily backup and, the first time a profile opens each day, a copy as
+  it was found in `<backup>\opened\<date>\`), the queue and the listening model. `stringctl` inspects, round-trips or
+  scans a data folder.
+- `string-audio`: decoding (Symphonia), the two decks, gapless and crossfade, loops, the output device.
+- `string-lyrics`: lyrics (.lrc, the song's own, LRCLIB) and translation through Ollama.
+- `string-extras`: duplicates, Edit info (writing tags), phone listening from Navidrome, and updates (the same feed and
+  key as the web version).
+- `string-platform`: Windows: one instance, media keys and taskbar buttons, Discord, files and the Recycle Bin,
+  backups, the error log.
+- `string-app`: the window and every screen (egui and wgpu), and `String.exe`. `native\string-app\SCREENS.md` says how
+  the screens are put together. Its icon: `assets\String.ico` (and `.png` for the window), drawn by
+  `native\icon\make-icon.py` and built into the exe by `build.rs`.
+
+```
+cd native
+cargo build --release -p string-app
+cargo test --workspace --release
+target\release\String.exe --smoke-test --data <a folder> --out <a folder>
+```
+
+The self-test runs muted and off-screen with instance names of its own, and writes `results.json` and a screenshot
+per step; `--data` takes a copy of a real profile too. Without `--smoke-test`, `--data <folder>` opens String on that
+folder (its backups stay inside it), and it shares the single-instance names, so close any other String first.
+
+`pwsh -File tools\release-native.ps1 -Version 2.0.0-preview.1 [-Notes "..."] [-Publish]` makes
+`release\String-<version>.zip`: `String.exe`, `Read me first.txt` (from `tools\share\Preview read me.txt`) and
+`licenses\` (every library it's built from with its licence texts, Rust's, and String's). It builds in
+`release\native-build` with the source paths renamed (the libraries' to `/cargo`, String's to `/string`), runs the same
+privacy check as `tools\release.ps1`, and `-Publish` makes a GitHub pre-release on the pushed commit it was built from.
+Installed copies never update to a pre-release; the script checks that the newest full release is still the same
+afterwards. Not in the preview yet: add-ons, your own look, installing and updating from 1.x.
+
 ## Things learned the hard way
 
 - WebView2 rewinds seekable response streams (see `SliceStream`).

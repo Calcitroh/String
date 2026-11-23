@@ -1,0 +1,4 @@
+# String is a Windows app: build with the MSVC toolchain (Visual Studio Build Tools' linker).
+[toolchain]
+channel = "stable-x86_64-pc-windows-msvc"
+components = ["clippy", "rustfmt"]

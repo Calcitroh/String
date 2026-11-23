@@ -39,6 +39,13 @@ Windows may warn you, because String isn't signed with a paid certificate: "More
 installs for your Windows account only (no admin), with a Start menu and a desktop shortcut, and it uninstalls from
 Settings → Apps. "Read me first.txt" in the zip has the details, and "Phone setup.txt" shows how to listen on your phone.
 
+## String 2.0 preview
+
+String is being rebuilt as a native Windows program (written in Rust, in `native/`): the same player, using about half
+the memory and far less of the processor. A preview is on the [Releases](../../releases) page as a pre-release: unzip
+it and open String.exe. It opens your String library and leaves your installed String alone (installed copies never
+update to a preview). Not in it yet: add-ons, your own look, installing and updating.
+
 ## What goes online
 
 Nothing about you, and only when you've turned the feature on:

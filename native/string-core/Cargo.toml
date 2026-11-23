@@ -1,0 +1,17 @@
+[package]
+name = "string-core"
+description = "String's library, saved data, queue and listening model, without sound or screens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value", "float_roundtrip"] }
+lofty = "0"
+rand = "0"
+chrono = { version = "0.4", features = ["serde"] }
+rayon = "1"
+tempfile = "3"
+sha2 = "0"

@@ -1,0 +1,31 @@
+String 2.0 preview
+==================
+
+This is an early look at String 2.0: the same player, rebuilt as a native Windows program (written in Rust). It
+uses about half the memory of String 1.x, and far less of the processor while it plays. It is a preview: try it, and
+keep String 1.x for everyday listening.
+
+Trying it
+- Nothing to install: unzip this folder anywhere and open String.exe.
+- Windows may say it protected your PC from an unknown app. Choose "More info", then "Run anyway".
+- It opens your own String library: the same songs, playlists, likes, loops and listening history as String 1.x.
+  Only one String runs at a time, so close String 1.x first.
+- As String 1.x does, it keeps a dated copy of your saved data each day in Documents\String Backup. The first time it
+  opens each day, it also keeps a copy of everything as it found it, in Documents\String Backup\opened.
+- New to String? It starts with a welcome page: pick the folders your songs are in.
+
+What it doesn't change
+- It never installs or updates itself, and it doesn't replace String 1.x. An installed String keeps updating as before.
+- Your song files are never changed, unless you edit a song's details or move a duplicate to the Recycle Bin yourself.
+
+Not in the preview yet
+- Add-ons, and your own look (look.css).
+- Installing it, and updating from String 1.x. String 2.0 will do both.
+
+Trying it on a copy of your library
+- Make a new folder, copy state.json, library.json and listening.json from %LOCALAPPDATA%\String into it, then run
+  String.exe --data "that folder". Close String 1.x first all the same.
+- That copies your library's records, not your songs: moving a duplicate to the Recycle Bin, or editing a song's
+  details, still changes the real song files.
+
+The licences of everything String is built from are in the licenses folder.
