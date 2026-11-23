@@ -1,5 +1,5 @@
 use regex_lite::Regex;
-use std::net::IpAddr;
+use std::{io, net::IpAddr};
 use ureq::Proxy;
 use url::Url;
 use windows::{
@@ -14,10 +14,27 @@ const INTERNET: PCWSTR = w!(r"Software\Microsoft\Windows\CurrentVersion\Internet
 
 #[derive(Default)]
 pub(super) struct ProxySettings {
-    http: Option<Proxy>,
-    https: Option<Proxy>,
+    http: Option<Route>,
+    https: Option<Route>,
+    socks: Option<Route>,
     local: bool,
     bypass: Vec<Regex>,
+}
+
+#[derive(Clone)]
+enum Route {
+    Proxy(Proxy),
+    UnsupportedSocks,
+    Invalid,
+}
+
+impl Route {
+    fn from_proxy(proxy: Proxy) -> Self {
+        match proxy.protocol() {
+            ureq::ProxyProtocol::Http | ureq::ProxyProtocol::Https => Self::Proxy(proxy),
+            _ => Self::UnsupportedSocks,
+        }
+    }
 }
 
 impl ProxySettings {
@@ -38,7 +55,7 @@ impl ProxySettings {
         };
         if status != ERROR_SUCCESS || enabled == 0 {
             // Keep the environment proxy used by earlier builds when Windows has no manual proxy.
-            let proxy = Proxy::try_from_env();
+            let proxy = Proxy::try_from_env().map(Route::from_proxy);
             return Self {
                 http: proxy.clone(),
                 https: proxy,
@@ -66,13 +83,15 @@ impl ProxySettings {
             } else {
                 Proxy::new(&format!("http://{address}"))
             };
+            let route = Some(proxy.map(Route::from_proxy).unwrap_or(Route::Invalid));
             match scheme.to_ascii_lowercase().as_str() {
                 "" => {
-                    settings.http = proxy.ok();
+                    settings.http = route;
                     settings.https = settings.http.clone();
                 }
-                "http" => settings.http = proxy.ok(),
-                "https" => settings.https = proxy.ok(),
+                "http" => settings.http = route,
+                "https" => settings.https = route,
+                "socks" => settings.socks = Some(Route::UnsupportedSocks),
                 _ => {}
             }
         }
@@ -105,27 +124,43 @@ impl ProxySettings {
         settings
     }
 
-    pub(super) fn route(&self, url: &Url) -> Option<&Proxy> {
-        let proxy = match url.scheme() {
-            "http" => self.http.as_ref(),
-            "https" => self.https.as_ref(),
+    pub(super) fn route(&self, url: &Url) -> io::Result<Option<&Proxy>> {
+        let route = match url.scheme() {
+            "http" => self.http.as_ref().or(self.socks.as_ref()),
+            "https" => self.https.as_ref().or(self.socks.as_ref()),
             _ => None,
-        }?;
-        let host = url.host_str()?;
+        };
+        let (Some(route), Some(host)) = (route, url.host_str()) else {
+            return Ok(None);
+        };
         let ip = host.trim_matches(['[', ']']).parse::<IpAddr>().ok();
         if ip.is_some_and(|ip| ip.is_loopback())
             || host.eq_ignore_ascii_case("localhost")
             || (self.local && ip.is_none() && !host.contains('.'))
         {
-            return None;
+            return Ok(None);
         }
         if !self.bypass.is_empty() {
-            let origin = format!("{}://{host}:{}", url.scheme(), url.port_or_known_default()?);
+            let origin = format!(
+                "{}://{host}:{}",
+                url.scheme(),
+                url.port_or_known_default().unwrap()
+            );
             if self.bypass.iter().any(|re| re.is_match(&origin)) {
-                return None;
+                return Ok(None);
             }
         }
-        Some(proxy)
+        match route {
+            Route::Proxy(proxy) => Ok(Some(proxy)),
+            Route::UnsupportedSocks => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SOCKS proxies are unsupported in this build",
+            )),
+            Route::Invalid => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid Windows proxy address",
+            )),
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 //! Check a published release and prepare its signed installer for the app.
+mod launch;
 #[cfg(test)]
 mod tests;
 mod unpack;
@@ -101,30 +102,39 @@ pub struct InstallPlan {
     release: unpack::PreparedRelease,
     to: PathBuf,
     _install_dir: fs::File,
+    install_parents: Vec<fs::File>,
 }
 impl InstallPlan {
-    /// Keep the verified directories open throughout Windows process creation.
+    /// Hand the verified files and their directory guards to the installer process.
     pub fn spawn(&self) -> io::Result<std::process::Child> {
-        self.command().spawn()
+        self.spawn_command(&mut self.command(), 0x10) // CREATE_NEW_CONSOLE
+    }
+
+    fn spawn_command(&self, command: &mut Command, flags: u32) -> io::Result<std::process::Child> {
+        launch::spawn(
+            command,
+            flags,
+            self.release.guards().chain(&self.install_parents),
+        )
     }
 
     fn command(&self) -> Command {
-        use std::os::windows::process::CommandExt;
         let mut cmd = Command::new("powershell.exe");
         const RUN: &str = concat!(
+            "Set-Location -LiteralPath $env:STRING_UPDATE_RELEASE -ErrorAction Stop; ",
+            "[Environment]::CurrentDirectory = $env:STRING_UPDATE_RELEASE; ",
             "$Host.UI.RawUI.WindowTitle = 'Updating String'; ",
             "& $env:STRING_UPDATE_SCRIPT -To $env:STRING_UPDATE_TO; ",
             "if ($LASTEXITCODE) { Read-Host 'Press Enter to close' }"
         );
-        cmd.current_dir(&self.release.path)
+        // Before assignment to the handoff job, even a suspended child must
+        // not own a working-directory handle inside the prepared release.
+        cmd.current_dir(self.release.path.ancestors().last().unwrap())
+            .env("STRING_UPDATE_RELEASE", &self.release.path)
             .env_remove("PSModulePath")
-            .env(
-                "STRING_UPDATE_SCRIPT",
-                self.release.path.join("app/setup/install.ps1"),
-            )
+            .env("STRING_UPDATE_SCRIPT", &self.release.script)
             .env("STRING_UPDATE_TO", &self.to)
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", RUN])
-            .creation_flags(0x10); // CREATE_NEW_CONSOLE
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", RUN]);
         cmd
     }
 }
@@ -145,7 +155,7 @@ struct FileId {
     volume: u64,
     id: [u8; 16],
 }
-fn directory_id(file: &fs::File) -> Option<FileId> {
+fn file_id(file: &fs::File) -> Option<FileId> {
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -227,7 +237,8 @@ impl Updater {
     pub fn installed(&self) -> bool {
         self.installed_at().is_some()
     }
-    fn installed_at(&self) -> Option<(PathBuf, fs::File)> {
+    fn installed_at(&self) -> Option<(PathBuf, fs::File, Vec<fs::File>)> {
+        let parents = unpack::pin_ancestors(&self.install).ok()?;
         let install_dir = unpack::open_dir(&self.install).ok()?;
         let bytes = fs::read(self.install.join("setup/installed.txt")).ok()?;
         let text = crate::text::host_text(&bytes);
@@ -242,12 +253,12 @@ impl Updater {
         if !crate::text::same_windows_path(&powershell_directory(&marked)?, &to) {
             return None;
         }
-        let running = directory_id(&install_dir)?;
-        let id_at = |path: &Path| directory_id(&unpack::open_dir(path).ok()?);
+        let running = file_id(&install_dir)?;
+        let id_at = |path: &Path| file_id(&unpack::open_dir(path).ok()?);
         if id_at(&marked)? != running || (to != self.install && id_at(&to)? != running) {
             return None;
         }
-        Some((to, install_dir))
+        Some((to, install_dir, parents))
     }
     fn get(&self, url: &str, within: Duration) -> Result<Response<Body>, ureq::Error> {
         #[cfg(any(test, feature = "test-feed"))]
@@ -366,7 +377,7 @@ impl Updater {
         want: &str,
         mut progress: impl FnMut(Progress),
     ) -> io::Result<InstallPlan> {
-        let (to, install_dir) = self
+        let (to, install_dir, install_parents) = self
             .installed_at()
             .ok_or_else(|| invalid("Only an installed String updates itself"))?;
         let release = self
@@ -404,28 +415,34 @@ impl Updater {
         let signature = Signature::from_slice(&decode(&sig)?).map_err(io::Error::other)?;
         let key = VerifyingKey::from_public_key_der(&decode(self.key.as_bytes())?)
             .map_err(io::Error::other)?;
-        let mut hash = Sha256::new();
         archive.rewind()?;
-        let mut buf = [0; 65536];
-        loop {
-            let n = archive.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            hash.update(&buf[..n]);
-        }
-        key.verify_prehash(&hash.finalize(), &signature)
+        key.verify_prehash(&hash_copy(&mut archive, io::sink())?, &signature)
             .map_err(|_| invalid("The release signature does not match String's key"))?;
         archive.rewind()?;
         let release = folder.unpack(archive, version)?;
         Ok(InstallPlan {
             release,
             _install_dir: install_dir,
+            install_parents,
             to,
             version,
         })
     }
 }
+fn hash_copy(mut source: impl Read, mut dest: impl Write) -> io::Result<[u8; 32]> {
+    let mut hash = Sha256::new();
+    let mut buf = [0; 65536];
+    loop {
+        let count = source.read(&mut buf)?;
+        if count == 0 {
+            break;
+        }
+        hash.update(&buf[..count]);
+        dest.write_all(&buf[..count])?;
+    }
+    Ok(hash.finalize().into())
+}
+
 fn decode(data: &[u8]) -> io::Result<Vec<u8>> {
     STANDARD
         .decode(

@@ -2,7 +2,6 @@ use super::*;
 use std::{
     fs::File,
     net::{TcpListener, TcpStream},
-    os::windows::process::CommandExt,
     process::{Child, Stdio},
     thread,
 };
@@ -31,11 +30,16 @@ fn manifest_row(name: &str, contents: &str) -> String {
 fn archive(file: File, version: &str, setup: &str, symlink: bool) -> File {
     let mut z = ZipWriter::new(file);
     let opts = SimpleFileOptions::default();
+    let script_name = if setup.starts_with("# Mixed-case entry") {
+        "setup/Install.PS1"
+    } else {
+        "setup/install.ps1"
+    };
     let files = [
         ("setup/version.txt", version),
         ("setup/imports.txt", "kernel32.dll GetLastError"),
         ("String.exe", "fixture"),
-        ("setup/install.ps1", setup),
+        (script_name, setup),
         (
             "setup/isolated.ps1",
             include_str!("../../../../tools/share/install.ps1"),
@@ -85,7 +89,7 @@ fn windows_installer_marker_matches_the_verbatim_exe_directory() {
     let exe_dir = fs::canonicalize(&install).unwrap();
     let updater = Updater::new(&exe_dir, "2.0.0").unwrap();
     assert_eq!(
-        updater.installed_at().map(|(path, _)| path).as_deref(),
+        updater.installed_at().map(|(path, ..)| path).as_deref(),
         Some(install.as_path())
     );
     fs::write(
@@ -103,8 +107,8 @@ fn marker_spelling_does_not_select_the_installer_destination() {
     let marker = install.join("setup/installed.txt");
     // Exercise the volume/file ID query even when the host folds case.
     assert!(
-        directory_id(&unpack::open_dir(&install).unwrap()).unwrap()
-            != directory_id(&unpack::open_dir(tmp.path()).unwrap()).unwrap()
+        file_id(&unpack::open_dir(&install).unwrap()).unwrap()
+            != file_id(&unpack::open_dir(tmp.path()).unwrap()).unwrap()
     );
     let other_spelling = tmp.path().join("player");
     fs::write(&marker, other_spelling.to_str().unwrap()).unwrap();
@@ -115,7 +119,7 @@ fn marker_spelling_does_not_select_the_installer_destination() {
         assert!(!updater.installed());
     } else {
         assert_eq!(
-            updater.installed_at().map(|(path, _)| path).as_deref(),
+            updater.installed_at().map(|(path, ..)| path).as_deref(),
             Some(install.as_path())
         );
     }
@@ -123,15 +127,17 @@ fn marker_spelling_does_not_select_the_installer_destination() {
 #[test]
 fn signed_release_feed_end_to_end() {
     with_prepared_release(FIXTURE_SETUP, |plan, root, install, origin, key| {
+        let mut command = plan.command();
         let child = plan
-            .command()
-            .creation_flags(0x08000000)
-            .env("STRING_TEST_TARGET", install)
-            .env("LOCALAPPDATA", root)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .spawn_command(
+                command
+                    .env("STRING_TEST_TARGET", install)
+                    .env("LOCALAPPDATA", root)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+                0x08000000,
+            )
             .unwrap();
         drop(plan);
         let run = child.wait_with_output().unwrap();
@@ -147,6 +153,22 @@ fn signed_release_feed_end_to_end() {
             Updater::for_test_feed(install, &version, &format!("{origin}/repos/good"), key)
                 .unwrap();
         assert!(!updated.check().unwrap().newer);
+    });
+}
+
+#[test]
+fn launch_uses_the_signed_entry_spelling() {
+    with_prepared_release("# Mixed-case entry\nparam($To)", |plan, _, _, _, _| {
+        let command = plan.command();
+        let script = command
+            .get_envs()
+            .find(|(key, _)| *key == "STRING_UPDATE_SCRIPT")
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(
+            Path::new(script).file_name().unwrap().to_str(),
+            Some("Install.PS1")
+        );
     });
 }
 
@@ -183,13 +205,15 @@ if ($PWD.Path -eq $release -and (Test-Path -LiteralPath (Join-Path $To 'setup/in
         for dir in &dirs {
             assert_delete_denied(dir);
         }
+        let mut command = plan.command();
         let child = plan
-            .command()
-            .creation_flags(0x08000000)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+            .spawn_command(
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped()),
+                0x08000000,
+            )
             .unwrap();
         drop(plan);
         let run = child.wait_with_output().unwrap();
@@ -208,6 +232,59 @@ if ($PWD.Path -eq $release -and (Test-Path -LiteralPath (Join-Path $To 'setup/in
             delete_handle(dir).unwrap();
         }
     });
+}
+
+#[test]
+fn prepared_payload_is_read_only_through_the_child_lifetime() {
+    with_prepared_release(
+        "param($To)\nwhile (!(Test-Path -LiteralPath $env:STRING_TEST_WAIT)) { Start-Sleep -Milliseconds 20 }",
+        |plan, root, _, _, _| {
+            let script = plan.release.path.join("app/setup/install.ps1");
+            let exe = plan.release.path.join("app/String.exe");
+            let write_error = |p: &Path| {
+                File::options()
+                    .write(true)
+                    .open(p)
+                    .err()
+                    .and_then(|e| e.raw_os_error())
+            };
+            let before = [&script, &exe].map(|p| write_error(p));
+            let done = root.join("continue");
+            let mut command = plan.command();
+            command.env("STRING_TEST_WAIT", &done);
+            let mut child = plan.spawn_command(&mut command, 0x08000000).unwrap();
+            drop(plan);
+            // Opening for write is enough to check sharing. Leave the files untouched.
+            let after = [&script, &exe].map(|p| write_error(p));
+            let parent = delete_handle(root).err().and_then(|e| e.raw_os_error());
+            fs::write(done, "").unwrap();
+            child.wait().unwrap();
+            assert_eq!(
+                (before, after, parent),
+                ([Some(32); 2], [Some(32); 2], Some(32))
+            );
+        },
+    );
+}
+
+#[test]
+fn preparation_pins_profile_and_install_ancestors() {
+    let t = tempdir().unwrap();
+    let profile = t.path().join("profile");
+    let folder = unpack::UpdateFolder::open(&profile).unwrap();
+    let profile_parent = delete_handle(t.path()).err().and_then(|e| e.raw_os_error());
+    drop(folder);
+    let install = t.path().join("Player");
+    fs::create_dir_all(install.join("setup")).unwrap();
+    fs::write(
+        install.join("setup/installed.txt"),
+        install.to_str().unwrap(),
+    )
+    .unwrap();
+    let updater = Updater::new(&install, "2.0").unwrap();
+    let _installed = updater.installed_at().unwrap();
+    let install_parent = delete_handle(t.path()).err().and_then(|e| e.raw_os_error());
+    assert_eq!((profile_parent, install_parent), (Some(32), Some(32)));
 }
 
 #[test]
@@ -291,7 +368,7 @@ fn with_prepared_release(
     );
     assert!(matches!(events.last(), Some(Progress::Verifying)));
     assert_eq!(plan.release.path, data.join(r"updates\String-9.9.9"));
-    let prepared_script = plan.release.path.join("app/setup/install.ps1");
+    let prepared_script = plan.release.script.clone();
     assert_eq!(fs::read_to_string(&prepared_script).unwrap(), setup);
     assert_eq!(plan.to, install);
     assert!(
@@ -326,10 +403,7 @@ fn with_prepared_release(
     fs::create_dir(&old).unwrap();
     let retry = good.prepare(&data, "", |_| {}).unwrap();
     assert_delete_denied(&retry.release.path);
-    assert_eq!(
-        fs::read_to_string(retry.release.path.join("app/setup/install.ps1")).unwrap(),
-        setup
-    );
+    assert_eq!(fs::read_to_string(&retry.release.script).unwrap(), setup);
     assert!(!prepared_script.exists());
     assert!(!old.exists());
 }

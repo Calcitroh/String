@@ -23,6 +23,7 @@ fn windows_proxy_forms_and_exceptions() {
     let route = |address: &str| {
         settings
             .route(&Url::parse(address).unwrap())
+            .unwrap()
             .map(|p| p.uri().authority().unwrap().as_str())
     };
     assert_eq!(route("http://example.test"), Some("proxy.test:8080"));
@@ -47,19 +48,47 @@ fn windows_proxy_forms_and_exceptions() {
         assert!(
             ProxySettings::parse(true, "proxy.test:8080", "")
                 .route(&url)
+                .unwrap()
                 .is_some()
         );
         assert!(
             ProxySettings::parse(false, server, "")
                 .route(&url)
+                .unwrap()
                 .is_none()
         );
     }
     assert!(
         ProxySettings::parse(true, "http=plain.test:80", "")
             .route(&Url::parse("https://example.test").unwrap())
+            .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn unsupported_socks_routes_fail_before_a_request_is_built() {
+    for setting in ["socks=unused.test:1080", "https=socks5://unused.test:1080"] {
+        let client = Client::new(ProxySettings::parse(true, setting, ""));
+        let result = client.get("https://service.invalid", Duration::from_secs(1), 0, |_| {
+            panic!("unsupported route reached request construction")
+        });
+        assert!(result.unwrap_err().to_string().contains("SOCKS"));
+    }
+}
+
+#[test]
+fn explicit_http_proxy_and_windows_exceptions_precede_socks_fallback() {
+    let settings = ProxySettings::parse(
+        true,
+        "socks=socks.test:1080;http=http.test:80",
+        "*.internal.test",
+    );
+    let route = |url| settings.route(&Url::parse(url).unwrap());
+    assert!(route("http://example.test").unwrap().is_some());
+    assert!(route("https://example.test").is_err());
+    assert!(route("https://service.internal.test").unwrap().is_none());
+    assert!(route("https://localhost").unwrap().is_none());
 }
 
 fn headers(stream: &mut BufReader<std::net::TcpStream>) -> String {
@@ -87,6 +116,7 @@ fn injected_proxy_carries_request_and_redirect_bypasses_it() {
         client
             .proxy
             .route(&Url::parse("http://music.invalid").unwrap())
+            .unwrap()
             .is_some()
     );
     let worker = thread::spawn(move || {

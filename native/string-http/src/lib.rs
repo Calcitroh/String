@@ -53,10 +53,11 @@ impl Client {
             let remaining = timeout
                 .checked_sub(started.elapsed())
                 .ok_or(Error::Timeout(ureq::Timeout::Global))?;
+            let proxy = self.proxy.route(&url)?.cloned();
             let request = configure(self.agent.get(url.as_str()));
             let response = request
                 .config()
-                .proxy(self.proxy.route(&url).cloned())
+                .proxy(proxy)
                 .timeout_global(Some(remaining))
                 .build()
                 .call()?;

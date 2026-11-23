@@ -10,8 +10,144 @@ param(
     [string]$Desktop = [Environment]::GetFolderPath('Desktop'),
     [string]$AppsKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\String',
     [string]$Data = (Join-Path $env:LOCALAPPDATA 'String'),
-    [ValidateSet('ask', 'keep')][string]$DataChoice = 'ask'
+    [ValidateSet('ask', 'keep')][string]$DataChoice = 'ask',
+    [switch]$BackupFunctionsOnly
 )
+$backupDirs = [Collections.Generic.Dictionary[string,IDisposable]]::new([StringComparer]::Ordinal)
+$backupFiles = [Collections.Generic.List[IDisposable]]::new()
+function Close-Backups {
+    foreach ($file in $backupFiles) { $file.Dispose() }
+    $backupFiles.Clear()
+    foreach ($dir in $backupDirs.Values) { $dir.Dispose() }
+    $backupDirs.Clear()
+}
+# Pin from the root down. OPEN_REPARSE_POINT opens the directory itself;
+# denying write/delete sharing keeps it from being redirected after the check.
+function Pin-BackupDir([string]$dir) {
+    if ($backupDirs.ContainsKey($dir)) { return }
+    $parent = [IO.Path]::GetDirectoryName($dir)
+    if ($parent) {
+        Pin-BackupDir $parent
+        [void][IO.Directory]::CreateDirectory($dir)
+    }
+    $handle = [StringSetup.Backup]::CreateFileW($dir, 0x81, 1, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
+    if ($handle.IsInvalid) { $handle.Dispose(); throw "Cannot secure the backup folder $dir." }
+    $backupDirs.Add($dir, $handle)
+    $attrs = [StringSetup.Backup]::Attributes($handle)
+    if (($attrs -band 0x410) -ne 0x10) { throw "$dir is not a regular directory or is a folder link." }
+}
+
+function Initialize-Backup {
+    if ('StringSetup.Backup' -as [type]) { return }
+    Add-Type -Namespace StringSetup -Name Backup -MemberDefinition @'
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string path, uint access, uint share,
+    IntPtr security, uint disposition, uint flags, IntPtr template);
+
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool GetFileInformationByHandleEx(Microsoft.Win32.SafeHandles.SafeFileHandle file,
+    int kind, out long info, uint size);
+
+public static uint Attributes(Microsoft.Win32.SafeHandles.SafeFileHandle file) {
+    long info;
+    if (!GetFileInformationByHandleEx(file, 9, out info, 8))
+        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    return (uint)info;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+private struct IoStatus { public IntPtr status, information; }
+
+[DllImport("ntdll.dll", ExactSpelling=true)]
+private static extern int NtSetInformationFile(Microsoft.Win32.SafeHandles.SafeFileHandle file,
+    out IoStatus io, byte[] buffer, int length, int kind);
+[DllImport("ntdll.dll", ExactSpelling=true)]
+private static extern uint RtlNtStatusToDosError(int status);
+
+// MoveFile resolves the destination by opening its parent for write. During a
+// guarded install that parent is pinned. A leaf-only FileRenameInformation with
+// no root handle renames within the source directory and never replaces a target.
+public static void RenameSibling(string source, string destination) {
+    if (!String.Equals(System.IO.Path.GetDirectoryName(source), System.IO.Path.GetDirectoryName(destination),
+            StringComparison.Ordinal)) throw new System.IO.IOException("Expected sibling directories.");
+    byte[] name = System.Text.Encoding.Unicode.GetBytes(System.IO.Path.GetFileName(destination));
+    int lengthOffset = 2 * IntPtr.Size;
+    byte[] info = new byte[lengthOffset + 4 + name.Length + 2];
+    BitConverter.GetBytes(name.Length).CopyTo(info, lengthOffset);
+    name.CopyTo(info, lengthOffset + 4);
+    using (var handle = CreateFileW(source, 0x10080, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+        if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        if ((Attributes(handle) & 0x410) != 0x10) throw new System.IO.IOException("Expected a regular directory.");
+        IoStatus io;
+        int status = NtSetInformationFile(handle, out io, info, info.Length, 10);
+        if (status < 0) throw new System.ComponentModel.Win32Exception((int)RtlNtStatusToDosError(status));
+    }
+}
+
+// Under .NET Framework, File.Open does not accept a named stream pathname.
+public static System.IO.FileStream OpenStream(string path, bool create) {
+    var handle = CreateFileW(path, create ? 0xc0000000u : 0x80000000u, 1, IntPtr.Zero,
+        create ? 1u : 3u, 0x00200000, IntPtr.Zero);
+    if (handle.IsInvalid) {
+        int error = Marshal.GetLastWin32Error();
+        handle.Dispose();
+        throw new System.ComponentModel.Win32Exception(error);
+    }
+    try {
+        if ((Attributes(handle) & 0x410) != 0) throw new System.IO.IOException("Expected a regular file.");
+        return new System.IO.FileStream(handle, create ? System.IO.FileAccess.ReadWrite : System.IO.FileAccess.Read);
+    } catch { handle.Dispose(); throw; }
+}
+'@
+}
+
+function Named-Streams([string]$path) {
+    foreach ($entry in Get-Item -Force -LiteralPath $path -Stream * -ErrorAction Stop) {
+        if ($entry.Stream -and $entry.Stream -cne ':$DATA') { $entry.Stream }
+    }
+}
+
+# Keep a guarded, verified copy of every data stream, including empty ones.
+function Save-Backup([string]$source, [string]$dest) {
+    Pin-BackupDir ([IO.Path]::GetDirectoryName($dest))
+    $hashes = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($stream in @('') + @(Named-Streams $source)) {
+        $suffix = if ($stream) { ':' + $stream } else { '' }
+        $inputFile = [StringSetup.Backup]::OpenStream($source + $suffix, $false)
+        try {
+            $copy = [StringSetup.Backup]::OpenStream($dest + $suffix, $true)
+            $backupFiles.Add($copy)
+            $inputFile.CopyTo($copy)
+            $copy.Flush($true)
+            $copy.Position = 0
+            $inputFile.Position = 0
+            $digest = [BitConverter]::ToString($sha.ComputeHash($copy))
+            if ($digest -cne [BitConverter]::ToString($sha.ComputeHash($inputFile))) {
+                throw "Backup verification failed for $source."
+            }
+            $hashes.Add($stream, $digest)
+        } finally { $inputFile.Dispose() }
+    }
+    return $hashes
+}
+
+function Matches-Backup([string]$path, $hashes) {
+    $streams = @('') + @(Named-Streams $path)
+    if ($streams.Count -ne $hashes.get_Count()) { return $false }
+    foreach ($stream in $streams) {
+        if (-not $hashes.ContainsKey($stream)) { return $false }
+        $suffix = if ($stream) { ':' + $stream } else { '' }
+        $file = [StringSetup.Backup]::OpenStream($path + $suffix, $false)
+        try {
+            if ([BitConverter]::ToString($sha.ComputeHash($file)) -cne $hashes[$stream]) { return $false }
+        } finally { $file.Dispose() }
+    }
+    return $true
+}
+
+# The installer imports the backup functions from the verified incoming package.
+if ($BackupFunctionsOnly) { return }
+
 $ErrorActionPreference = 'Stop'
 $To = [IO.Path]::GetFullPath($To).TrimEnd('\')
 $Data = [IO.Path]::GetFullPath($Data).TrimEnd('\')
@@ -21,7 +157,7 @@ $self = Join-Path $To 'setup\uninstall.ps1'
 $mark = Join-Path $To 'setup\installed.txt'
 
 function Say([string]$text) { Write-Host "  $text" }
-function Done([string]$text, [int]$code) { Write-Host ''; Say $text; Write-Host ''; if ($DataChoice -eq 'ask') { Read-Host '  Press Enter to close' | Out-Null }; exit $code }
+function Done([string]$text, [int]$code) { Close-Backups; Write-Host ''; Say $text; Write-Host ''; if ($DataChoice -eq 'ask') { Read-Host '  Press Enter to close' | Out-Null }; exit $code }
 function Has([string]$path) { Test-Path -LiteralPath $path }
 function Under([string]$path, [string]$dir) { $path -and $path.StartsWith($dir + '\', [StringComparison]::OrdinalIgnoreCase) }
 function IsLink([string]$path) { (Has $path) -and ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) -ne 0 }
@@ -98,7 +234,7 @@ foreach ($line in $rows) {
     if (-not $full -or -not [IO.File]::Exists($full) -or (IsLink $full) -or -not (NoLinks $To $full)) { continue }
     $t = New-Object PSObject -Property @{ Full = $full; Rel = $full.Substring($To.Length + 1); Size = [int64]$p[1]; Hash = $p[0]; Copy = $null }
     $targets += $t
-    try { if ((New-Object IO.FileInfo $full).Length -ne $t.Size -or (Sha256 $full) -ne $t.Hash) { $changed += $t } }
+    try { if ((New-Object IO.FileInfo $full).Length -ne $t.Size -or (Sha256 $full) -ne $t.Hash -or @(Named-Streams $full).Count) { $changed += $t } }
     catch { $changed += $t }   # unreadable: try to copy it, which says why if it can't
 }
 $stamp = (Get-Date -Format 'yyyy-MM-dd HH-mm-ss') + ' (uninstalled)'
@@ -106,7 +242,7 @@ $edits = Join-Path "$To edits" $stamp
 for ($n = 2; Has $edits; $n++) { $edits = Join-Path "$To edits" "$stamp ($n)" }
 foreach ($t in $changed) {
     $dst = Join-Path $edits $t.Rel
-    try { [void][IO.Directory]::CreateDirectory((Split-Path $dst -Parent)); [IO.File]::Copy($t.Full, $dst, $false); $t.Copy = $dst }
+    try { Initialize-Backup; $t.Copy = Save-Backup $t.Full $dst }
     catch { Done "Your change to $($t.Rel) couldn't be saved to $edits, so nothing was removed. ($($_.Exception.Message))" 1 }
 }
 $saved = $changed.Count
@@ -117,8 +253,8 @@ function Remove-Verified($t) {
     try {
         $len = (New-Object IO.FileInfo $t.Full).Length
         $h = Sha256 $t.Full
-        $same = $len -eq $t.Size -and $h -eq $t.Hash
-        if (-not $same -and $t.Copy) { $same = (New-Object IO.FileInfo $t.Copy).Length -eq $len -and (Sha256 $t.Copy) -eq $h }
+        $same = $len -eq $t.Size -and $h -eq $t.Hash -and -not @(Named-Streams $t.Full).Count
+        if (-not $same -and $t.Copy) { $same = Matches-Backup $t.Full $t.Copy }
         if ($same) { [IO.File]::SetAttributes($t.Full, [IO.FileAttributes]::Normal); [IO.File]::Delete($t.Full) }
     }
     catch { }
@@ -149,7 +285,9 @@ try {
     }
 }
 catch { }
-foreach ($f in $list, $mark) { try { [IO.File]::Delete($f) } catch { } }
+foreach ($f in $list, $mark) {
+    try { if (-not @(Named-Streams $f).Count) { [IO.File]::Delete($f) } } catch { }
+}
 Remove-Empty $To
 $left = ''
 if (Has $To) { $left = " Files that weren't part of String (maybe your own) were left in: $To" }

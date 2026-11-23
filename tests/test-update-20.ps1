@@ -12,6 +12,42 @@ $run = Join-Path $root "test-runs\update-20-$id"
 function Check([bool]$pass, [string]$message) {
     if (-not $pass) { throw $message }
 }
+# Exercise just the backup functions on a private tree. Loading their definitions
+# separately keeps the Windows setup entry point out of this sharing check.
+function CheckBackupFunctions([string]$script, [string]$folder) {
+    . $script -BackupFunctionsOnly -To $folder -Menu $folder -Desktop $folder -AppsKey 'HKCU:\unused' -Data $folder -DataChoice keep
+    Initialize-Backup
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $source = Join-Path $folder 'original'
+    $dest = Join-Path $folder 'edits\saved'
+    [void][IO.Directory]::CreateDirectory($folder)
+    [IO.File]::WriteAllText($source, 'Edited content')
+    Set-Content -LiteralPath $source -Stream 'Count' -Value 'user metadata' -NoNewline
+    Set-Content -LiteralPath $source -Stream 'rating' -Value '5' -NoNewline
+    try {
+        $snapshot = Save-Backup $source $dest
+        Check (Matches-Backup $source $snapshot) 'A complete backup failed verification'
+        $dir = [IO.Path]::GetDirectoryName($dest)
+        $probe = [StringSetup.Backup]::CreateFileW($dir, 0x10000, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+        try { $denied = $probe.IsInvalid } finally { $probe.Dispose() }
+        $stream = Get-Content -LiteralPath $dest -Stream 'rating' -Raw -ErrorAction SilentlyContinue
+        $first = [IO.Directory]::CreateDirectory((Join-Path $folder 'current')).FullName
+        $second = Join-Path $folder 'previous'
+        [StringSetup.Backup]::RenameSibling($first, $second)
+        [void][IO.Directory]::CreateDirectory($first)
+        $refused = $false
+        try { [StringSetup.Backup]::RenameSibling($first, $second) } catch { $refused = $true }
+        Check ($refused -and [IO.Directory]::Exists($first) -and [IO.Directory]::Exists($second)) 'Guarded swap replaced an existing directory'
+        Set-Content -LiteralPath $source -Stream 'rating' -Value '6' -NoNewline
+        Check (-not (Matches-Backup $source $snapshot)) 'A newer stream edit was eligible for retirement'
+        Set-Content -LiteralPath $source -Stream 'rating' -Value '5' -NoNewline
+        Set-Content -LiteralPath $source -Stream 'empty' -Value '' -NoNewline
+        Check (-not (Matches-Backup $source $snapshot)) 'A new empty stream was eligible for retirement'
+        Check ($denied -and $stream -ceq '5') "Backup contract failed (folder denies delete access: $denied, saved rating: '$stream')"
+    } finally { Close-Backups; $sha.Dispose() }
+}
+CheckBackupFunctions (Join-Path $root 'tools\share\uninstall.ps1') (Join-Path $run 'Backup functions')
+
 function Build([string]$script, [string[]]$options) {
     & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File (Join-Path $root "tools\$script") @options
     Check ($LASTEXITCODE -eq 0) "$script failed ($LASTEXITCODE)"
@@ -220,6 +256,9 @@ try {
     $before = Snapshot $data
     $css = 'wwwroot\string.css'
     [IO.File]::AppendAllText((Join-Path $to $css), "`r`n/* personal edit */`r`n")
+    Set-Content -LiteralPath (Join-Path $to $css) -Stream 'notes' -Value 'Preserved metadata' -NoNewline
+    $streamOnly = 'String.runtimeconfig.json'
+    Set-Content -LiteralPath (Join-Path $to $streamOnly) -Stream 'rating' -Value '5' -NoNewline
     $edited = (Get-FileHash -LiteralPath (Join-Path $to $css)).Hash
     [IO.File]::WriteAllText((Join-Path $to 'my notes.txt'), 'Kept across the move.')
 
@@ -236,6 +275,8 @@ try {
     Check ($backups.Count -eq 1) 'Expected one edits backup'
     $savedCss = Join-Path $backups[0].FullName $css
     Check ((Get-FileHash -LiteralPath $savedCss).Hash -ceq $edited) 'Edited CSS was lost'
+    Check ((Get-Content -LiteralPath $savedCss -Stream 'notes' -Raw) -ceq 'Preserved metadata') 'Edited CSS lost its named stream'
+    Check ((Get-Content -LiteralPath (Join-Path $backups[0].FullName $streamOnly) -Stream 'rating' -Raw) -ceq '5') 'A stream-only edit was lost'
     Check ([IO.File]::ReadAllText((Join-Path $to 'my notes.txt')) -ceq 'Kept across the move.') 'Personal file was lost'
     "Migrated $($before.Count) profile files. Removed $($retired.Count) retired program files. Verified edited CSS and both shortcuts."
 
@@ -259,6 +300,8 @@ try {
     $afterSmoke = Snapshot $data
     $uninstaller = Join-Path $to 'setup\uninstall.ps1'
     [IO.File]::AppendAllText($uninstaller, "`r`n# Personal setup note.`r`n")
+    Set-Content -LiteralPath $uninstaller -Stream 'notes' -Value 'Uninstall metadata' -NoNewline
+    Set-Content -LiteralPath (Join-Path $to 'String.exe') -Stream 'rating' -Value '4' -NoNewline
     $uninstallerHash = (Get-FileHash -LiteralPath $uninstaller).Hash
     Setup $uninstaller $zone -Remove
     SameFiles $afterSmoke (Snapshot $data) 'uninstalled profile'
@@ -266,6 +309,9 @@ try {
     Check ([IO.File]::Exists((Join-Path $to 'my notes.txt')) -and [IO.File]::Exists($savedCss)) 'Uninstall removed personal files'
     $savedSetup = @(Get-ChildItem -LiteralPath "$to edits" -Recurse -File -Filter 'uninstall.ps1')
     Check ($savedSetup.Count -eq 1 -and (Get-FileHash -LiteralPath $savedSetup[0].FullName).Hash -ceq $uninstallerHash) 'Uninstall lost an edit to its own script'
+    Check ((Get-Content -LiteralPath $savedSetup[0].FullName -Stream 'notes' -Raw) -ceq 'Uninstall metadata') 'Uninstall lost a named stream'
+    $savedExe = @(Get-ChildItem -LiteralPath "$to edits" -Recurse -File -Filter 'String.exe')
+    Check ($savedExe.Count -eq 1 -and (Get-Content -LiteralPath $savedExe[0].FullName -Stream 'rating' -Raw) -ceq '4') 'Uninstall lost a stream-only edit'
     foreach ($path in 'Player\String.exe', 'Menu\String.lnk', 'Desktop\String.lnk') {
         Check (-not (Test-Path -LiteralPath (Join-Path $zone $path))) "Uninstall left $path"
     }
