@@ -1,23 +1,27 @@
 #Requires -Version 7
-# Makes a preview of the native String (native\, written in Rust): release\String-<version>.zip, a folder to unzip and
-# run. A preview is never installed and never reaches an installed String: installed copies update only to the newest
-# full release, and -Publish puts a preview on GitHub as a pre-release, which they skip.
+# Makes an installable native release, or a loose preview that installed copies skip.
+#   pwsh -File tools\release-native.ps1 -Full -Version 2.0.0 [-Key <release key>]
 #   pwsh -File tools\release-native.ps1 -Version 2.0.0-preview.1 [-Notes "What it is"] [-Publish]
 # Nothing personal goes in: the same check as tools\release.ps1 (this PC's user and profile name, and any words listed,
 # one per line, in %USERPROFILE%\.string-release\private-words.txt).
 param(
     [Parameter(Mandatory)][string]$Version,
     [string]$Notes = '',
-    [switch]$Publish
+    [switch]$Publish,
+    [switch]$Full,
+    [string]$Key = (Join-Path $env:USERPROFILE '.string-release\release-key.pem')
 )
 $ErrorActionPreference = 'Stop'
-if ($Version -notmatch '^\d+\.\d+\.\d+-preview\.\d+$') { "a preview's version looks like 2.0.0-preview.1 (got '$Version')"; exit 1 }
+if ($Full -and $Publish) { 'Publishing full native releases is disabled.'; exit 1 }
+if ($Full) {
+    if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { "a full version looks like 2.0.0 (got '$Version')"; exit 1 }
+} elseif ($Version -notmatch '^\d+\.\d+\.\d+-preview\.\d+$') { "a preview's version looks like 2.0.0-preview.1 (got '$Version')"; exit 1 }
 $root = Split-Path $PSScriptRoot -Parent
 $native = Join-Path $root 'native'
 $out = Join-Path $root 'release'
-$stage = Join-Path $out 'native-stage'
-$name = "String-$Version"
-$app = Join-Path $stage $name
+$stage = Join-Path $out $(if ($Full) { 'native-full-stage' } else { 'native-stage' })
+$name = if ($Full) { 'String' } else { "String-$Version" }
+$app = Join-Path $stage $(if ($Full) { 'app' } else { $name })
 $tag = "v$Version"
 # A published preview's tag goes on the exact commit it's built from, so that commit has to be complete (no change and
 # no new file outside git's ignore list, since the build could pick one up), already on GitHub's main, and the tag
@@ -39,34 +43,49 @@ if ($Publish) {
     git -C $root merge-base --is-ancestor $commit origin/main
     if ($LASTEXITCODE) { "push $commit to main first: the preview's tag goes on it"; exit 1 }
 }
-if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }   # our own staging folder, made below
-New-Item -ItemType Directory -Force (Join-Path $app 'licenses') | Out-Null
-
 "building String $Version..."
 # A Rust program keeps the source paths of everything it's built from (for its error messages): the libraries' under
 # this PC's profile folder, String's own under wherever this repository is. The build names them /cargo and /string
-# instead, and the linker keeps only the debug file's name. It builds in release\native-build, so these flags never
-# mix with an everyday build's.
+# instead, and the linker keeps only the debug file's name. Separate targets keep the preview's executable, the
+# statically linked release and the everyday build from overwriting one another.
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
-$env:CARGO_ENCODED_RUSTFLAGS = @(
-    "--remap-path-prefix=$($cargoHome.TrimEnd('\'))=/cargo",
-    "--remap-path-prefix=$($root.TrimEnd('\'))=/string",
-    '-Clink-arg=/PDBALTPATH:%_PDB%') -join [char]0x1f
-$target = Join-Path $out 'native-build'
+$originalFlags = $env:CARGO_ENCODED_RUSTFLAGS
+$target = Join-Path $out $(if ($Full) { 'native-full-build' } else { 'native-build' })
 $triple = 'x86_64-pc-windows-msvc'   # named, so a configured default target can't send the build elsewhere
 Push-Location $native
 try {
+    $meta = cargo metadata --format-version 1 --locked --filter-platform $triple | ConvertFrom-Json -Depth 100
+    if ($LASTEXITCODE) { 'cargo metadata failed'; exit 1 }
+    $crate = $meta.packages | Where-Object name -EQ 'string-app'
+    if ($Full -and $Version -cne $crate.version) { throw "Full release $Version must match string-app $($crate.version)." }
+    # Vendored registries can live outside both the Cargo home and this checkout.
+    $registryDirs = $meta.packages | Where-Object { $_.source -like 'registry+*' } | ForEach-Object {
+        [IO.Directory]::GetParent([IO.Path]::GetDirectoryName($_.manifest_path)).FullName
+    } | Sort-Object -Unique
+    $flags = @("--remap-path-prefix=$($cargoHome.TrimEnd('\'))=/cargo", "--remap-path-prefix=$root=/string")
+    foreach ($dir in $registryDirs) { $flags += "--remap-path-prefix=$dir=/cargo" }
+    # A clean install cannot assume the Visual C++ redistributable is installed.
+    if ($Full) { $flags += '-Ctarget-feature=+crt-static' }
+    $env:CARGO_ENCODED_RUSTFLAGS = ($flags + '-Clink-arg=/PDBALTPATH:%_PDB%') -join [char]0x1f
     cargo build --release --locked -p string-app --target $triple --target-dir $target
     if ($LASTEXITCODE) { 'String build failed'; exit 1 }
-    $meta = cargo metadata --format-version 1 --locked --filter-platform x86_64-pc-windows-msvc | ConvertFrom-Json -Depth 100
-    if ($LASTEXITCODE) { 'cargo metadata failed'; exit 1 }
     $rustc = "$(rustc --version)".Trim()
     $sysroot = "$(rustc --print sysroot)".Trim()
 } finally {
     Pop-Location
-    Remove-Item Env:CARGO_ENCODED_RUSTFLAGS -ErrorAction SilentlyContinue
+    $env:CARGO_ENCODED_RUSTFLAGS = $originalFlags
 }
-Copy-Item -LiteralPath (Join-Path $target "$triple\release\String.exe") (Join-Path $app 'String.exe')
+if (Test-Path -LiteralPath $stage) {
+    $stagingDir = Get-Item -LiteralPath $stage -Force
+    if ($stagingDir.Parent.FullName -ne $out -or $stagingDir.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "unexpected staging folder: $stage" }
+    Remove-Item -LiteralPath $stagingDir.FullName -Recurse -Force
+}
+New-Item -ItemType Directory -Force (Join-Path $app 'licenses') | Out-Null
+$exe = Join-Path $app 'String.exe'
+Copy-Item -LiteralPath (Join-Path $target "$triple\release\String.exe") $exe
+if ($Full -and [Diagnostics.FileVersionInfo]::GetVersionInfo($exe).ProductVersion -cne $Version) {
+    throw "String.exe does not have product version $Version."
+}
 
 # Licences: every library String.exe is built from (what string-app depends on, not tools used only to build or
 # test), each listed with its licence and the licence files it ships; identical texts are printed once.
@@ -145,10 +164,24 @@ Copy-Item -LiteralPath $f (Join-Path $app 'licenses\Rust-COPYRIGHT-library.html'
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') (Join-Path $app 'licenses\String-LICENSE.txt')
 "$($used.Count) libraries, $($texts.Count) distinct licence texts"
 
-# the notes, with Windows line endings (Notepad reads them)
-$notesText = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'share\Preview read me.txt')) -replace "`r?`n", "`r`n"
-if ($notesText -match '[^\x00-\x7F]') { throw 'the preview notes are not plain ASCII' }
-[IO.File]::WriteAllText((Join-Path $app 'Read me first.txt'), $notesText, (New-Object Text.UTF8Encoding $false))
+function CopyText([string]$name, [string]$dest) {
+    $text = [IO.File]::ReadAllText((Join-Path $PSScriptRoot "share\$name")) -replace "`r?`n", "`r`n"
+    if ($text -match '[^\x00-\x7F]') { throw "not plain ASCII: $name" }
+    [IO.File]::WriteAllText($dest, $text)
+}
+if ($Full) {
+    $setup = New-Item -ItemType Directory -Path (Join-Path $app 'setup')
+    foreach ($file in 'install.ps1', 'uninstall.ps1') { CopyText $file (Join-Path $setup.FullName $file) }
+    [IO.File]::WriteAllText((Join-Path $setup.FullName 'version.txt'), "$Version`r`n")
+    CopyText 'Install String.cmd' (Join-Path $stage 'Install String.cmd')
+    CopyText 'Native read me.txt' (Join-Path $stage 'Read me first.txt')
+    $rows = @(foreach ($f in (Get-ChildItem -LiteralPath $app -Recurse -File -Force | Sort-Object FullName)) {
+        "{0}`t{1}`t{2}" -f (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash, $f.Length, $f.FullName.Substring($app.Length + 1)
+    })
+    [IO.File]::WriteAllLines((Join-Path $setup.FullName 'files.txt'), [string[]]($rows + "#end`t$($rows.Count)"))
+} else {
+    CopyText 'Preview read me.txt' (Join-Path $app 'Read me first.txt')
+}
 
 # Nothing personal: no data or debug files, and no sign of this PC's user or profile folder name (or private words).
 # As in tools\release.ps1: each file's bytes read as Latin-1, so a name's UTF-8 and UTF-16 bytes are found either way; a
@@ -184,10 +217,31 @@ foreach ($f in $everything) {
 
 'zipping...'
 $zip = Join-Path $out "$name.zip"
+$sigFile = "$zip.sig"
+if ($Full -and (Test-Path -LiteralPath $sigFile)) { Remove-Item -LiteralPath $sigFile }
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip, [IO.Compression.CompressionLevel]::Optimal, $false)
 "release\$name.zip: {0:N1} MB" -f ((Get-Item $zip).Length / 1MB)
+
+if ($Full) {
+    if (-not (Test-Path -LiteralPath $Key)) { "not signed: no release key at $Key"; exit 0 }
+    $ecdsa = [Security.Cryptography.ECDsa]::Create()
+    try {
+        $ecdsa.ImportFromPem([IO.File]::ReadAllText($Key))
+        $pub = [Convert]::ToBase64String($ecdsa.ExportSubjectPublicKeyInfo())
+        $legacy = [IO.File]::ReadAllText((Join-Path $root 'src\Updater.cs'))
+        $nativeCode = [IO.File]::ReadAllText((Join-Path $native 'string-extras\src\updates.rs'))
+        if (-not $legacy.Contains("UpdateKey = `"$pub`"") -or -not $nativeCode.Contains("const KEY: &str = `"$pub`"")) {
+            throw "This release key does not match both updaters."
+        }
+        $stream = [IO.File]::OpenRead($zip)
+        try { $sig = $ecdsa.SignData($stream, [Security.Cryptography.HashAlgorithmName]::SHA256) }
+        finally { $stream.Dispose() }
+        [IO.File]::WriteAllText($sigFile, [Convert]::ToBase64String($sig))
+        'signed: release\String.zip.sig'
+    } finally { $ecdsa.Dispose() }
+}
 
 if ($Publish) {
     Push-Location $root

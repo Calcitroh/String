@@ -14,7 +14,8 @@
 #   "<install folder> edits\<date time>\", then carried into the new copy. Where the update changed the same file:
 #   the look (CSS, pictures, fonts) stays theirs, with the update's version saved in "<date time> (the update's
 #   versions)\"; anything else (code) takes the update's version, since an old one could break String. The old copy
-#   is then removed file by file, only what is String's unchanged or identical to its saved copy.
+#   is then removed file by file, only what is String's unchanged or identical to its saved copy. On moving to
+#   the native player, edits to retired program files and web assets stay in the edits folder.
 # Keep this file plain ASCII and Windows PowerShell 5.1 compatible: that is the PowerShell every Windows PC has.
 param(
     [string]$To = (Join-Path $env:LOCALAPPDATA 'Programs\String'),
@@ -113,7 +114,6 @@ function WebView2Version {
 
 Write-Host ''
 Say 'Installing String...'
-foreach ($f in 'String.exe', 'wwwroot', 'setup\uninstall.ps1', 'setup\files.txt') { if (-not (Has (Join-Path $from $f))) { Fail $unzipAgain } }
 # The build is for x64 PCs. Windows 11 on ARM runs x64 programs; Windows 10 on ARM doesn't.
 $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 $build = [Environment]::OSVersion.Version.Build
@@ -125,10 +125,15 @@ if (IsLink $To) { Fail "$To is a folder link, so nothing was changed." }
 Say 'Checking the unzipped files...'
 try {
     $files = @(Listed $from -Strict)
-    if ($files.Count -lt 10 -or -not ($files | Where-Object { $_.Rel -eq 'String.exe' })) { Fail $unzipAgain }
+    foreach ($required in 'String.exe', 'setup\install.ps1', 'setup\uninstall.ps1', 'setup\version.txt') {
+        if ($files.Rel -notcontains $required) { Fail $unzipAgain }
+    }
     foreach ($f in $files) {
         if (-not [IO.File]::Exists($f.Full) -or (New-Object IO.FileInfo $f.Full).Length -ne $f.Size -or (Sha256 $f.Full) -ne $f.Hash) { Fail $unzipAgain }
     }
+    $version = [version]([IO.File]::ReadAllText((Join-Path $from 'setup\version.txt')).Trim())
+    $needsWebView = $version.Major -lt 2
+    if ($needsWebView -and -not ($files.Rel -like 'wwwroot\*')) { Fail $unzipAgain }
 }
 catch { Fail "$unzipAgain ($($_.Exception.Message))" }
 
@@ -176,6 +181,7 @@ if ((Has $To) -and (Has (Join-Path $To 'setup\files.txt'))) {
     $mine = @()
     try {
         foreach ($f in @(Listed $To)) { $cur[$f.Rel.ToLower()] = $f }
+        $fromWebPlayer = -not $needsWebView -and ($cur.Keys -like 'wwwroot\*')
         $next = @{}; foreach ($f in $files) { $next[$f.Rel.ToLower()] = $f }
         foreach ($rel in @(Walk $To $To)) {
             $k = $rel.ToLower()
@@ -202,6 +208,8 @@ if ((Has $To) -and (Has (Join-Path $To 'setup\files.txt'))) {
             }
             foreach ($rel in $mine) {
                 $k = $rel.ToLower(); $was = $cur[$k]; $now = $next[$k]
+                # The old runtime and web pages are no longer loaded. Their edits are safe in $edits.
+                if ($fromWebPlayer -and -not $now -and ($was -or $k -match '^(wwwroot|runtimes|presence)\\')) { continue }
                 $dst = Join-Path $new $rel
                 $updated = $now -and (-not $was -or $now.Hash -ne $was.Hash)   # the update brings its own, different file here
                 if ($updated -and -not ($was -and $lookTypes -contains [IO.Path]::GetExtension($rel).ToLower())) { $tookNew += $rel; continue }
@@ -284,7 +292,8 @@ try {
 catch { }
 try {
     $refresh = Join-Path ([Environment]::GetFolderPath('System')) 'ie4uinit.exe'
-    if (Has $refresh) { [void](Start-Process $refresh -ArgumentList '-show' -WindowStyle Hidden -PassThru) }
+    # A helper that outlives setup must not hold the updater's extracted directory open.
+    if (Has $refresh) { [void](Start-Process $refresh -ArgumentList '-show' -WorkingDirectory ([IO.Path]::GetTempPath()) -WindowStyle Hidden -PassThru) }
 }
 catch { }
 
@@ -311,7 +320,7 @@ else {
 
 Write-Host ''
 Say 'Done. String is in your Start menu and on your desktop.'
-if (-not (WebView2Version)) {
+if ($needsWebView -and -not (WebView2Version)) {
     Write-Host ''
     Write-Host '  One more thing: String also needs Microsoft Edge WebView2 Runtime, which this PC' -ForegroundColor Yellow
     Write-Host '  does not seem to have. Your browser now downloads it from Microsoft: run that file,' -ForegroundColor Yellow

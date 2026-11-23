@@ -63,9 +63,14 @@ function Sha256([string]$path) {
 $madeByInstaller = $false
 try {
     $setup = Join-Path $To 'setup'
-    $madeByInstaller = (Has $self) -and (Has $list) -and (Has $mark) -and -not (IsLink $To) -and -not (IsLink $setup) -and
-        -not (IsLink $list) -and -not (IsLink $mark) -and ([IO.File]::ReadAllText($mark).Trim() -ieq $To) -and
-        (@([IO.File]::ReadAllLines($list) | Where-Object { $_ -match '^[0-9A-F]{64}\t\d+\t' }).Count -ge 10)
+    if ((Has $self) -and (Has $list) -and (Has $mark) -and -not (IsLink $To) -and -not (IsLink $setup) -and
+        -not (IsLink $self) -and -not (IsLink $list) -and -not (IsLink $mark) -and ([IO.File]::ReadAllText($mark).Trim() -ieq $To)) {
+        # A native release has far fewer files than the bundled web runtime. Check the manifest's own count.
+        $lines = [IO.File]::ReadAllLines($list)
+        $rows = @($lines -match '^[0-9A-F]{64}\t\d+\t.+$')
+        $madeByInstaller = $lines.Count -eq $rows.Count + 1 -and $lines[-1] -ceq "#end`t$($rows.Count)" -and
+            ($rows -match '\tString\.exe$') -and ($rows -match '\tsetup\\uninstall\.ps1$')
+    }
 }
 catch { }
 if (-not $madeByInstaller) { Done "This isn't an installed copy of String, so nothing was removed: $To" 1 }
@@ -86,11 +91,11 @@ if ((Running).Count) {
 # fails, nothing is removed.
 Set-Location -LiteralPath ([IO.Path]::GetTempPath())   # not inside the folder that is about to go
 $targets = @(); $changed = @()
-foreach ($line in [IO.File]::ReadAllLines($list)) {
+foreach ($line in $rows) {
     $p = $line.Split("`t")
     if ($p.Count -ne 3) { continue }
     $full = Inside $To $p[2]
-    if (-not $full -or $full -ieq $self -or -not [IO.File]::Exists($full) -or -not (NoLinks $To $full)) { continue }
+    if (-not $full -or -not [IO.File]::Exists($full) -or (IsLink $full) -or -not (NoLinks $To $full)) { continue }
     $t = New-Object PSObject -Property @{ Full = $full; Rel = $full.Substring($To.Length + 1); Size = [int64]$p[1]; Hash = $p[0]; Copy = $null }
     $targets += $t
     try { if ((New-Object IO.FileInfo $full).Length -ne $t.Size -or (Sha256 $full) -ne $t.Hash) { $changed += $t } }
@@ -108,8 +113,7 @@ $saved = $changed.Count
 if ($saved) { Say "Your own changes to String's files ($saved) are saved in: $edits" }
 # Each file is checked again right before it goes: String's own unchanged, or identical to its saved copy. One that
 # changed in the meantime (an editor saving it) stays.
-$stuck = @()
-foreach ($t in $targets) {
+function Remove-Verified($t) {
     try {
         $len = (New-Object IO.FileInfo $t.Full).Length
         $h = Sha256 $t.Full
@@ -118,14 +122,20 @@ foreach ($t in $targets) {
         if ($same) { [IO.File]::SetAttributes($t.Full, [IO.FileAttributes]::Normal); [IO.File]::Delete($t.Full) }
     }
     catch { }
-    if ([IO.File]::Exists($t.Full)) { $stuck += $t.Rel }
+    return -not [IO.File]::Exists($t.Full)
 }
+$stuck = @()
+foreach ($t in $targets) {
+    if ($t.Full -ieq $self) { $selfFile = $t; continue }
+    if (-not (Remove-Verified $t)) { $stuck += $t.Rel }
+}
+if (-not $stuck.Count -and $selfFile -and -not (Remove-Verified $selfFile)) { $stuck += $selfFile.Rel }
 if ($stuck.Count) {
     $where = ''; if ($saved) { $where = " Your changes so far are saved in: $edits" }
     Done "Some of String's files are still in use or were just changed ($(($stuck | Select-Object -First 3) -join ', ')), so String isn't fully removed yet. Close what uses them (or restart the PC), then uninstall it again from Settings > Apps.$where" 1
 }
 
-# then the shortcuts and the Apps entry (only String's own, pointing at this folder), then the uninstaller itself
+# then the shortcuts and the Apps entry (only String's own, pointing at this folder)
 $shell = New-Object -ComObject WScript.Shell
 foreach ($dir in @($Menu, $Desktop)) {
     if (-not $dir) { continue }
@@ -139,7 +149,7 @@ try {
     }
 }
 catch { }
-foreach ($f in $self, $list, $mark) { try { [IO.File]::Delete($f) } catch { } }
+foreach ($f in $list, $mark) { try { [IO.File]::Delete($f) } catch { } }
 Remove-Empty $To
 $left = ''
 if (Has $To) { $left = " Files that weren't part of String (maybe your own) were left in: $To" }
