@@ -1314,11 +1314,7 @@ pub fn takes_keys(ctx: &Context) -> bool {
     }
     false
 }
-const AUDIO: [&str; 11] = [
-    "mp3", "flac", "m4a", "m4b", "aac", "ogg", "oga", "opus", "wav", "weba", "webm",
-];
-fn drops(ctx: &Context, v: &mut View<'_>) {
-    let hi = v.tint;
+fn drops(ctx: &Context, hi: Tint, adds: &crate::add_work::Input, toast: &mut ui::Toast) {
     let (hovering, dropped) = ctx.input(|i| {
         (
             !i.raw.hovered_files.is_empty(),
@@ -1352,22 +1348,8 @@ fn drops(ctx: &Context, v: &mut View<'_>) {
             hi.ink(1.),
         );
     }
-    if dropped.is_empty() {
-        return;
-    }
-    let mut added = 0;
-    for path in dropped {
-        let song = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| AUDIO.contains(&e.to_ascii_lowercase().as_str()));
-        if path.is_dir() || (path.is_file() && song) {
-            v.add_path(path);
-            added += 1;
-        }
-    }
-    if added == 0 {
-        v.views.toast.set("Those aren't songs String can play");
+    if !dropped.is_empty() && !adds.dropped_paths(dropped) {
+        toast.set("String could not take more songs.");
     }
 }
 /// The label that follows the pointer while songs are dragged.
@@ -1407,13 +1389,16 @@ pub fn overlay(ui: &mut Ui, v: &mut View<'_>) {
                 .collect();
         new_playlist(v, ids, false);
     }
-    drops(&ctx, v);
+    drops(&ctx, v.tint, v.adds, &mut v.views.toast);
     drag_ghost(&ctx, v);
     show_menu(&ctx, v);
     show_dialog(&ctx, v);
 }
 
 /* ---------- smoke cases ---------- */
+
+#[cfg(test)]
+mod drop_tests;
 
 pub mod smoke {
     use super::*;

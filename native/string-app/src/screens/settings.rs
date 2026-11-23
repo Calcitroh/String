@@ -15,7 +15,7 @@ use egui::{Align, Context, Frame, Label, Layout, Margin, RichText, Sense, Ui, ve
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{LazyLock, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
@@ -159,18 +159,10 @@ pub(crate) fn add_songs_to(
 ) -> Option<String> {
     let mut files = strings(s.field("files"));
     let before = files.len();
-    for p in list {
-        let ext = p
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+    for p in list.iter().filter(|p| is_song_path(p)) {
         let p = p.to_string_lossy().into_owned();
         let id = p.to_lowercase();
-        if AUDIO.contains(&ext.as_str())
-            && !files.iter().any(|f| f.to_lowercase() == id)
-            && !s.models.by_id.contains_key(&id)
-        {
+        if !files.iter().any(|f| f.to_lowercase() == id) && !s.models.by_id.contains_key(&id) {
             files.push(p);
         }
     }
@@ -181,6 +173,12 @@ pub(crate) fn add_songs_to(
     s.set_field("files", files.into());
     scan.requested = true;
     Some(format!("{} added", plural(fresh, "song")))
+}
+
+pub(crate) fn is_song_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| AUDIO.iter().any(|e| ext.eq_ignore_ascii_case(e)))
 }
 impl State {
     fn numbers(&mut self, v: &View<'_>) -> &Numbers {

@@ -2,7 +2,7 @@ use crate::{playback::Session, playlist_add, scan::Scanner};
 use std::{
     collections::HashSet,
     fs, io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
 };
@@ -53,9 +53,14 @@ impl Drop for Charge {
 
 enum Source {
     Helper(Option<String>),
-    Window,
+    Picker,
+    Drop,
 }
 type Job = (Source, Vec<PathBuf>, Charge);
+
+fn path_charge(path: &Path) -> usize {
+    (path.as_os_str().len() + 1) * 2
+}
 
 #[derive(Clone)]
 pub(crate) struct Input {
@@ -71,17 +76,40 @@ impl Input {
         let Ok(path) = std::path::absolute(path) else {
             return false;
         };
-        let bytes = (path.as_os_str().len() + 1) * 2;
-        self.enqueue(Source::Window, vec![path], bytes)
+        let bytes = path_charge(&path);
+        self.enqueue(Source::Picker, vec![path], bytes)
     }
-    fn enqueue(&self, source: Source, paths: Vec<PathBuf>, bytes: usize) -> bool {
+    pub(crate) fn dropped_paths(&self, paths: Vec<PathBuf>) -> bool {
+        let bytes = paths.iter().map(|p| path_charge(p)).sum();
+        self.enqueue(Source::Drop, paths, bytes)
+    }
+    fn enqueue(&self, source: Source, mut paths: Vec<PathBuf>, mut bytes: usize) -> bool {
         let mut p = self.state.lock().unwrap();
-        if p.closed
-            || paths.is_empty()
-            || paths.len() > Instance::MAX_ADD_PATHS - p.paths
-            || bytes > Instance::MAX_ADD_BYTES - p.bytes
-        {
+        if p.closed || paths.is_empty() {
             return false;
+        }
+        let free_paths = Instance::MAX_ADD_PATHS - p.paths;
+        let free_bytes = Instance::MAX_ADD_BYTES - p.bytes;
+        let fits = paths.len() <= free_paths && bytes <= free_bytes;
+        if !fits {
+            if !matches!(source, Source::Drop) || free_paths == 0 {
+                return false;
+            }
+            // Drops used to admit each path separately. Keep what fits, in the same order.
+            let mut count = 0;
+            bytes = 0;
+            paths.retain(|path| {
+                let size = path_charge(path);
+                if count == free_paths || size > free_bytes - bytes {
+                    return false;
+                }
+                count += 1;
+                bytes += size;
+                true
+            });
+            if paths.is_empty() {
+                return false;
+            }
         }
         p.paths += paths.len();
         p.bytes += bytes;
@@ -93,7 +121,7 @@ impl Input {
         // Serialize submissions to preserve admission order. Release the lock before dropping a failed send.
         let sent = self.jobs.send((source, paths, charge));
         drop(p);
-        sent.is_ok()
+        sent.is_ok() && fits
     }
 }
 
@@ -111,11 +139,16 @@ impl Batch {
         }
     }
     /// Adds the checked paths; for drops, returns what to tell the person.
-    pub fn apply(self, s: &mut Session, scan: &mut Scanner) -> Option<String> {
-        if self.locations.is_empty() {
-            return None;
+    pub fn apply(mut self, s: &mut Session, scan: &mut Scanner) -> Option<String> {
+        if matches!(self.source, Source::Drop) {
+            self.locations
+                .retain(|l| l.directory || crate::screens::settings::is_song_path(&l.path));
         }
-        if matches!(self.source, Source::Window) {
+        if self.locations.is_empty() {
+            return matches!(self.source, Source::Drop)
+                .then(|| "Those aren't songs String can play".into());
+        }
+        if matches!(self.source, Source::Drop | Source::Picker) {
             // Drops follow the pickers' rules: a folder inside a listed one isn't added again, only songs are taken.
             let (folders, songs): (Vec<_>, Vec<_>) =
                 self.locations.into_iter().partition(|l| l.directory);
@@ -168,7 +201,7 @@ pub(crate) fn add_dropped_now(
     paths: Vec<PathBuf>,
 ) -> Option<String> {
     Batch {
-        source: Source::Window,
+        source: Source::Drop,
         locations: classify(paths),
         _charge: None,
     }
@@ -185,7 +218,7 @@ impl Adds {
     pub fn new() -> io::Result<Self> {
         Self::with_classifier(classify)
     }
-    fn with_classifier(
+    pub(crate) fn with_classifier(
         inspect: impl Fn(Vec<PathBuf>) -> Vec<Location> + Send + 'static,
     ) -> io::Result<Self> {
         let (jobs, inbox) = mpsc::channel::<Job>();
@@ -238,28 +271,28 @@ impl Adds {
         self.startup.is_some() || self.input.state.lock().unwrap().paths != 0
     }
     pub fn poll(&mut self, s: &mut Session, scan: &mut Scanner, toast: &mut crate::ui::Toast) {
-        // Everything dropped that's ready now goes in together, so several songs get one message.
-        let mut dropped = Vec::new();
+        // Picker results arrive as separate paths. Each drag-and-drop already arrives in one batch.
+        let mut picked = Vec::new();
         let mut charges = Vec::new();
         let mut missing = false;
         for batch in self.startup.take().into_iter().chain(self.ready.try_iter()) {
-            if matches!(batch.source, Source::Window) {
+            if matches!(batch.source, Source::Picker) {
                 missing |= batch.locations.is_empty();
-                dropped.extend(batch.locations);
+                picked.extend(batch.locations);
                 charges.push(batch._charge);
-            } else {
-                batch.apply(s, scan);
+            } else if let Some(message) = batch.apply(s, scan) {
+                toast.set(message);
             }
         }
-        if dropped.is_empty() {
+        if picked.is_empty() {
             if missing {
                 toast.set("This path does not exist.");
             }
             return;
         }
         let message = Batch {
-            source: Source::Window,
-            locations: dropped,
+            source: Source::Picker,
+            locations: picked,
             _charge: None,
         }
         .apply(s, scan);
@@ -281,6 +314,39 @@ impl Adds {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn a_partly_full_queue_keeps_the_dropped_paths_that_fit() {
+        let adds = Adds::with_classifier(|paths| {
+            paths
+                .into_iter()
+                .map(|path| Location {
+                    path,
+                    directory: false,
+                })
+                .collect()
+        })
+        .unwrap();
+        let small = PathBuf::from(r"C:\a.mp3");
+        let large = PathBuf::from(r"C:\larger.mp3");
+        assert!(adds.input.submit(
+            None,
+            vec![large.clone()],
+            Instance::MAX_ADD_BYTES - path_charge(&small)
+        ));
+        assert!(!adds.input.dropped_paths(vec![large, small.clone()]));
+        let wait = || adds.ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let _helper = wait();
+        let drop = wait();
+        assert!(matches!(drop.source, Source::Drop));
+        assert_eq!(
+            drop.locations,
+            [Location {
+                path: small,
+                directory: false
+            }]
+        );
+    }
 
     #[test]
     fn capacity_covers_queued_work_the_classifier_and_unapplied_results() {
