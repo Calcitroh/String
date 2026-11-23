@@ -313,7 +313,7 @@ impl Engine {
             (None, None) => return None,
         };
         let start = lp.start.max(0.0);
-        (end - start >= 0.5).then_some((start, end))
+        (end - start >= 1.).then_some((start, end))
     }
 
     fn seek(&mut self, secs: f64) {
@@ -755,6 +755,7 @@ pub(crate) fn status(position: &Position, now_ns: Option<u64>) -> Status {
     Status {
         key: Some(w[0]),
         position: position.max(0.0),
+        loop_offset: f64::from_bits(w[6]),
         duration,
         playing,
     }

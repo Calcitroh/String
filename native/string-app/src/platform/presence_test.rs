@@ -130,6 +130,7 @@ fn discord_wire_follows_the_queue_pause_and_expiry() {
                 playing,
                 position: 0.,
                 duration: Some(duration),
+                ..Default::default()
             };
             transport.update(s, st, None, None, dir.path(), &log, &ctx);
         };

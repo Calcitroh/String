@@ -69,9 +69,9 @@ pub fn shortcuts(ui: &Ui, v: &mut View<'_>) {
     } else if key(no, Key::ArrowRight) {
         v.s.seek(v.player, v.st.position + 5.);
     } else if key(Modifiers::CTRL, Key::ArrowUp) {
-        v.volume(v.s.volume() + 0.05);
+        v.volume(v.s.audible_volume() + 0.05);
     } else if key(Modifiers::CTRL, Key::ArrowDown) {
-        v.volume(v.s.volume() - 0.05);
+        v.volume(v.s.audible_volume() - 0.05);
     } else if key(no, Key::M) {
         v.mute();
     } else if key(no, Key::S) {
@@ -86,9 +86,9 @@ pub fn shortcuts(ui: &Ui, v: &mut View<'_>) {
         v.record(Overlay::Record);
     } else if key(no, Key::Y) {
         v.record(Overlay::Lyrics);
-    } else if key(no, Key::OpenBracket) {
+    } else if key(no, Key::OpenBracket) && v.s.bar_song(v.st).is_some() {
         v.s.set_loop(v.player, Some((true, v.st.position)));
-    } else if key(no, Key::CloseBracket) {
+    } else if key(no, Key::CloseBracket) && v.s.bar_song(v.st).is_some() {
         v.s.set_loop(v.player, Some((false, v.st.position)));
     } else if key(no, Key::Backslash) {
         v.s.set_loop(v.player, None);

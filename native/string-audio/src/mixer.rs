@@ -76,7 +76,7 @@ pub(crate) enum Evt {
 }
 
 /// What the screens read about the current song: key, flags, position, end, rate, the time the
-/// position was heard (ns), and the song's handle.
+/// position was heard (ns), and the accumulated loop rewinds (seconds).
 pub(crate) type Position = SeqLock<7>;
 pub(crate) const FLAG_SONG: u64 = 1;
 pub(crate) const FLAG_PLAYING: u64 = 2;
@@ -297,6 +297,7 @@ pub(crate) struct Mixer {
     armed: Option<Armed>,
     /// The song last reported as started.
     started: u32,
+    loop_offset: f64,
     transport: Envelope,
     running: bool,
     volume: f32,
@@ -331,6 +332,7 @@ impl Mixer {
             cur: None,
             armed: None,
             started: 0,
+            loop_offset: 0.,
             transport: Envelope::steady(1.0),
             running: false,
             volume: 1.0,
@@ -744,6 +746,7 @@ impl Mixer {
                         None => false,
                     };
                     if due || cd.stopped {
+                        self.loop_offset += (pos - self.decks[o].pos) as f64 / self.rate as f64;
                         self.release(c);
                         let od = &mut self.decks[o];
                         od.role = Role::Current;
@@ -858,7 +861,7 @@ impl Mixer {
                     };
                 w[2] = d.pos.max(0) as u64;
                 w[3] = d.end_pos().or(d.est_end).unwrap_or(UNKNOWN) as u64;
-                w[6] = d.handle as u64;
+                w[6] = self.loop_offset.to_bits();
             }
         }
         w[4] = self.rate as u64;
