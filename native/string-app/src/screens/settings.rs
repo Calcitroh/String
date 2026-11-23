@@ -698,11 +698,11 @@ fn playback(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
         "Songs played on your phone through Navidrome on this PC count in Stats, as whole songs.",
     );
     ui.add_space(10.);
-    panel::panel_h(ui, "Look", "", tint);
     if st.reveal_look > 0 {
         st.reveal_look -= 1;
         ui.scroll_to_cursor(Some(Align::Min));
     }
+    panel::panel_h(ui, "Look", "", tint);
     let now = v.s.setting("tint").as_str().unwrap_or("mono").to_owned();
     // the person's look.css can set its own tint: shown beside String's three while it's the one drawn
     let custom = matches!(tint, Tint::Custom(_));

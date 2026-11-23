@@ -51,24 +51,69 @@ fn the_tint_follows_the_1x_cascade() {
     assert_eq!(over(":root { --hi: 1 2 3 }", Tint::Mono), Some([1, 2, 3]));
     assert_eq!(over(":root { --hi: 1 2 3 }", Tint::Arc), None);
     assert_eq!(over(":root { --hi: 1 2 3 }", Tint::Ember), None);
-    assert_eq!(over(":root { --hi: 1 2 3 ! IMPORTANT }", Tint::Arc), Some([1, 2, 3]));
-    assert_eq!(over(":root.tint-arc { --hi: 4 5 6 }", Tint::Arc), Some([4, 5, 6]));
+    assert_eq!(
+        over(":root { --hi: 1 2 3 ! IMPORTANT }", Tint::Arc),
+        Some([1, 2, 3])
+    );
+    assert_eq!(
+        over(":root.tint-arc { --hi: 4 5 6 }", Tint::Arc),
+        Some([4, 5, 6])
+    );
     assert_eq!(over(":root.tint-arc { --hi: 4 5 6 }", Tint::Mono), None);
-    assert_eq!(over(".tint-ember { --hi: 4 5 6 }", Tint::Ember), Some([4, 5, 6]));
+    // a bare class is less specific than String's own :root.tint-ember
+    assert_eq!(over(".tint-ember { --hi: 4 5 6 }", Tint::Ember), None);
+    assert_eq!(
+        over(".tint-ember { --hi: 4 5 6 !important }", Tint::Ember),
+        Some([4, 5, 6])
+    );
+    assert_eq!(
+        over(".tint-ember { --hi: 4 5 6 !important }", Tint::Arc),
+        None
+    );
     // html is less specific than String's own :root
     assert_eq!(over("html { --hi: 1 2 3 }", Tint::Mono), None);
-    assert_eq!(over("html { --hi: 1 2 3 !important }", Tint::Mono), Some([1, 2, 3]));
+    assert_eq!(
+        over("html { --hi: 1 2 3 !important }", Tint::Mono),
+        Some([1, 2, 3])
+    );
     // what the body (or every element) says is what the page inherits
     assert_eq!(over("body { --hi: 7 8 9 }", Tint::Arc), Some([7, 8, 9]));
     assert_eq!(over("* { --hi: 7 8 9 }", Tint::Ember), Some([7, 8, 9]));
-    assert_eq!(over(":root { --hi: 1 2 3 !important } body { --hi: 7 8 9 }", Tint::Mono), Some([7, 8, 9]));
+    assert_eq!(
+        over(
+            ":root { --hi: 1 2 3 !important } body { --hi: 7 8 9 }",
+            Tint::Mono
+        ),
+        Some([7, 8, 9])
+    );
     // later wins a tie; important wins over later
-    assert_eq!(over(":root{--hi:1 2 3} :root{--hi:4 5 6}", Tint::Mono), Some([4, 5, 6]));
-    assert_eq!(over(":root{--hi:1 2 3!important} :root{--hi:4 5 6}", Tint::Mono), Some([1, 2, 3]));
+    assert_eq!(
+        over(":root{--hi:1 2 3} :root{--hi:4 5 6}", Tint::Mono),
+        Some([4, 5, 6])
+    );
+    assert_eq!(
+        over(":root{--hi:1 2 3!important} :root{--hi:4 5 6}", Tint::Mono),
+        Some([1, 2, 3])
+    );
     // the numbers: commas too, clamped, percentages; anything else isn't a tint
-    assert_eq!(over(":root { --hi: 300, -5, 50% }", Tint::Mono), Some([255, 0, 128]));
-    for bad in ["#d4af37", "1 2", "1 2 3 4", "gold", "rgb(1 2 3)", "NaN 1 2", ""] {
-        assert_eq!(over(&format!(":root {{ --hi: {bad} }}"), Tint::Mono), None, "{bad}");
+    assert_eq!(
+        over(":root { --hi: 300, -5, 50% }", Tint::Mono),
+        Some([255, 0, 128])
+    );
+    for bad in [
+        "#d4af37",
+        "1 2",
+        "1 2 3 4",
+        "gold",
+        "rgb(1 2 3)",
+        "NaN 1 2",
+        "",
+    ] {
+        assert_eq!(
+            over(&format!(":root {{ --hi: {bad} }}"), Tint::Mono),
+            None,
+            "{bad}"
+        );
     }
     // custom properties keep their case, and other places don't tint the page
     assert_eq!(over(":root { --HI: 1 2 3 }", Tint::Mono), None);
@@ -92,9 +137,14 @@ fn a_broken_file_is_read_as_far_as_it_goes() {
         let _ = spec(css);
     }
     // the end of the file closes what's open
-    assert_eq!(spec(":root { --hi: 1 2 3").tint_over(Tint::Mono), Some([1, 2, 3]));
+    assert_eq!(
+        spec(":root { --hi: 1 2 3").tint_over(Tint::Mono),
+        Some([1, 2, 3])
+    );
     // at-rules are skipped whole, and what follows is still read
-    let s = spec("@media (max-width: 900px) { :root { --hi: 1 2 3 !important } } @import 'x.css'; .brand { height: 10px }");
+    let s = spec(
+        "@media (max-width: 900px) { :root { --hi: 1 2 3 !important } } @import 'x.css'; .brand { height: 10px }",
+    );
     assert_eq!(s.tint_over(Tint::Mono), None);
     assert_eq!(s.brand.height, Some(10.));
     // a stray brace spoils only the rule it's in
@@ -103,7 +153,7 @@ fn a_broken_file_is_read_as_far_as_it_goes() {
     assert_eq!(s.brand.padding, [Some(4.), Some(6.), Some(4.), Some(6.)]);
     // quotes and comments in values
     let s = spec("#main { background: url(\"a}/*b.png\") } :root { --hi: 1 /* x */ 2 3 }");
-    assert_eq!(s.main.unwrap().url, "a}/*b.png");
+    assert_eq!(s.main.as_ref().unwrap().url, "a}/*b.png");
     assert_eq!(s.tint_over(Tint::Mono), Some([1, 2, 3]));
     // nested rules are skipped with their selector
     let s = spec(".brand { .x { height: 5px } height: 30px; }");
@@ -124,11 +174,17 @@ fn the_logo_box_reads_its_selectors() {
     let both = b(".brand > * { display: none } .brand svg { display: block }");
     assert!(both.hide_name && !both.hide_wire);
     // hover states, other places and a spoiled list don't count
-    assert_eq!(b(".brand:hover { height: 9px } .side .brand { height: 9px }"), Brand::default());
+    assert_eq!(
+        b(".brand:hover { height: 9px } .side .brand { height: 9px }"),
+        Brand::default()
+    );
     assert_eq!(b(".x, .brand::before { height: 9px }"), Brand::default());
     assert_eq!(b(".x, .brand { height: 9px }").height, Some(9.));
     assert!(b(".brand { display: none }").hidden);
-    assert_eq!(b(".brand { height: 3em; padding: 1px 2px 3px 4px }").padding, [Some(1.), Some(2.), Some(3.), Some(4.)]);
+    assert_eq!(
+        b(".brand { height: 3em; padding: 1px 2px 3px 4px }").padding,
+        [Some(1.), Some(2.), Some(3.), Some(4.)]
+    );
     assert_eq!(b(".brand { height: 3em }").height, None);
 }
 
@@ -144,13 +200,21 @@ fn background_longhands_and_layers() {
     let m = main("#main { background: url(a.png) no-repeat; background-size: contain }").unwrap();
     assert_eq!((m.fit, m.repeat), (Fit::Contain, [false, false]));
     let m = main("#main { background-size: contain; background: url(a.png) }").unwrap();
-    assert_eq!((m.fit, m.repeat, m.at), (Fit::Sized(None, None), [true, true], [Len::Pct(0.), Len::Pct(0.)]));
+    assert_eq!(
+        (m.fit, m.repeat, m.at),
+        (
+            Fit::Sized(None, None),
+            [true, true],
+            [Len::Pct(0.), Len::Pct(0.)]
+        )
+    );
     // the first layer with a picture, with its own size from each list
     let m = main("main { background: linear-gradient(#000, #111), url(x.png) top 10px / 20px 30px no-repeat #000 }").unwrap();
     assert_eq!(m.url, "x.png");
     assert_eq!(m.fit, Fit::Sized(Some(Len::Px(20.)), Some(Len::Px(30.))));
     assert_eq!(m.at[1], Len::Pct(0.));
-    let m = main("#main { background-image: none, url(y.png); background-size: cover, contain }").unwrap();
+    let m = main("#main { background-image: none, url(y.png); background-size: cover, contain }")
+        .unwrap();
     assert_eq!((m.url.as_str(), m.fit), ("y.png", Fit::Contain));
     assert!(main("#main { background: #123 }").is_none());
     assert!(main("#main { background: url() }").is_none());
@@ -162,7 +226,10 @@ fn only_pictures_inside_the_folder() {
     let dir = Path::new(r"C:\data\look");
     let ok = |u: &str| inside(dir, u);
     assert_eq!(ok("logo.png"), Some(dir.join("logo.png")));
-    assert_eq!(ok("./pics/../pics/Logo.PNG?v=2#x"), Some(dir.join("pics").join("Logo.PNG")));
+    assert_eq!(
+        ok("./pics/../pics/Logo.PNG?v=2#x"),
+        Some(dir.join("pics").join("Logo.PNG"))
+    );
     assert_eq!(ok("my%20logo.webp"), Some(dir.join("my logo.webp")));
     assert_eq!(ok(r"pics\bg.jpg"), Some(dir.join("pics").join("bg.jpg")));
     for bad in [
@@ -215,7 +282,9 @@ fn a_look_loads_with_its_pictures() {
     .unwrap();
     png(&look.join("logo.png"), 40, 20);
     fs::create_dir(look.join("pics")).unwrap();
-    image::RgbImage::new(64, 48).save(look.join("pics").join("background.jpg")).unwrap();
+    image::RgbImage::new(64, 48)
+        .save(look.join("pics").join("background.jpg"))
+        .unwrap();
     let l = load(&look);
     assert_eq!(l.spec.tint_over(Tint::Arc), Some(GOLD));
     assert_eq!(l.logo.as_ref().map(|p| p.natural), Some([40, 20]));
@@ -276,19 +345,35 @@ fn never_through_a_link() {
     let elsewhere = t.path().join("elsewhere");
     fs::create_dir(&elsewhere).unwrap();
     png(&elsewhere.join("logo.png"), 8, 8);
-    fs::write(elsewhere.join("look.css"), ":root { --hi: 1 2 3 !important }").unwrap();
-    assert!(junction(&look.join("linked"), &elsewhere), "couldn't make a junction");
-    fs::write(look.join("look.css"), ".brand { background: url(linked/logo.png) }").unwrap();
+    fs::write(
+        elsewhere.join("look.css"),
+        ":root { --hi: 1 2 3 !important }",
+    )
+    .unwrap();
+    assert!(
+        junction(&look.join("linked"), &elsewhere),
+        "couldn't make a junction"
+    );
+    fs::write(
+        look.join("look.css"),
+        ".brand { background: url(linked/logo.png) }",
+    )
+    .unwrap();
     let l = load(&look);
     assert!(l.spec.brand.picture.is_some());
     assert!(l.logo.is_none(), "read through a junction");
     // the same picture, reached without the link, is fine
     fs::copy(elsewhere.join("logo.png"), look.join("logo.png")).unwrap();
-    fs::write(look.join("look.css"), ".brand { background: url(logo.png) }").unwrap();
+    fs::write(
+        look.join("look.css"),
+        ".brand { background: url(logo.png) }",
+    )
+    .unwrap();
     assert!(load(&look).logo.is_some());
     // a look.css that is itself a link is no look (a symbolic link needs Developer Mode; skipped without it)
     fs::remove_file(look.join("look.css")).unwrap();
-    if std::os::windows::fs::symlink_file(elsewhere.join("look.css"), look.join("look.css")).is_ok() {
+    if std::os::windows::fs::symlink_file(elsewhere.join("look.css"), look.join("look.css")).is_ok()
+    {
         assert_eq!(load(&look).spec, Spec::default());
     }
 }
@@ -315,14 +400,18 @@ fn a_saved_change_is_read_again_and_no_file_is_held() {
     let (done, rx) = unbounded();
     let dir = look.clone();
     let w = std::thread::spawn(move || worker(dir, msgs, done, Context::default()));
-    let next = || rx.recv_timeout(Duration::from_secs(5)).expect("the worker read the look");
+    let next = || {
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the worker read the look")
+    };
     tx.send(Msg::On(true)).unwrap();
     assert_eq!(next().spec.tint_over(Tint::Mono), Some([1, 2, 3]));
-    // saved the way careful editors save: a new file put in place of the old one, which fails if it's held open
+    // saved the way careful editors save: a new file put in place of the old one, which fails if it's held open.
+    // (A different length: two saves of the same size within one tick of the file clock look the same.)
     let tmp = look.join("look.css.tmp");
-    fs::write(&tmp, ":root { --hi: 4 5 6 }").unwrap();
+    fs::write(&tmp, ":root { --hi: 40 50 60 }").unwrap();
     fs::rename(&tmp, &css).unwrap();
-    assert_eq!(next().spec.tint_over(Tint::Mono), Some([4, 5, 6]));
+    assert_eq!(next().spec.tint_over(Tint::Mono), Some([40, 50, 60]));
     // a picture appearing after the look names it
     fs::write(&css, "#main { background: url(bg.png) }").unwrap();
     assert!(next().main.is_none());

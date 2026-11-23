@@ -273,7 +273,16 @@ folder (its backups stay inside it), and it shares the single-instance names, so
 `release\native-build` with the source paths renamed (the libraries' to `/cargo`, String's to `/string`), runs the same
 privacy check as `tools\release.ps1`, and `-Publish` makes a GitHub pre-release on the pushed commit it was built from.
 Installed copies never update to a pre-release; the script checks that the newest full release is still the same
-afterwards. Not in the preview yet: add-ons, your own look, installing and updating from 1.x.
+afterwards. Not in the preview yet: add-ons, installing and updating from 1.x.
+
+Your own look in 2.0 (`string-app\src\theme\look.rs`) uses the same `<data>\look\look.css`, Open folder and
+`set.look` as 1.x. egui can't run CSS, so it reads what it can draw, with 1.x's meaning: `--hi` (a custom `Tint`;
+without `!important` it wins over Mono only, as Arc and Ember's own rules are more specific), `.brand`'s picture,
+height and padding and its hidden parts (`.brand > *`, `svg`, `b`), and `#main`'s picture (size, position, repeat,
+`content-box`). The surfaces, text colours and fonts are left out: the colours are constants every screen draws
+with, and egui panics on a font it can't parse. Files are read whole, only inside the folder and never through a
+link. A worker looks at the files the look uses (four times a second, once a second without a look.css) and reads
+them again once a change has held still for one look, so nothing is held open.
 
 ## Things learned the hard way
 

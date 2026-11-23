@@ -15,10 +15,13 @@
 //! Only files inside the look folder are read, never through a link (a symbolic link or junction anywhere below the
 //! folder, as 1.x refuses), each read whole and closed at once, so an editor's save never finds one held open. A
 //! missing or broken look.css is no look; a missing or broken picture is no picture. While the look is on, a worker
-//! looks at the files it uses four times a second and reads them again once a change has held still for one look.
+//! looks at the files it uses four times a second (once a second while there's no look.css) and reads them again once
+//! a change has held still for one look.
 use super::Tint;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
-use egui::{Color32, ColorImage, Context, Painter, Pos2, Rect, TextureHandle, TextureOptions, pos2, vec2};
+use egui::{
+    Color32, ColorImage, Context, Painter, Pos2, Rect, TextureHandle, TextureOptions, pos2, vec2,
+};
 use image::RgbaImage;
 use std::{
     collections::HashMap,
@@ -175,9 +178,7 @@ pub(crate) fn parse(css: &str) -> Vec<Rule> {
                 }
             } else if c == b'"' || c == b'\'' {
                 quote = c;
-            } else if c == b'{' {
-                break;
-            } else if c == b';' && css[start..i].trim_start().starts_with('@') {
+            } else if c == b'{' || (c == b';' && css[start..i].trim_start().starts_with('@')) {
                 break;
             } else if c == b'}' {
                 bad = true;
@@ -323,7 +324,9 @@ struct Compound<'a> {
 fn compound(s: &str) -> Compound<'_> {
     let b = s.as_bytes();
     let name_end = |mut j: usize| {
-        while j < b.len() && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'-' | b'_') || b[j] >= 0x80) {
+        while j < b.len()
+            && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'-' | b'_') || b[j] >= 0x80)
+        {
             j += 1;
         }
         j
@@ -385,7 +388,11 @@ impl Compound<'_> {
         self.tag.is_some_and(|t| t.eq_ignore_ascii_case(name))
     }
     fn only_tag(&self, name: &str) -> bool {
-        self.tag_is(name) && self.ids.is_empty() && self.classes.is_empty() && self.pseudo.is_empty() && !self.odd
+        self.tag_is(name)
+            && self.ids.is_empty()
+            && self.classes.is_empty()
+            && self.pseudo.is_empty()
+            && !self.odd
     }
     /// The page itself (`:root`, `html`, `.tint-arc`, …): `Some(the tint it needs)`.
     fn root(&self) -> Option<Option<Tint>> {
@@ -464,7 +471,11 @@ fn target(sel: &str) -> Option<(Target, (u16, u16, u16))> {
     if sel.contains(['+', '~', '[', '(']) {
         return None;
     }
-    let cs: Vec<Compound> = sel.split([' ', '>']).filter(|s| !s.is_empty()).map(compound).collect();
+    let cs: Vec<Compound> = sel
+        .split([' ', '>'])
+        .filter(|s| !s.is_empty())
+        .map(compound)
+        .collect();
     let spec = cs.iter().fold((0, 0, 0), |a, c| {
         let s = c.specificity();
         (a.0 + s.0, a.1 + s.1, a.2 + s.2)
@@ -580,7 +591,13 @@ impl Spec {
     pub fn tint_over(&self, base: Tint) -> Option<[u8; 3]> {
         let applies = |h: &&Hi| h.when.is_none_or(|w| w == base);
         let rank = |h: &&Hi| (h.important, h.spec);
-        if let Some(h) = self.hi.iter().filter(applies).filter(|h| h.body).max_by_key(rank) {
+        if let Some(h) = self
+            .hi
+            .iter()
+            .filter(applies)
+            .filter(|h| h.body)
+            .max_by_key(rank)
+        {
             return Some(h.rgb);
         }
         let own = if matches!(base, Tint::Arc | Tint::Ember) {
@@ -588,14 +605,21 @@ impl Spec {
         } else {
             (0, 1, 0)
         };
-        let h = self.hi.iter().filter(applies).filter(|h| !h.body).max_by_key(rank)?;
+        let h = self
+            .hi
+            .iter()
+            .filter(applies)
+            .filter(|h| !h.body)
+            .max_by_key(rank)?;
         (h.important || h.spec >= own).then_some(h.rgb)
     }
 }
 
-/// The winning value of each property for one element: important first, then specificity, then file order.
+/// Important, specificity, then file order: the bigger wins.
+type Rank = (bool, (u16, u16, u16), usize);
+/// The winning value of each property for one element.
 #[derive(Default)]
-struct Props(HashMap<String, ((bool, (u16, u16, u16), usize), String)>);
+struct Props(HashMap<String, (Rank, String)>);
 const BACKGROUND: [&str; 6] = [
     "background-image",
     "background-position",
@@ -604,14 +628,19 @@ const BACKGROUND: [&str; 6] = [
     "background-origin",
     "background-clip",
 ];
-const PADDING: [&str; 4] = ["padding-top", "padding-right", "padding-bottom", "padding-left"];
+const PADDING: [&str; 4] = [
+    "padding-top",
+    "padding-right",
+    "padding-bottom",
+    "padding-left",
+];
 impl Props {
-    fn set(&mut self, name: &str, value: &str, rank: (bool, (u16, u16, u16), usize)) {
+    fn set(&mut self, name: &str, value: &str, rank: Rank) {
         if self.0.get(name).is_none_or(|(old, _)| *old <= rank) {
             self.0.insert(name.to_owned(), (rank, value.to_owned()));
         }
     }
-    fn add(&mut self, d: &Decl, rank: (bool, (u16, u16, u16), usize)) {
+    fn add(&mut self, d: &Decl, rank: Rank) {
         match d.name.as_str() {
             "background" => {
                 for (name, value) in BACKGROUND.iter().zip(background(&d.value)) {
@@ -638,10 +667,11 @@ impl Props {
         self.0.get(name).map(|(_, v)| v.trim())
     }
     fn hidden(&self) -> bool {
-        self.get("display").is_some_and(|v| v.eq_ignore_ascii_case("none"))
-            || self
-                .get("visibility")
-                .is_some_and(|v| v.eq_ignore_ascii_case("hidden") || v.eq_ignore_ascii_case("collapse"))
+        self.get("display")
+            .is_some_and(|v| v.eq_ignore_ascii_case("none"))
+            || self.get("visibility").is_some_and(|v| {
+                v.eq_ignore_ascii_case("hidden") || v.eq_ignore_ascii_case("collapse")
+            })
             || self.get("opacity").and_then(|v| v.parse::<f32>().ok()) == Some(0.)
     }
     fn layer(&self) -> Option<Layer> {
@@ -649,7 +679,10 @@ impl Props {
         let idx = images.iter().position(|v| url_of(v).is_some())?;
         // the other lists repeat to cover every picture, as in CSS
         let pick = |name: &str, default: &'static str| -> String {
-            let list = self.get(name).map(|v| split_top(v, b',')).unwrap_or_default();
+            let list = self
+                .get(name)
+                .map(|v| split_top(v, b','))
+                .unwrap_or_default();
             if list.is_empty() {
                 default.to_owned()
             } else {
@@ -737,16 +770,24 @@ fn px(w: &str) -> Option<f32> {
 fn is_image(w: &str) -> bool {
     let w = w.to_ascii_lowercase();
     w == "none"
-        || ["url(", "image-set(", "-webkit-image-set(", "image(", "cross-fade(", "element("]
-            .iter()
-            .any(|f| w.starts_with(f))
+        || [
+            "url(",
+            "image-set(",
+            "-webkit-image-set(",
+            "image(",
+            "cross-fade(",
+            "element(",
+        ]
+        .iter()
+        .any(|f| w.starts_with(f))
         || w.contains("gradient(")
 }
 /// `background`'s parts for each picture, as the six longhands it sets (the colour and attachment aside).
 fn background(value: &str) -> [String; 6] {
     let mut lists: [Vec<String>; 6] = Default::default();
     for layer in split_top(value, b',') {
-        let (mut image, mut at, mut size, mut rep, mut boxes) = (vec![], vec![], vec![], vec![], vec![]);
+        let (mut image, mut at, mut size, mut rep, mut boxes) =
+            (vec![], vec![], vec![], vec![], vec![]);
         let mut sizing = false;
         for w in words(layer) {
             let l = w.to_ascii_lowercase();
@@ -754,24 +795,44 @@ fn background(value: &str) -> [String; 6] {
                 sizing = true;
             } else if is_image(w) {
                 image.push(w);
-            } else if matches!(l.as_str(), "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round") {
+            } else if matches!(
+                l.as_str(),
+                "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round"
+            ) {
                 rep.push(w);
             } else if matches!(l.as_str(), "border-box" | "padding-box" | "content-box") {
                 boxes.push(w);
-            } else if sizing && size.len() < 2 && (is_len(&l) || matches!(l.as_str(), "auto" | "cover" | "contain")) {
+            } else if sizing
+                && size.len() < 2
+                && (is_len(&l) || matches!(l.as_str(), "auto" | "cover" | "contain"))
+            {
                 size.push(w);
-            } else if is_len(&l) || matches!(l.as_str(), "left" | "right" | "top" | "bottom" | "center") {
+            } else if is_len(&l)
+                || matches!(l.as_str(), "left" | "right" | "top" | "bottom" | "center")
+            {
                 sizing = false;
                 at.push(w);
             }
         }
-        let or = |p: &[&str], d: &str| if p.is_empty() { d.to_owned() } else { p.join(" ") };
+        let or = |p: &[&str], d: &str| {
+            if p.is_empty() {
+                d.to_owned()
+            } else {
+                p.join(" ")
+            }
+        };
         lists[0].push(or(&image, "none"));
         lists[1].push(or(&at, "0% 0%"));
         lists[2].push(or(&size, "auto"));
         lists[3].push(or(&rep, "repeat"));
         lists[4].push(boxes.first().map_or("padding-box", |b| *b).to_owned());
-        lists[5].push(boxes.get(1).or(boxes.first()).map_or("border-box", |b| *b).to_owned());
+        lists[5].push(
+            boxes
+                .get(1)
+                .or(boxes.first())
+                .map_or("border-box", |b| *b)
+                .to_owned(),
+        );
     }
     lists.map(|l| l.join(", "))
 }
@@ -818,7 +879,9 @@ fn position(v: &str) -> [Len; 2] {
     match w.as_slice() {
         [a] if vertical(a) => [center, kw(a).unwrap_or(center)],
         [a] => [kw(a).unwrap_or(Len::Pct(0.)), center],
-        [a, b] if vertical(a) || horizontal(b) => [kw(b).unwrap_or(center), kw(a).unwrap_or(center)],
+        [a, b] if vertical(a) || horizontal(b) => {
+            [kw(b).unwrap_or(center), kw(a).unwrap_or(center)]
+        }
         [a, b] => [kw(a).unwrap_or(Len::Pct(0.)), kw(b).unwrap_or(Len::Pct(0.))],
         _ => {
             let keys: Vec<&&str> = w.iter().filter(|w| !is_len(w)).collect();
@@ -927,7 +990,12 @@ pub(crate) fn inside(dir: &Path, url: &str) -> Option<PathBuf> {
     }
     const DEVICES: &[&str] = &["con", "prn", "aux", "nul", "conin$", "conout$"];
     for p in &parts {
-        let stem = p.split('.').next().unwrap_or_default().trim_end().to_ascii_lowercase();
+        let stem = p
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .trim_end()
+            .to_ascii_lowercase();
         let numbered = (stem.starts_with("com") || stem.starts_with("lpt"))
             && stem.len() == 4
             && stem.as_bytes()[3].is_ascii_digit();
@@ -935,7 +1003,10 @@ pub(crate) fn inside(dir: &Path, url: &str) -> Option<PathBuf> {
             return None;
         }
     }
-    let ext = Path::new(parts.last()?).extension()?.to_str()?.to_ascii_lowercase();
+    let ext = Path::new(parts.last()?)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
     PICTURES
         .contains(&ext.as_str())
         .then(|| parts.iter().fold(dir.to_path_buf(), |p, s| p.join(s)))
@@ -991,22 +1062,27 @@ fn read_whole(dir: &Path, path: &Path) -> io::Result<Vec<u8>> {
     if through_link(dir, path) {
         return Err(io::Error::other("A link in the look folder"));
     }
-    let mut f = fs::File::open(path)?;
+    let f = fs::File::open(path)?;
     if !f.metadata()?.is_file() {
         return Err(io::Error::other("Not a file"));
     }
     let mut bytes = Vec::new();
-    f.by_ref().take(MAX_FILE + 1).read_to_end(&mut bytes)?;
+    f.take(MAX_FILE + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_FILE {
         return Err(io::Error::other("Too big for a look file"));
     }
     Ok(bytes)
 }
-/// How a file looked: size, time and attributes, or not there. A change in any is a change to read.
+/// How a file looked: size, time and whether it's a link, or not there. A change in any is a change to read. (Two
+/// saves of the same size within one tick of the file system's clock look alike, which no person's saves are.)
 #[derive(Debug, Clone, PartialEq)]
 struct Stamp(Option<(u64, Option<SystemTime>, bool)>);
 fn stamp(p: &Path) -> Stamp {
-    Stamp(fs::symlink_metadata(p).ok().map(|m| (m.len(), m.modified().ok(), is_link(&m))))
+    Stamp(
+        fs::symlink_metadata(p)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok(), is_link(&m))),
+    )
 }
 
 /// A decoded picture: kept at most `MAX_SIDE` on its longest side, with the size CSS lays it out at.
@@ -1015,7 +1091,9 @@ pub(crate) struct Picture {
     pub natural: [u32; 2],
 }
 fn decode(bytes: &[u8]) -> Option<Picture> {
-    let mut r = image::ImageReader::new(io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut r = image::ImageReader::new(io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(16384);
     limits.max_image_height = Some(16384);
@@ -1029,7 +1107,10 @@ fn decode(bytes: &[u8]) -> Option<Picture> {
     let long = natural[0].max(natural[1]);
     let rgba = if long > MAX_SIDE {
         let k = MAX_SIDE as f32 / long as f32;
-        scale(&rgba, natural.map(|v| ((v as f32 * k).round() as u32).max(1)))?
+        scale(
+            &rgba,
+            natural.map(|v| ((v as f32 * k).round() as u32).max(1)),
+        )?
     } else {
         rgba
     };
@@ -1037,7 +1118,10 @@ fn decode(bytes: &[u8]) -> Option<Picture> {
 }
 /// `src` at `size`, with alpha taken into account so a logo's soft edges stay clean.
 fn scale(src: &RgbaImage, size: [u32; 2]) -> Option<RgbaImage> {
-    use fast_image_resize::{PixelType, Resizer, images::{Image, ImageRef}};
+    use fast_image_resize::{
+        PixelType, Resizer,
+        images::{Image, ImageRef},
+    };
     if src.dimensions() == (size[0], size[1]) {
         return Some(src.clone());
     }
@@ -1057,7 +1141,12 @@ pub(crate) struct Loaded {
 impl Loaded {
     fn changed(&self) -> Option<Vec<Stamp>> {
         let now: Vec<Stamp> = self.watch.iter().map(|(p, _)| stamp(p)).collect();
-        (!self.watch.iter().zip(&now).all(|((_, was), now)| was == now)).then_some(now)
+        (!self
+            .watch
+            .iter()
+            .zip(&now)
+            .all(|((_, was), now)| was == now))
+        .then_some(now)
     }
 }
 /// Read the look in `dir`. Never fails: whatever can't be read is left out.
@@ -1073,9 +1162,18 @@ pub(crate) fn load(dir: &Path) -> Loaded {
         watch.push((path.clone(), stamp(&path)));
         decode(&read_whole(dir, &path).ok()?)
     };
-    let logo = if spec.brand.hidden { None } else { picture(&spec.brand.picture) };
+    let logo = if spec.brand.hidden {
+        None
+    } else {
+        picture(&spec.brand.picture)
+    };
     let main = picture(&spec.main);
-    Loaded { spec, logo, main, watch }
+    Loaded {
+        spec,
+        logo,
+        main,
+        watch,
+    }
 }
 
 /// Makes the look folder with the starter look.css the first time (never over anything already there), and says
@@ -1086,7 +1184,11 @@ pub(crate) fn make_folder(dir: &Path) -> io::Result<(PathBuf, bool)> {
         return Ok((css, false));
     }
     fs::create_dir_all(dir)?;
-    match fs::OpenOptions::new().write(true).create_new(true).open(&css) {
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&css)
+    {
         Ok(mut f) => {
             f.write_all(STARTER.as_bytes())?;
             Ok((css, true))
@@ -1107,8 +1209,12 @@ enum Msg {
 fn worker(dir: PathBuf, rx: Receiver<Msg>, tx: Sender<Arc<Loaded>>, ctx: Context) {
     let (mut on, mut last, mut settling) = (false, None::<Arc<Loaded>>, None::<Vec<Stamp>>);
     loop {
+        // without a look.css (most people), once a second is enough to see one appear
+        let has_css = last
+            .as_ref()
+            .is_some_and(|l| l.watch.first().is_some_and(|(_, s)| s.0.is_some()));
         let msg = if on {
-            rx.recv_timeout(POLL)
+            rx.recv_timeout(if has_css { POLL } else { POLL * 4 })
         } else {
             rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
         };
@@ -1220,7 +1326,11 @@ pub fn frame(ctx: &Context, on: bool) {
         } else if !rt.waited {
             // the first look of the session: wait a moment for it, so String doesn't open in its own look and swap
             rt.waited = true;
-            if let Some(l) = rt.rx.as_ref().and_then(|rx| rx.recv_timeout(Duration::from_millis(300)).ok()) {
+            if let Some(l) = rt
+                .rx
+                .as_ref()
+                .and_then(|rx| rx.recv_timeout(Duration::from_millis(300)).ok())
+            {
                 rt.show(ctx, l);
             }
         }
@@ -1233,7 +1343,8 @@ pub fn frame(ctx: &Context, on: bool) {
 }
 impl Runtime {
     fn show(&mut self, ctx: &Context, look: Arc<Loaded>) {
-        *OVER.lock().unwrap() = [Tint::Mono, Tint::Arc, Tint::Ember].map(|t| look.spec.tint_over(t));
+        *OVER.lock().unwrap() =
+            [Tint::Mono, Tint::Arc, Tint::Ember].map(|t| look.spec.tint_over(t));
         // the pictures go to the screen when they're first drawn, at the size they're drawn
         self.shown = Some(Shown {
             look,
@@ -1263,7 +1374,8 @@ pub fn settled(on: bool) -> bool {
         (None, want) => !want,
         (Some(s), true) => {
             let b = &s.look.spec.brand;
-            (s.look.logo.is_none() || b.hidden || s.logo.is_some()) && (s.look.main.is_none() || s.main.is_some())
+            (s.look.logo.is_none() || b.hidden || s.logo.is_some())
+                && (s.look.main.is_none() || s.main.is_some())
         }
         (Some(_), false) => false,
     }
@@ -1299,7 +1411,10 @@ pub fn brand() -> BrandBox {
     }
     let pad = [0, 1, 2, 3].map(|i| b.padding[i].unwrap_or(BRAND_PAD[i]).min(200.));
     // border-box, as String's styles size everything: the height counts the padding, and never less than it
-    let height = b.height.unwrap_or(BRAND_HEIGHT).clamp(pad[0] + pad[2], 240.);
+    let height = b
+        .height
+        .unwrap_or(BRAND_HEIGHT)
+        .clamp(pad[0] + pad[2], 240.);
     BrandBox {
         height,
         pad,
@@ -1330,7 +1445,15 @@ pub fn paint_main(p: &Painter, r: Rect) {
     paint_layer(p, r, [0.; 4], layer, pic, &mut s.main, "look background");
 }
 /// Lays a picture out in a box as CSS's background does: origin and clip box, size, position and repeat.
-fn paint_layer(p: &Painter, border: Rect, pad: [f32; 4], layer: &Layer, pic: &Picture, tex: &mut Option<Tex>, name: &str) {
+fn paint_layer(
+    p: &Painter,
+    border: Rect,
+    pad: [f32; 4],
+    layer: &Layer,
+    pic: &Picture,
+    tex: &mut Option<Tex>,
+    name: &str,
+) {
     let content = Rect::from_min_max(
         pos2(border.left() + pad[3], border.top() + pad[0]),
         pos2(border.right() - pad[1], border.bottom() - pad[2]),
@@ -1348,7 +1471,11 @@ fn paint_layer(p: &Painter, border: Rect, pad: [f32; 4], layer: &Layer, pic: &Pi
     let size = match layer.fit {
         Fit::Cover | Fit::Contain => {
             let (a, b) = (area.width() / w0, area.height() / h0);
-            let k = if layer.fit == Fit::Cover { a.max(b) } else { a.min(b) };
+            let k = if layer.fit == Fit::Cover {
+                a.max(b)
+            } else {
+                a.min(b)
+            };
             vec2(w0 * k, h0 * k)
         }
         Fit::Sized(Some(w), Some(h)) => vec2(of(w, area.width()), of(h, area.height())),
@@ -1365,7 +1492,11 @@ fn paint_layer(p: &Painter, border: Rect, pad: [f32; 4], layer: &Layer, pic: &Pi
     if !(size.x >= 1. && size.y >= 1. && size.x < 1e5 && size.y < 1e5) {
         return;
     }
-    let min = area.min + vec2(of(layer.at[0], area.width() - size.x), of(layer.at[1], area.height() - size.y));
+    let min = area.min
+        + vec2(
+            of(layer.at[0], area.width() - size.x),
+            of(layer.at[1], area.height() - size.y),
+        );
     let tile = Rect::from_min_size(min, size);
     let (mut rect, mut uv) = (tile, Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)));
     // repeated: one rectangle over the whole clip box, the texture wrapping
@@ -1403,15 +1534,20 @@ fn paint_layer(p: &Painter, border: Rect, pad: [f32; 4], layer: &Layer, pic: &Pi
         } else {
             TextureOptions::LINEAR
         };
-        let image = ColorImage::from_rgba_unmultiplied([want[0] as usize, want[1] as usize], im.as_raw());
+        let image =
+            ColorImage::from_rgba_unmultiplied([want[0] as usize, want[1] as usize], im.as_raw());
         *tex = Some(Tex {
             handle: p.ctx().load_texture(name, image, opts),
             size: want,
         });
     }
     if let Some(t) = tex {
-        p.with_clip_rect(clip.intersect(p.clip_rect()))
-            .image(t.handle.id(), rect, uv, Color32::WHITE);
+        p.with_clip_rect(clip.intersect(p.clip_rect())).image(
+            t.handle.id(),
+            rect,
+            uv,
+            Color32::WHITE,
+        );
     }
 }
 
