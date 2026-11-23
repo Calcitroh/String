@@ -10,6 +10,14 @@ use std::sync::{
 const SEEN: &str = "iconCreditSeen";
 const TEXT_CREDIT: &str = "Credits to Discord — awepollyon for the icon!";
 static LOGO: Mutex<Option<TextureHandle>> = Mutex::new(None);
+// The Close button, while the card shows: Space or Enter on it closes the card instead of playing or pausing.
+static CLOSE: Mutex<Option<Id>> = Mutex::new(None);
+pub fn close_focused(ctx: &Context) -> bool {
+    CLOSE
+        .lock()
+        .unwrap()
+        .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
+}
 // The self-test never shows it on its own (its pictures would all have the card); a case asks for it.
 static IN_TEST: AtomicBool = AtomicBool::new(false);
 static DRAWN: AtomicBool = AtomicBool::new(false);
@@ -40,6 +48,7 @@ pub fn show(ctx: &Context, v: &mut View<'_>) {
     };
     DRAWN.store(false, Ordering::Relaxed);
     if !wanted {
+        *CLOSE.lock().unwrap() = None;
         return;
     }
     let mut closed = false;
@@ -63,7 +72,9 @@ pub fn show(ctx: &Context, v: &mut View<'_>) {
                         ui.add(egui::Image::new(&logo(ctx)).fit_to_exact_size(vec2(40., 40.)));
                         ui.label(RichText::new(TEXT_CREDIT).font(font("UI", 13.5)).color(TEXT));
                         let (r, _) = ui.allocate_exact_size(vec2(28., 28.), Sense::hover());
-                        closed = ui::icon_btn(ui, r, "x", "Close", false, v.tint).clicked();
+                        let close = ui::icon_btn(ui, r, "x", "Close", false, v.tint);
+                        *CLOSE.lock().unwrap() = Some(close.id);
+                        closed = close.clicked();
                     });
                 });
         });
