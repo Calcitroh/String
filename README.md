@@ -3,6 +3,10 @@
 Your own songs, played like a streaming app. No ads, no accounts, no cloud: String plays the music files in the
 folders you pick, where they are, and doesn't change them. Dark and monochrome, for Windows 10 and 11.
 
+> Before anything else, yes this is vibe coded. It also works! (hopefully)
+>
+> Icon's humanmade though, (DC - awepollyon) Thanks Bro <3
+
 - **Library:** Home, Songs, Albums, Artists, Liked, playlists and search. Songs, Liked and playlists have a filter box.
   Add folders in Library (the gear at the top) or drop them on the window.
 - **Playing:** a queue (songs you add play first; drag songs onto the queue button) with a Recent tab, shuffle, repeat,
