@@ -42,6 +42,65 @@ fn started(events: &Arc<Mutex<Vec<Event>>>) -> Vec<u64> {
         .collect()
 }
 
+#[test]
+fn editing_or_seeking_in_the_last_milliseconds_keeps_the_right_successor() {
+    let dir = scratch("late-handover");
+    let tracks: Vec<_> = [44_100, SR, 32_000]
+        .into_iter()
+        .enumerate()
+        .map(|(i, rate)| {
+            let path = dir.join(format!("{i}.wav"));
+            write_wav(&path, rate, &level(0.25, rate as usize * 4));
+            Track::new(i as u64, path)
+        })
+        .collect();
+    for op in ["queue", "seek", "loop"] {
+        let host = Shared {
+            list: Arc::new(Mutex::new(tracks.clone())),
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut p = OfflinePlayer::new(SR, Config::default(), host.clone());
+        p.play_track(tracks[0].clone(), 0.);
+        if op == "loop" {
+            p.set_loop(Some(string_audio::LoopRange {
+                start: 0.5,
+                end: None,
+            }));
+        }
+        p.render_secs(3.997);
+        let successor = match op {
+            "queue" => {
+                host.list.lock().unwrap().remove(1);
+                p.queue_changed();
+                2
+            }
+            "seek" => {
+                p.seek(2.);
+                p.render_secs(0.5);
+                assert_eq!(
+                    p.status().key,
+                    Some(0),
+                    "seek handed over before taking effect"
+                );
+                assert!((2.35..2.51).contains(&p.status().position));
+                p.render_secs(1.6);
+                1
+            }
+            _ => {
+                p.set_loop(None);
+                1
+            }
+        };
+        p.render_secs(0.25);
+        assert_eq!(p.status().key, Some(successor), "{op}");
+        assert!(
+            p.status().playing && started(&host.events) == [0, successor],
+            "{op}"
+        );
+        assert!(!host.events.lock().unwrap().contains(&Event::Stopped));
+    }
+}
+
 /// Song A (3 s, numbered), B (1 s at 0.3), C (1 s at 0.6).
 fn songs(name: &str) -> [Track; 3] {
     let dir = scratch(name);

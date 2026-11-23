@@ -27,6 +27,8 @@ pub(crate) enum Handover {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Cmd {
+    /// Silence the old selection if opening its replacement takes another callback.
+    Selecting,
     /// An idle deck holds era `era` now (a song made ready, not playing).
     Load { deck: usize, era: u32 },
     /// `deck` plays era `era` (another song) as the current song; what played fades out over
@@ -61,16 +63,27 @@ pub(crate) enum Cmd {
     Spectrum(bool),
 }
 
+impl Cmd {
+    pub fn assignment(self) -> Option<(usize, u32)> {
+        match self {
+            Self::Load { deck, era }
+            | Self::Seek { deck, era, .. }
+            | Self::Replace { deck, era, .. } => Some((deck, era)),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Evt {
     /// `deck` holds the current song now.
-    Current { deck: usize },
+    Current,
     /// Song `handle` is heard: it began, or took over.
     Started { handle: u32 },
     /// Song `handle` played to its last frame.
     Ended { handle: u32 },
     /// `deck` is silent and nothing is armed on it: the engine may load it.
-    Freed { deck: usize },
+    Freed,
     /// The current song ran out and nothing followed.
     Finished { handle: u32 },
 }
@@ -101,6 +114,8 @@ struct Pending {
 }
 
 struct Deck {
+    /// Load or seek command this deck last accepted, including a seek still fading out.
+    assignment: u32,
     samples: rtrb::Consumer<f32>,
     markers: rtrb::Consumer<Marker>,
     read: u64,
@@ -130,6 +145,7 @@ struct Deck {
 impl Deck {
     fn new(samples: rtrb::Consumer<f32>, markers: rtrb::Consumer<Marker>) -> Deck {
         Deck {
+            assignment: 0,
             samples,
             markers,
             read: 0,
@@ -176,6 +192,14 @@ impl Deck {
                 }
                 if m.at > self.read {
                     break;
+                }
+                if let Some(p) = self.pending
+                    && matches!(m.kind, MarkerKind::Begin { .. })
+                    && m.era >= p.era
+                {
+                    // The old audio ran out before its seek fade did. Apply the switch
+                    // before consuming the only Begin marker for the requested position.
+                    self.switch_to(p.era, p.in_);
                 }
                 let _ = self.markers.pop();
                 match m.kind {
@@ -292,13 +316,15 @@ pub(crate) struct Mixer {
     rate: u32,
     decks: [Deck; 2],
     cmds: rtrb::Consumer<Cmd>,
-    events: rtrb::Producer<Evt>,
+    events: rtrb::Producer<(usize, u32, Evt)>,
     cur: Option<usize>,
     armed: Option<Armed>,
     /// The song last reported as started.
     started: u32,
     transport: Envelope,
     running: bool,
+    /// When the last frame mixed for a device will have played (on the player's clock).
+    audible_until: u64,
     volume: f32,
     volume_target: f32,
     volume_k: f32,
@@ -310,7 +336,7 @@ pub(crate) struct Mixer {
 /// The engine's ends of the mixer's command and event rings.
 pub(crate) struct Link {
     pub cmds: rtrb::Producer<Cmd>,
-    pub events: rtrb::Consumer<Evt>,
+    pub events: rtrb::Consumer<(usize, u32, Evt)>,
 }
 
 impl Mixer {
@@ -333,6 +359,7 @@ impl Mixer {
             started: 0,
             transport: Envelope::steady(1.0),
             running: false,
+            audible_until: 0,
             volume: 1.0,
             volume_target: 1.0,
             volume_k: volume_k(rate),
@@ -353,6 +380,10 @@ impl Mixer {
         self.rate
     }
 
+    pub fn drained(&self, now_ns: u64) -> bool {
+        (!self.running || self.decks.iter().all(|d| !d.audible())) && now_ns >= self.audible_until
+    }
+
     /// A new output rate (the engine reloads what plays).
     pub fn set_rate(&mut self, rate: u32) {
         self.rate = rate;
@@ -362,13 +393,10 @@ impl Mixer {
 
     /// The old stream has stopped. Keep the last rendered position, and freeze interpolation
     /// until the next device publishes a frame. Transport intent still belongs to the engine.
-    pub fn output_waiting(&mut self, playing: bool) {
+    pub fn output_waiting(&mut self) {
         let mut snapshot = [0; 7];
         self.position.read(&mut snapshot);
-        snapshot[1] = (snapshot[1] & !FLAG_PLAYING) | FLAG_NO_OUTPUT;
-        if playing {
-            snapshot[1] |= FLAG_PLAYING;
-        }
+        snapshot[1] |= FLAG_PLAYING | FLAG_NO_OUTPUT;
         self.position.write(&snapshot);
     }
 
@@ -382,6 +410,15 @@ impl Mixer {
             if let Some(pending) = deck.pending.take() {
                 deck.switch_to(pending.era, 0);
             }
+        }
+    }
+
+    /// Before a new device starts, discard buffered frames from retired loads so the
+    /// feeder has space for the first real callback, even after a sample-rate change.
+    pub fn prime(&mut self) {
+        self.commands();
+        for deck in &mut self.decks {
+            deck.settle();
         }
     }
 
@@ -401,8 +438,8 @@ impl Mixer {
         self.decks.each_ref().map(|deck| deck.era)
     }
 
-    fn emit(&mut self, e: Evt) {
-        let _ = self.events.push(e);
+    fn emit(&mut self, deck: usize, e: Evt) {
+        let _ = self.events.push((deck, self.decks[deck].assignment, e));
     }
 
     fn release(&mut self, d: usize) {
@@ -416,13 +453,13 @@ impl Mixer {
         if self.armed.is_some_and(|a| a.deck == d) {
             self.armed = None;
         }
-        self.emit(Evt::Freed { deck: d });
+        self.emit(d, Evt::Freed);
     }
 
     fn set_current(&mut self, d: usize) {
         if self.cur != Some(d) {
             self.cur = Some(d);
-            self.emit(Evt::Current { deck: d });
+            self.emit(d, Evt::Current);
         }
     }
 
@@ -432,7 +469,7 @@ impl Mixer {
             && a.deck != keep
             && self.decks[a.deck].role == Role::Idle
         {
-            self.emit(Evt::Freed { deck: a.deck });
+            self.emit(a.deck, Evt::Freed);
         }
         let o = 1 - keep;
         if self.decks[o].audible() {
@@ -447,8 +484,13 @@ impl Mixer {
     }
 
     fn commands(&mut self) {
+        let mut selecting = false;
         while let Ok(cmd) = self.cmds.pop() {
+            if let Some((deck, era)) = cmd.assignment() {
+                self.decks[deck].assignment = era;
+            }
             match cmd {
+                Cmd::Selecting => selecting = true,
                 Cmd::Load { deck, era } => {
                     if self.armed.is_some_and(|a| a.deck == deck) {
                         self.armed = None;
@@ -468,6 +510,7 @@ impl Mixer {
                     out,
                     in_,
                 } => {
+                    selecting = false;
                     self.quiet_others(deck, out);
                     self.change(deck, era, out, in_);
                     self.set_current(deck);
@@ -479,6 +522,7 @@ impl Mixer {
                     out,
                     in_,
                 } => {
+                    self.end_crossfade();
                     if self.cur != Some(deck) {
                         // the song moved on to the other deck just now: back to this one
                         self.quiet_others(deck, out);
@@ -505,11 +549,14 @@ impl Mixer {
                     }
                 }
                 Cmd::Disarm => {
-                    if let Some(a) = self.armed
-                        && a.started.is_none()
-                    {
-                        self.armed = None;
-                        self.emit(Evt::Freed { deck: a.deck });
+                    if let Some(a) = self.armed.take() {
+                        if a.started.is_some()
+                            && matches!(a.how, Handover::Jump { .. })
+                            && let Some(c) = self.cur
+                        {
+                            self.decks[c].gain.set(1.0);
+                        }
+                        self.release(a.deck);
                     }
                 }
                 Cmd::Release { deck, out } => {
@@ -536,6 +583,7 @@ impl Mixer {
                         self.running = true;
                         self.transport.ramp(1.0, fade, Shape::Linear);
                     } else if self.running {
+                        self.end_crossfade();
                         self.transport.ramp(0.0, fade, Shape::Linear);
                         if fade == 0 {
                             self.running = false;
@@ -551,6 +599,21 @@ impl Mixer {
                 }
                 Cmd::Spectrum(on) => self.spectrum_on = on,
             }
+        }
+        if selecting {
+            // A quick successful open uses the normal replacement fade. A slow open
+            // must not leave the previous song playing while the engine waits for I/O.
+            self.running = false;
+            self.transport.set(0.0);
+        }
+    }
+
+    fn end_crossfade(&mut self) {
+        if let Some(c) = self.cur
+            && self.decks[1 - c].role == Role::Fading
+        {
+            self.release(1 - c);
+            self.decks[c].gain.set(1.0);
         }
     }
 
@@ -589,6 +652,11 @@ impl Mixer {
             }
             let n = self.run_length(ready, frames - done);
             if n == 0 {
+                // An empty ring renders silence. A pause still finishes on device time.
+                if self.transport.target() == 0.0 {
+                    self.transport.advance(frames - done);
+                    self.running = self.transport.moving();
+                }
                 break;
             }
             spins = 0;
@@ -608,6 +676,9 @@ impl Mixer {
         }
         if self.spectrum_on {
             self.analyser.feed(out);
+        }
+        if done > 0 {
+            self.audible_until = heard_at + done as u64 * 1_000_000_000 / self.rate as u64;
         }
         self.apply_volume(out);
         self.publish(heard_at + frames as u64 * 1_000_000_000 / self.rate as u64);
@@ -629,7 +700,7 @@ impl Mixer {
         // songs that reached their end
         for d in 0..2 {
             if let Some(handle) = self.decks[d].ended_now.take() {
-                self.emit(Evt::Ended { handle });
+                self.emit(d, Evt::Ended { handle });
             }
         }
         // outgoing decks that are done
@@ -652,7 +723,12 @@ impl Mixer {
         {
             self.started = self.decks[c].handle;
             let handle = self.started;
-            self.emit(Evt::Started { handle });
+            self.emit(c, Evt::Started { handle });
+        }
+        // A seek or replacement owns this deck. Its outgoing frames can reach EOF
+        // during the short fade; never hand over based on that discarded position.
+        if self.decks[c].pending.is_some() {
+            return false;
         }
         if let Some(a) = self.armed {
             let o = a.deck;
@@ -765,8 +841,9 @@ impl Mixer {
         if cd.begun && cd.stopped && cd.pending.is_none() && self.armed.is_none() {
             let handle = cd.handle;
             self.release(c);
-            self.running = false;
-            self.emit(Evt::Finished { handle });
+            // Only the engine knows whether the queue ended. Keep transport intent
+            // through its decision, including a seek racing this final callback.
+            self.emit(c, Evt::Finished { handle });
             return true;
         }
         false
