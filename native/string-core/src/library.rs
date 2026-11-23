@@ -14,6 +14,16 @@ pub fn track_id(path: &str) -> String {
     path.to_lowercase()
 }
 
+/// Convert the path kept in a profile to the operating system's filename.
+pub fn native_path(saved: &str) -> PathBuf {
+    #[cfg(windows)]
+    if saved.contains('\0') {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+        return OsString::from_wide(&crate::data::text::units(saved)).into();
+    }
+    PathBuf::from(saved)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Track {
@@ -44,10 +54,7 @@ impl Track {
     #[cfg(windows)]
     fn selected_wide_path_exists(&self, roots: &[PathBuf], loose: &[PathBuf]) -> bool {
         use crate::data::text;
-        use std::{
-            ffi::OsString,
-            os::windows::ffi::{OsStrExt, OsStringExt},
-        };
+        use std::os::windows::ffi::OsStrExt;
         if !self.path.contains('\0') {
             return false;
         }
@@ -66,8 +73,7 @@ impl Track {
         {
             return false;
         }
-        let path = OsString::from_wide(&text::units(&self.path));
-        match std::fs::metadata(path) {
+        match std::fs::metadata(native_path(&self.path)) {
             Ok(meta) => meta.is_file(),
             Err(e) => e.kind() != io::ErrorKind::NotFound,
         }

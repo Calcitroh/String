@@ -5,6 +5,7 @@ mod snapshot;
 use crate::{Fields, queue::Queue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(from = "SavedState")]
@@ -34,14 +35,35 @@ impl From<SavedState> for State {
         }
         if let Some(playlists) = fields["playlists"].as_array_mut() {
             playlists.retain(Value::is_object);
+            // Reserve even later IDs before assigning replacements. Keep the first owner of a
+            // duplicate ID, so existing references still address the same playlist.
+            let mut reserved: HashSet<String> = playlists
+                .iter()
+                .filter_map(|p| p["id"].as_str().map(str::to_owned))
+                .collect();
+            let mut seen = HashSet::new();
+            let mut serial = 0;
             for playlist in playlists {
+                // A legacy row with neither field is preserved but never offered for ID-based actions.
+                if (playlist.get("id").is_some() || playlist.get("name").is_some())
+                    && !playlist["id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty() && seen.insert(id.to_owned()))
+                {
+                    loop {
+                        serial += 1;
+                        let id = format!("recovered-{serial}");
+                        if reserved.insert(id.clone()) {
+                            playlist["id"] = id.into();
+                            break;
+                        }
+                    }
+                }
                 if !playlist["items"].is_array() {
                     playlist["items"] = json!([]);
                 }
-                for key in ["id", "name"] {
-                    if playlist.get(key).is_some_and(|v| !v.is_string()) {
-                        playlist[key] = "".into();
-                    }
+                if playlist.get("name").is_some_and(|v| !v.is_string()) {
+                    playlist["name"] = "".into();
                 }
             }
         }

@@ -174,7 +174,7 @@ impl Session {
         self.sequence
     }
     fn track(&self, id: &str, key: u64) -> Option<Track> {
-        Some(Track::new(key, &self.models.by_id.get(id)?.path).with_loop(self.loop_for(id)))
+        Some(Track::new(key, string_core::library::native_path(&self.models.by_id.get(id)?.path)).with_loop(self.loop_for(id)))
     }
     pub fn load_current(&mut self, p: &Player, start: bool, pos: f64) {
         self.pending = None;

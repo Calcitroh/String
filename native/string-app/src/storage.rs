@@ -104,6 +104,12 @@ pub struct Storage {
 impl Storage {
     pub fn open(folder: &DataFolder, ctx: &Context) -> io::Result<(Self, Session)> {
         let mut profile: Profile = folder.open()?;
+        if !profile.state.exists() && !profile.library.value.tracks.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "state.json is missing. Restore it from backup before opening this saved library.",
+            ));
+        }
         // Copy the original bytes after a good load and before handing any caller a writer.
         let mut feedback = Feedback::default();
         if let Err(e) = folder.keep_opening_copy() {
@@ -282,6 +288,126 @@ fn broken() -> Receipt {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn playlist_actions_edit_only_the_selected_recovered_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = folder(dir.path(), true);
+        fs::write(dir.path().join("state.json"), br#"{"playlists":[{"id":4,"name":"First","items":["a"]},{"id":false,"name":"Second","items":["b"]}]}"#).unwrap();
+        let (mut store, mut s) = Storage::open(&folder, &Context::default()).unwrap();
+        let lists = &s.state.fields["playlists"];
+        let first = lists[0].clone();
+        let second = lists[1]["id"].as_str().unwrap().to_owned();
+        s.playlist_rename(&second, "Changed");
+        s.add_to_playlist(&second, vec!["new".to_string()].into());
+        assert_eq!(s.state.fields["playlists"][1]["items"][1]["id"], "new");
+        assert_eq!(s.playlist_delete(&second).as_deref(), Some("Changed"));
+        assert!(!store.flush(&mut s).failed());
+        assert_eq!(
+            folder.open().unwrap().state.value.fields["playlists"],
+            serde_json::json!([first])
+        );
+    }
+
+    #[test]
+    fn phone_sync_skips_credited_plays_and_suspends_only_an_unresolved_account() {
+        use string_extras::phone::{choose, sync};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("fixture.db");
+        let output = std::process::Command::new("node")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fake-navidrome.js"))
+            .arg(&db)
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let folder = folder(dir.path(), true);
+        let path = dir.path().join("listening.json");
+        fs::write(
+            &path,
+            br#"{"phoneImport":{"after":{"u1":"2","u2":{"unresolved":true}},"plays":2}}"#,
+        )
+        .unwrap();
+        let mut p = folder.open().unwrap();
+        assert_eq!(choose(&mut p, &db, "u2").unwrap().added, 0);
+        assert_eq!(choose(&mut p, &db, "u1").unwrap().added, 2);
+        let mut reopened = folder.open().unwrap();
+        assert_eq!(sync(&mut reopened, &db).unwrap().added, 0);
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["phoneImport"]["after"]["u2"]["unresolved"], true);
+        assert_eq!(saved["phoneImport"]["after"]["u1"], 4);
+        assert_eq!(saved["phoneImport"]["plays"], 4);
+    }
+
+    #[test]
+    fn missing_state_with_cached_tracks_cannot_start_a_pruning_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = folder(dir.path(), true);
+        let cache = br#"{"v":1,"tracks":[{"path":"offline.wav","added":22,"extension":3}]}"#;
+        fs::write(dir.path().join("library.json"), cache).unwrap();
+        assert!(Storage::open(&folder, &Context::default()).is_err());
+        assert_eq!(fs::read(dir.path().join("library.json")).unwrap(), cache);
+        fs::write(dir.path().join("state.json"), b"{}").unwrap();
+        assert!(Storage::open(&folder, &Context::default()).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn opens_a_saved_wide_filename_on_the_paused_deck() {
+        use std::{
+            ffi::OsString,
+            os::windows::ffi::OsStringExt,
+            sync::{Arc, Mutex},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let name = OsString::from_wide(&[0xd800, 46, 119, 97, 118]);
+        let song = dir.path().join(name);
+        let mut wave = b"RIFF".to_vec();
+        wave.extend(16036u32.to_le_bytes());
+        wave.extend(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
+        wave.extend(8000u32.to_le_bytes());
+        wave.extend(16000u32.to_le_bytes());
+        wave.extend(b"\x02\0\x10\0data");
+        wave.extend(16000u32.to_le_bytes());
+        wave.resize(16044, 0);
+        fs::write(&song, wave).unwrap();
+        let prefix = serde_json::to_string(dir.path().to_str().unwrap()).unwrap();
+        let path = format!(r#"{}\\\ud800.wav""#, &prefix[..prefix.len() - 1]);
+        fs::write(
+            dir.path().join("library.json"),
+            format!(r#"{{"tracks":[{{"path":{path}}}]}}"#),
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("state.json"),
+            format!(
+                r#"{{"queue":{{"items":[{}],"at":0}}}}"#,
+                path.to_lowercase()
+            ),
+        )
+        .unwrap();
+        let ctx = Context::default();
+        let (_store, s) = Storage::open(&folder(dir.path(), true), &ctx).unwrap();
+        let session = Arc::new(Mutex::new(s));
+        let player = crate::playback::open(&session, &ctx, true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = player.status();
+            if status.duration.is_some_and(|d| d > 0.) {
+                assert!(!status.playing);
+                break;
+            }
+            let s = session.lock().unwrap();
+            assert!(s.notices.is_empty(), "{:?}", s.notices);
+            assert!(Instant::now() < deadline, "saved song was never cued");
+            drop(s);
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 
     #[test]
     fn retry_saves_the_latest_edit_after_the_file_becomes_writable() {

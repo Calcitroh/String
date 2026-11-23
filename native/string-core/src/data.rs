@@ -14,6 +14,9 @@ use tempfile::NamedTempFile;
 pub(crate) mod text;
 use serde_json::{Value, json};
 
+#[cfg(test)]
+mod profile_tests;
+
 pub(crate) fn object(value: Value) -> crate::Fields {
     match value {
         Value::Object(fields) => fields,
@@ -73,6 +76,7 @@ pub struct DataFolder {
 pub struct Document<T> {
     folder: DataFolder,
     previous: Option<[u8; 32]>,
+    daily_written: Option<NaiveDate>,
     pub value: T,
 }
 #[derive(Debug)]
@@ -101,13 +105,25 @@ fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::
 }
 fn decode<T: Model>(bytes: &[u8]) -> io::Result<T> {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    let parsed = serde_json::from_slice::<Value>(&text::read_json(bytes)).map_err(invalid)?;
-    let mut fields = object(parsed);
-    // A numeric version for a different format must never be rewritten as version one.
+    let json = text::read_json(bytes);
+    let parsed = match serde_json::from_slice::<Value>(&json) {
+        Ok(value) => value,
+        // A syntactically broken cache can be rebuilt. A well-formed document in another
+        // format must never become a writable empty cache.
+        Err(_)
+            if T::CACHE
+                && serde_json::from_slice::<&serde_json::value::RawValue>(&json).is_err() =>
+        {
+            return Ok(T::default());
+        }
+        Err(e) => return Err(invalid(e)),
+    };
+    let Value::Object(mut fields) = parsed else {
+        return Err(invalid("expected a document object"));
+    };
     if fields
         .get("v")
-        .and_then(Value::as_f64)
-        .is_some_and(|v| v != 1.)
+        .is_some_and(|v| v.as_f64() != Some(1.) && v.as_str() != Some("1"))
     {
         return Err(invalid("unsupported document version"));
     }
@@ -146,15 +162,13 @@ impl DataFolder {
         let result = (|| {
             let bytes = read_existing(&path)?;
             let value = match bytes.as_deref() {
-                Some(b) => match decode(b) {
-                    Err(_) if T::CACHE => T::default(),
-                    result => result?,
-                },
+                Some(b) => decode(b)?,
                 None => T::default(),
             };
             Ok(Document {
                 folder: self.clone(),
                 previous: bytes.as_deref().map(hash),
+                daily_written: None,
                 value,
             })
         })();
@@ -165,7 +179,9 @@ impl DataFolder {
     /// day, so a profile another version of String saved earlier the same day would otherwise have no copy from before
     /// this version's first save (and with a file missing, today's backup of it may be the only copy left).
     pub fn keep_opening_copy(&self) -> io::Result<()> {
-        let date = Local::now().date_naive();
+        self.keep_opening_copy_for(Local::now().date_naive())
+    }
+    fn keep_opening_copy_for(&self, date: NaiveDate) -> io::Result<()> {
         let days = self.backup.join("opened");
         let today = days.join(date.to_string());
         if today.is_dir() {
@@ -177,21 +193,26 @@ impl DataFolder {
                 format!("{} is in the way", today.display()),
             ));
         }
-        let staging = days.join(".copying");
-        if staging.exists() {
-            fs::remove_dir_all(&staging)?;
-        }
-        fs::create_dir_all(&staging)?;
+        fs::create_dir_all(&days)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".copying-")
+            .tempdir_in(&days)?;
+        let dir = staging.path();
         for name in [State::NAME, Listening::NAME, Library::NAME] {
             if let Some(bytes) = read_existing(&self.root.join(format!("{name}.json")))? {
-                replace(&staging, &staging.join(format!("{name}.json")), &bytes)?;
+                replace(dir, &dir.join(format!("{name}.json")), &bytes)?;
             }
             let daily = format!("{name}-{date}.json");
             if let Some(bytes) = read_existing(&self.backup.join(&daily))? {
-                replace(&staging, &staging.join(daily), &bytes)?;
+                replace(dir, &dir.join(daily), &bytes)?;
             }
         }
-        fs::rename(&staging, &today)?;
+        if let Err(e) = fs::rename(dir, &today) {
+            if today.is_dir() {
+                return Ok(());
+            }
+            return Err(e);
+        }
         let mut kept = vec![];
         for entry in fs::read_dir(&days)? {
             let entry = entry?;
@@ -211,29 +232,33 @@ impl DataFolder {
     }
     /// Load the whole profile before enabling saves in the application.
     pub fn open(&self) -> io::Result<Profile> {
+        let state = self.read::<State>()?;
+        let mut listening = self.read::<Listening>()?;
+        if let Some(status) = state.value.fields.get("phone") {
+            listening.value.recover_legacy_cursor(status);
+        }
         Ok(Profile {
-            state: self.read()?,
-            listening: self.read()?,
+            state,
+            listening,
             library: self.read()?,
         })
     }
 }
 
-fn replace(dir: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
+fn stage(dir: &Path, bytes: &[u8]) -> io::Result<NamedTempFile> {
     let mut temp = NamedTempFile::new_in(dir)?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
-    temp.persist(target).map_err(|e| e.error)?;
+    Ok(temp)
+}
+fn replace(dir: &Path, target: &Path, bytes: &[u8]) -> io::Result<()> {
+    stage(dir, bytes)?.persist(target).map_err(|e| e.error)?;
     Ok(())
 }
-fn backup(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
+fn backup(dir: &Path, name: &str, date: NaiveDate, bytes: &[u8]) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     let prefix = format!("{name}-");
-    replace(
-        dir,
-        &dir.join(format!("{prefix}{}.json", Local::now().date_naive())),
-        bytes,
-    )?;
+    replace(dir, &dir.join(format!("{prefix}{date}.json")), bytes)?;
     let mut dates = vec![];
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -256,6 +281,36 @@ fn backup(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 impl<T: Model> Document<T> {
+    fn protect_inherited_daily(&self, date: NaiveDate) -> io::Result<()> {
+        if self.daily_written == Some(date) {
+            return Ok(());
+        }
+        let name = format!("{}-{date}.json", T::NAME);
+        let Some(bytes) = read_existing(&self.folder.backup.join(&name))? else {
+            return Ok(());
+        };
+        self.folder.keep_opening_copy_for(date)?;
+        let opened = self.folder.backup.join("opened").join(date.to_string());
+        let digest = hash(&bytes);
+        if self.previous == Some(digest)
+            || read_existing(&opened.join(name))?.as_deref() == Some(&bytes)
+        {
+            return Ok(());
+        }
+        // Another writer may have made a different daily backup since the morning's
+        // snapshot. With a missing or different live file this could be its only copy.
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        let kept = opened.join(format!("{}-daily-{hex}.json", T::NAME));
+        match stage(&opened, &bytes)?.persist_noclobber(&kept) {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.error.kind() == io::ErrorKind::AlreadyExists && fs::read(kept)? == bytes =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e.error),
+        }
+    }
     pub fn exists(&self) -> bool {
         self.previous.is_some()
     }
@@ -292,9 +347,18 @@ impl<T: Model> Document<T> {
         }
         let digest = hash(&bytes);
         let bytes_changed = self.previous != Some(digest);
+        let date = Local::now().date_naive();
+        // Before this writer first replaces today's backup, secure the copy it inherited.
+        // Retry even after a live save succeeded: the daily file may still be the only good copy.
+        let protect_daily = self.protect_inherited_daily(date);
         replace(dir, &path, &bytes)?;
         self.previous = Some(digest);
-        let backup_error = backup(&self.folder.backup, T::NAME, &bytes).err();
+        let backup_error = protect_daily
+            .and_then(|()| backup(&self.folder.backup, T::NAME, date, &bytes))
+            .err();
+        if backup_error.is_none() {
+            self.daily_written = Some(date);
+        }
         Ok(SaveResult {
             bytes_changed,
             backup_error,
