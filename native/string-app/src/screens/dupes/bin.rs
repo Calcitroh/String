@@ -1,6 +1,8 @@
 //! Ask the Recycle Bin itself where Restore will put the item identified by the file handle.
 use std::{
+    ffi::OsString,
     io,
+    os::windows::ffi::OsStringExt,
     path::{Path, PathBuf},
 };
 use windows::{
@@ -48,19 +50,16 @@ impl Bin {
         })
     }
     pub fn restore_path(&self, physical: &Path) -> io::Result<PathBuf> {
-        let name = physical
-            .to_str()
-            .ok_or_else(|| io::Error::other("The recycled name could not be read"))?;
-        let name = HSTRING::from(name.trim_start_matches(r"\\?\"));
+        let name = HSTRING::from(super::files::dos_path(physical).as_os_str());
         let item: IShellItem2 = unsafe { SHCreateItemFromRelativeName(&self.folder, &name, None)? };
-        let property = |key: &PROPERTYKEY| -> io::Result<String> {
+        let property = |key: &PROPERTYKEY| -> io::Result<OsString> {
             let raw = unsafe { item.GetString(key)? };
             if raw.is_null() {
                 return Err(io::Error::other("The restore location is unavailable"));
             }
-            let text = unsafe { raw.to_string() };
+            let text = OsString::from_wide(unsafe { raw.as_wide() });
             unsafe { CoTaskMemFree(Some(raw.0.cast())) };
-            text.map_err(io::Error::other)
+            Ok(text)
         };
         Ok(PathBuf::from(property(&self.directory)?).join(property(&self.name)?))
     }

@@ -22,11 +22,10 @@ use files::{Checked, Pair, Stamp};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
     sync::{LazyLock, Mutex, MutexGuard},
 };
 use string_core::{
-    library::{Library, Track},
+    library::{Library, Track, native_path},
     state::State as Saved,
 };
 use string_extras::{
@@ -85,6 +84,7 @@ struct Problem {
 struct Progress {
     next: usize,
     moved: usize,
+    merged_ids: HashSet<String>,
     failed: Vec<String>,
 }
 struct Recycling {
@@ -96,6 +96,7 @@ struct Recycling {
 #[derive(Default)]
 pub struct State {
     groups: Vec<Group>,
+    locations: [Value; 2],
     basis: Option<Basis>,
     look_number: u64,
     looking: Option<(Basis, Task<Vec<Group>>)>,
@@ -192,6 +193,7 @@ impl State {
         }
     }
     fn look(&mut self, ctx: &Context, s: &Session) {
+        self.locations = ["roots", "files"].map(|key| s.field(key).clone());
         self.ctx = Some(ctx.clone());
         self.look_number += 1;
         self.basis = None;
@@ -244,7 +246,7 @@ impl State {
                     .iter()
                     .map(|id| {
                         let t = tracks.get(id)?;
-                        let path = std::path::Path::new(&t.path);
+                        let path = native_path(&t.path);
                         let names = display_names(state, t);
                         let kbps = if t.tags.duration > 0. && t.size > 0 {
                             (t.size as f64 * 8. / t.tags.duration / 1000.).round() as u64
@@ -362,7 +364,7 @@ impl State {
         }
     }
     fn plan(&self, s: &Session, intent: Intent) -> Result<Vec<Pair>, Problem> {
-        if self.basis != Some(basis(s)) {
+        if self.basis != Some(basis(s)) || self.locations_removed(s, None) {
             return Err(self.changed());
         }
         let tracks: HashMap<_, _> = s.library.tracks.iter().map(|t| (t.id(), t)).collect();
@@ -390,7 +392,7 @@ impl State {
                     continue;
                 };
                 if intent != Intent::Hide
-                    && !crate::integration::files::recyclable_song(std::path::Path::new(&copy.path))
+                    && !crate::integration::files::recyclable_song(&native_path(&copy.path))
                 {
                     refused.push(d.id.clone());
                     reason.get_or_insert_with(|| {
@@ -441,7 +443,7 @@ impl State {
         let result = self.checking.as_ref()?.2.poll()?;
         let (intent, revision, _) = self.checking.take()?;
         match result {
-            Ok(_) if revision != basis(s) => {
+            Ok(_) if revision != basis(s) || self.locations_removed(s, None) => {
                 self.refuse(self.changed());
                 None
             }
@@ -517,19 +519,71 @@ impl State {
         progress: &mut Progress,
         s: &Session,
     ) -> Option<(usize, Track)> {
+        let removed = self.locations_removed(s, None);
         while let Some(copy) = checked.plan.get(progress.next) {
             let at = progress.next;
             progress.next += 1;
-            if let Some(drop) = self.matching_drop(s, copy, None) {
+            if !removed && let Some(drop) = self.matching_drop(s, copy, None) {
                 return Some((at, drop.clone()));
             }
             self.choose_drop(copy.drop_id.clone(), false);
-            progress.failed.push(format!(
-                "{} no longer matches the reviewed pair and was left in place",
-                copy.path
-            ));
+            let path = native_path(&copy.path);
+            progress.failed.push(if removed {
+                format!(
+                    "{} was left in place because a library location was removed.",
+                    path.display()
+                )
+            } else {
+                format!(
+                    "{} no longer matches the reviewed pair and was left in place",
+                    path.display()
+                )
+            });
         }
         None
+    }
+    // Stop unstarted moves on removal. For a move already confirmed by Windows,
+    // only a removed location that could contain its keeper affects the transfer.
+    fn locations_removed(&self, s: &Session, keeper_id: Option<&str>) -> bool {
+        self.locations
+            .iter()
+            .zip(["roots", "files"])
+            .any(|(before, key)| {
+                let after = s.field(key);
+                if before == after {
+                    return false;
+                }
+                let current: HashSet<_> = after
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                before
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .any(|p| {
+                        !current.contains(p)
+                            && keeper_id.is_none_or(|id| {
+                                let location = files::dos_path(&native_path(&p.to_lowercase()));
+                                let keeper = files::dos_path(&native_path(id));
+                                if !location.is_absolute()
+                                    || location
+                                        .components()
+                                        .any(|c| c == std::path::Component::ParentDir)
+                                {
+                                    return true;
+                                }
+                                if key == "roots" {
+                                    keeper.starts_with(location)
+                                } else {
+                                    keeper == location
+                                }
+                            })
+                    })
+            })
     }
     fn dispatch(&mut self, mut checked: Checked, mut progress: Progress, v: &mut View<'_>) {
         if let Some((at, original_drop)) = self.next_pair(&checked, &mut progress, v.s) {
@@ -546,6 +600,11 @@ impl State {
             return;
         }
         v.scan.recycling = false;
+        // The cache and queue were updated with each move. Build the display lists once.
+        if !progress.merged_ids.is_empty() {
+            v.s.rebuild();
+            v.s.queue_changed(v.player);
+        }
         v.scan.requested |= progress.moved > 0 || !progress.failed.is_empty();
         let moved = copies(progress.moved);
         let message = match progress.failed.first() {
@@ -569,18 +628,22 @@ impl State {
         if let Err(error) = result {
             self.choose_drop(copy.drop_id.clone(), false);
             v.scan.reread_files(HashSet::from([copy.path.clone()]));
-            progress.failed.push(format!("{}: {error}", copy.path));
+            progress
+                .failed
+                .push(format!("{}: {error}", native_path(&copy.path).display()));
             return;
         }
         // The keeper is still guarded and pair edits and scan application are serialized with
         // this one move. History belongs to the checked IDs even if a scan saw the removal.
         progress.moved += 1;
         v.s.removals += 1;
-        if self.matching_drop(v.s, copy, Some(original_drop)).is_none() {
+        if self.matching_drop(v.s, copy, Some(original_drop)).is_none()
+            || self.locations_removed(v.s, Some(&copy.keep_id))
+        {
             self.choose_drop(copy.drop_id.clone(), false);
             progress.failed.push(format!(
                 "{} moved, but the pair changed. Its history was left in place.",
-                copy.path
+                native_path(&copy.path).display()
             ));
             v.scan.reread_files(HashSet::from([copy.path.clone()]));
             return;
@@ -599,10 +662,11 @@ impl State {
             to: &copy.keep_id,
         });
         service.event(Event::Removed(std::slice::from_ref(&copy.drop_id)));
-        v.s.library.tracks.retain(|t| t.id() != copy.drop_id);
+        progress.merged_ids.insert(copy.drop_id.clone());
+        v.s.models.catalog.tracks.remove(&copy.drop_id);
+        v.s.library.tracks.retain(|t| t.path != copy.path);
         v.s.library_dirty = true;
         v.s.listening_dirty = true;
-        v.s.rebuild();
         v.s.queue_changed(v.player);
         if swap {
             v.s.load_current(v.player, v.st.playing, v.st.position);
@@ -651,10 +715,9 @@ pub fn settle(v: &mut View<'_>) {
 /// Edit info and Swap names can still change other songs, including pending pairs.
 pub(crate) fn can_edit(id: &str) -> bool {
     let st = state();
-    let busy = st
-        .recycling
-        .as_ref()
-        .is_some_and(|j| j.active.keep_id == id || j.active.drop_id == id);
+    let busy = st.recycling.as_ref().is_some_and(|j| {
+        j.active.keep_id == id || j.active.drop_id == id || j.progress.merged_ids.contains(id)
+    });
     if busy {
         services::notice("This copy is being moved. Try the edit again when the move finishes.");
     }
@@ -669,14 +732,18 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     let mut st = state();
     let st = &mut *st;
     let tint = v.tint;
-    st.refresh(ui.ctx(), v.s);
+    // A newly opened page must not adopt cached rows from a folder being removed.
+    let scan_pending = v.scan.requested || v.scan.running();
+    if !scan_pending {
+        st.refresh(ui.ctx(), v.s);
+    }
     let mut again = false;
     panel::page_title(ui, "Duplicates", "Songs you have more than once", |ui| {
         ui.add_space(2.);
         again = Btn::new("Look again", tint)
             .icon("reload")
             .sm()
-            .enabled(st.settled(v) && !st.ask)
+            .enabled(!scan_pending && st.settled(v) && !st.ask)
             .show(ui)
             .clicked();
     });
@@ -1053,7 +1120,7 @@ fn row(ui: &mut Ui, v: &mut View<'_>, st: &mut State, gi: usize, ci: usize) {
             FAINT.gamma_multiply(fade),
         );
         ui.interact(names, ui.scope_id().with("path"), Sense::hover())
-            .on_hover_text(&c.path);
+            .on_hover_text(native_path(&c.path).display().to_string());
         if wide {
             let meta = ui::area(names.right() + 12., r.top(), flex - names_w, r.height());
             ui::label(
@@ -1151,7 +1218,7 @@ fn row(ui: &mut Ui, v: &mut View<'_>, st: &mut State, gi: usize, ci: usize) {
         Some(1) => st.choose_keep(gi, id),
         Some(2) => st.choose_drop(id, !drop),
         Some(3) => {
-            let path = PathBuf::from(&c.path);
+            let path = native_path(&c.path);
             services::fire(ui.ctx(), move |s| s.reveal(&path));
         }
         _ => {}

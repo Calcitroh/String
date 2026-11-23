@@ -6,22 +6,23 @@ use std::{
     io,
     mem::size_of,
     os::windows::{
-        ffi::OsStringExt,
-        fs::OpenOptionsExt,
+        ffi::{OsStrExt, OsStringExt},
+        fs::{MetadataExt, OpenOptionsExt},
         io::{AsRawHandle, FromRawHandle},
     },
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
 };
-use string_core::library::Track;
+use string_core::library::{Track, native_path};
 use windows::Win32::{
     Foundation::HANDLE,
+    Globalization::{CSTR_EQUAL, CompareStringOrdinal},
     Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_BASIC_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAGS_AND_ATTRIBUTES,
         FILE_GENERIC_READ, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_MODE, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FileBasicInfo, FileIdInfo, GETFINALPATHNAMEBYHANDLE_FLAGS,
-        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        ReOpenFile, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
+        GetFileAttributesW, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, ReOpenFile, VOLUME_NAME_DOS, VOLUME_NAME_GUID,
     },
 };
 
@@ -34,23 +35,30 @@ pub(super) struct Stamp {
     changed: i64,
 }
 impl Stamp {
-    fn open(path: &Path) -> io::Result<(Self, File)> {
+    fn open(path: &Path, parents: &mut HashMap<PathBuf, File>) -> io::Result<(Self, File)> {
         if !path.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "A full song path is required",
             ));
         }
+        guard_parent(path, parents)?;
         let file = OpenOptions::new()
             .read(true)
             .share_mode(FILE_SHARE_READ.0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
             .open(path)?;
-        // Lock the real file before reading its tags by name. Ordinary parent directories
-        // cannot be renamed while their descendant denies delete. Reject redirected paths.
-        if dos_path(&final_name(&file, VOLUME_NAME_DOS)?)? != dos_path(&std::path::absolute(path)?)?
-        {
-            return Err(io::Error::other("The song path is redirected"));
+        // Windows resolved each component under its own directory's case rules.
+        // guard_parent rejected reparse points. Also refuse substituted drive names.
+        let actual = dos_path(&final_name(&file, VOLUME_NAME_DOS)?);
+        let submitted = dos_path(&std::path::absolute(path)?);
+        if actual != submitted {
+            let wide = |p: &Path| p.as_os_str().encode_wide().collect::<Vec<_>>();
+            if unsafe { CompareStringOrdinal(&wide(&actual), &wide(&submitted), true) }
+                != CSTR_EQUAL
+            {
+                return Err(io::Error::other("The song path is redirected"));
+            }
         }
         Ok((Self::read(&file)?, file))
     }
@@ -92,15 +100,16 @@ impl Stamp {
         })
     }
     pub(super) fn seen(t: &Track) -> Option<Self> {
-        let path = Path::new(&t.path);
-        let (stamp, _guard) = Self::open(path).ok()?;
+        let path = native_path(&t.path);
+        let mut parents = HashMap::new();
+        let (stamp, _guard) = Self::open(&path, &mut parents).ok()?;
         let unix_ms = (stamp.written - 116_444_736_000_000_000) / 10_000;
         if stamp.size != t.size || unix_ms != t.mtime || t.read_error != 0 {
             return None;
         }
         // A restored file can have the very same size and timestamp as the old recording.
         // Use the scanner's parser while the file is locked, including its raw tags under edits.
-        let tags = string_core::tags::read(path).ok()?.tags;
+        let tags = string_core::tags::read(&path).ok()?.tags;
         (tags.title == t.tags.title
             && tags.artist == t.tags.artist
             && tags.album == t.tags.album
@@ -130,14 +139,30 @@ impl Checked {
         move_file: impl FnOnce(&Path) -> io::Result<()>,
     ) -> io::Result<()> {
         let bin = super::bin::Bin::open()?;
-        let source = std::path::absolute(&self.plan[index].path)?;
-        let original = dos_path(&source)?;
-        self.move_one(index, move_file, |moved| {
-            recycled_location(moved)
-                && bin
-                    .restore_path(moved)
-                    .is_ok_and(|recorded| recorded == original)
-        })
+        let (_, file) = self.guarded(&self.plan[index].drop_id)?;
+        let canonical = final_name(file, VOLUME_NAME_DOS)?;
+        let original = dos_path(&canonical);
+        let source = if self.plan[index].path.starts_with(r"\\?\") {
+            &canonical
+        } else {
+            &original
+        };
+        // Give Restore the exact on-disk spelling while the source is still locked.
+        self.move_one(
+            index,
+            |_| move_file(source),
+            |moved| {
+                recycled_location(moved)
+                    && bin
+                        .restore_path(moved)
+                        .is_ok_and(|recorded| recorded == original)
+            },
+        )
+    }
+    fn guarded(&self, id: &str) -> io::Result<&(Stamp, File)> {
+        self.guards
+            .get(id)
+            .ok_or_else(|| io::Error::other("The song is no longer guarded"))
     }
     pub(super) fn move_one(
         &mut self,
@@ -146,29 +171,24 @@ impl Checked {
         in_bin: impl FnOnce(&Path) -> bool,
     ) -> io::Result<()> {
         self.moved_guard = None; // the previous move has been applied
-        let path = Path::new(&self.plan[index].path);
+        let path = native_path(&self.plan[index].path);
         let copy = &self.plan[index];
-        let guarded = |id: &str| -> io::Result<&File> {
-            let (seen, file) = self
-                .guards
-                .get(id)
-                .ok_or_else(|| io::Error::other("The song is no longer guarded"))?;
-            if Stamp::read(file)? != *seen {
-                return Err(io::Error::other(
-                    "A file in this pair changed before the move",
-                ));
-            }
-            Ok(file)
-        };
-        guarded(&copy.keep_id)?;
-        let read = reopen(guarded(&copy.drop_id)?, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
+        let (keep_stamp, keeper) = self.guarded(&copy.keep_id)?;
+        let (drop_stamp, drop_file) = self.guarded(&copy.drop_id)?;
+        let read = reopen(drop_file, FILE_SHARE_READ | FILE_SHARE_DELETE)?;
         // The shell records the submitted path for Restore. A staging name would be restored
         // verbatim. Follow the original object through the call, independently of that path.
         if recycled_location(&final_name(&read, VOLUME_NAME_GUID)?) {
             return Err(io::Error::other("The song is already in the Recycle Bin"));
         }
-        self.guards.remove(&copy.drop_id);
-        move_file(path)?;
+        if Stamp::read(keeper)? != *keep_stamp || Stamp::read(&read)? != *drop_stamp {
+            return Err(io::Error::other(
+                "A file in this pair changed before the move",
+            ));
+        }
+        let (_, guard) = self.guards.remove(&copy.drop_id).unwrap();
+        drop(guard);
+        move_file(&path)?;
         // Keep this object in place until the session commits its history transfer.
         if let Ok(moved) = reopen(&read, FILE_SHARE_READ)
             && final_name(&moved, VOLUME_NAME_DOS).is_ok_and(|p| in_bin(&p))
@@ -176,9 +196,11 @@ impl Checked {
             self.moved_guard = Some(moved);
             return Ok(());
         }
-        Err(io::Error::other(
-            "Windows reported a move, but the checked file and its restore path could not be verified. Check the Recycle Bin. The song's history was left in place",
-        ))
+        Err(io::Error::other(format!(
+            "Windows could not confirm which file moved. In the Recycle Bin, look for “{}” with “{}” under Original Location. If the wrong file moved, choose Restore. String kept its history in place.",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            path.parent().unwrap_or(&path).display()
+        )))
     }
 }
 
@@ -194,31 +216,63 @@ fn reopen(file: &File, sharing: FILE_SHARE_MODE) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle.0) })
 }
 
-// While the shell may rename the leaf, keep its containing directory in place as well.
+// Keep the containing folder in place even while the shell may rename the leaf.
 fn guard_parent(path: &Path, parents: &mut HashMap<PathBuf, File>) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::other("The song needs a parent folder"))?;
     if dir.parent().is_some() && !parents.contains_key(dir) {
         let file = OpenOptions::new()
-            .access_mode(windows::Win32::Storage::FileSystem::FILE_TRAVERSE.0)
+            .access_mode(
+                (windows::Win32::Storage::FileSystem::FILE_TRAVERSE
+                    | windows::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES)
+                    .0,
+            )
             .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE).0)
             .custom_flags((FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS).0)
             .open(dir)?;
+        if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            return Err(io::Error::other(
+                "A folder in the song path is a link or reparse point",
+            ));
+        }
+        // Ordinary ancestors cannot be renamed over a delete-denying descendant.
+        // Windows can return their entry attributes even in a traverse-only tree.
+        for ancestor in dir.ancestors().skip(1).take_while(|p| p.parent().is_some()) {
+            let name = windows::core::HSTRING::from(ancestor.as_os_str());
+            let attrs = unsafe { GetFileAttributesW(&name) };
+            if attrs == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            if attrs & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+                return Err(io::Error::other(
+                    "A folder in the song path is a link or reparse point",
+                ));
+            }
+        }
         parents.insert(dir.into(), file);
     }
     Ok(())
 }
 
-fn dos_path(path: &Path) -> io::Result<PathBuf> {
-    let name = path
-        .to_str()
-        .ok_or_else(|| io::Error::other("The song path could not be verified"))?;
-    if let Some(unc) = name.strip_prefix(r"\\?\UNC\") {
-        Ok(PathBuf::from(format!(r"\\{unc}")))
-    } else {
-        Ok(PathBuf::from(name.trim_start_matches(r"\\?\")))
-    }
+pub(super) fn dos_path(path: &Path) -> PathBuf {
+    let mut parts = path.components();
+    let Some(Component::Prefix(prefix)) = parts.next() else {
+        return path.into();
+    };
+    let mut out = match prefix.kind() {
+        Prefix::VerbatimDisk(letter) => PathBuf::from(format!("{}:\\", char::from(letter))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut unc = std::ffi::OsString::from(r"\\");
+            unc.push(server);
+            unc.push(r"\");
+            unc.push(share);
+            PathBuf::from(unc)
+        }
+        _ => return path.into(),
+    };
+    out.extend(parts.filter(|part| *part != Component::RootDir));
+    out
 }
 
 fn final_name(file: &File, flags: GETFINALPATHNAMEBYHANDLE_FLAGS) -> io::Result<PathBuf> {
@@ -269,10 +323,9 @@ pub(super) fn check(pairs: Vec<Pair>) -> super::FileCheck {
             {
                 continue;
             }
-            let path_ref = Path::new(path);
+            let path_ref = native_path(path);
             let detail;
-            let why = match guard_parent(path_ref, &mut parents).and_then(|_| Stamp::open(path_ref))
-            {
+            let why = match Stamp::open(&path_ref, &mut parents) {
                 Ok((actual, file)) if Some(actual) == expected => {
                     guards.insert(id.clone(), (actual, file));
                     continue;
@@ -289,10 +342,7 @@ pub(super) fn check(pairs: Vec<Pair>) -> super::FileCheck {
                 }
             };
             if bad.is_empty() {
-                let name = Path::new(path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
+                let name = path_ref.file_name().unwrap_or_default().to_string_lossy();
                 reason = format!("{name} {why}. Nothing was merged.");
             }
             reread.insert(path.clone());
