@@ -175,7 +175,7 @@ fn sidebar(ui: &mut Ui, v: &mut View<'_>) {
     );
     p.vline(r.right() - 1., r.y_range(), (1., HAIR));
     // the logo box (1.x's .brand): the person's own picture from their look, if any, then String's logo unless the
-    // look hides it: a glowing wire between two ringed pegs, then S T R I N G with a soft halo
+    // look hides it: the logo as a small record that turns while music plays, then S T R I N G with a soft halo
     let brand = look::brand();
     look::paint_brand(
         &p,
@@ -185,30 +185,18 @@ fn sidebar(ui: &mut Ui, v: &mut View<'_>) {
     let x = r.left() + brand.pad[3];
     let y = r.top() + brand.pad[0] + (brand.height - brand.pad[0] - brand.pad[2]) / 2.;
     if brand.wire {
-        let (a, b) = (pos2(x + 4., y), pos2(x + 30., y));
+        // It turns with the Now Playing record and coasts to a stop on pause; the app redraws while the record turns.
+        let (c, radius) = (pos2(x + 16., y), 14.);
         ui::glow(
             &p,
-            Rect::from_min_max(a, b).expand2(vec2(0., 1.)),
-            1.,
-            6.,
-            t.ink(0.25),
+            Rect::from_center_size(c, vec2(2. * radius, 2. * radius)),
+            radius,
+            10.,
+            t.ink(0.16),
         );
-        if v.st.playing {
-            // The string plucks while music plays, as in the web version (±5.5 px, 0.11 s each way).
-            let time = ui.input(|i| i.time);
-            let bend = -5.5 * (std::f64::consts::PI * time / 0.11).cos() as f32;
-            p.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
-                [a, pos2(x + 17., y + bend), b],
-                false,
-                egui::Color32::TRANSPARENT,
-                egui::Stroke::new(1.6, t.ink(1.)),
-            ));
+        ui::logo_disc::paint(ui.ctx(), &p, c, radius, v.viz.spin(), t.ink(0.35));
+        if v.viz.turning() {
             ui.ctx().request_repaint();
-        } else {
-            p.line_segment([a, b], (1.6, t.ink(1.)));
-        }
-        for peg in [a, b] {
-            p.circle(peg, 2.4, BG, (1.4, t.ink(0.8)));
         }
     }
     if brand.name {

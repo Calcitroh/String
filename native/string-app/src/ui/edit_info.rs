@@ -70,9 +70,13 @@ pub fn open(v: &View<'_>, id: &str) {
         fresh: true,
     });
 }
-pub(crate) fn save_info(s: &mut crate::playback::Session, id: &str, info: &Info) {
+pub(crate) fn save_info(s: &mut crate::playback::Session, id: &str, info: &Info) -> bool {
+    if !crate::screens::dupes::can_edit(id) {
+        return false;
+    }
     edit_info(&mut s.state, id, info);
     s.rebuild();
+    true
 }
 fn changed(v: &mut View<'_>, id: &str) {
     v.s.state_dirty = true;
@@ -82,6 +86,9 @@ fn changed(v: &mut View<'_>, id: &str) {
 /// A song named the wrong way round ("Title - Artist" read as "Artist - Title"): one click, an edit of the
 /// person's own.
 pub fn swap(v: &mut View<'_>, id: &str) {
+    if !crate::screens::dupes::can_edit(id) {
+        return;
+    }
     let Some(t) = track(v, id).cloned() else {
         return;
     };
@@ -223,11 +230,12 @@ pub fn show(ctx: &Context, v: &mut View<'_>) {
         });
     });
     if save {
-        let form = st.form.take().unwrap();
-        let mut info = form.info;
-        info.art = info.art.trim().trim_matches('"').to_owned();
-        save_info(v.s, &form.id, &info);
+        form.info.art = form.info.art.trim().trim_matches('"').to_owned();
+        if !save_info(v.s, &form.id, &form.info) {
+            return;
+        }
         changed(v, &form.id);
+        st.form = None;
         v.views.toast.set("Saved");
     } else if close || dismissed {
         st.form = None;

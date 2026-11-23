@@ -26,20 +26,19 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWINDOWATTRIBUTE, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
-    MonitorFromWindow,
+    CreateSolidBrush, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+    MONITORINFO, MonitorFromPoint, MonitorFromWindow,
 };
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT, DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, GetDpiForSystem,
     SetThreadDpiAwarenessContext,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GCLP_HBRBACKGROUND, GWL_EXSTYLE, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW,
-    GetWindowPlacement, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, IsZoomed,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_RESTORE,
-    SW_SHOW, SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetClassLongPtrW, SetForegroundWindow, SetWindowPos,
-    ShowWindow, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
+    GCLP_HBRBACKGROUND, GWL_EXSTYLE, GetCursorPos, GetWindowLongPtrW, GetWindowPlacement,
+    HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, IsZoomed, SW_RESTORE, SW_SHOW,
+    SW_SHOWMAXIMIZED, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SetClassLongPtrW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 /// A colour, red, green and blue.
@@ -216,8 +215,8 @@ impl Placement {
         })
     }
 
-    /// App.cs's test before using a saved place: at least the minimum size, and the title bar (80 by 16 pixels in from
-    /// its top left corner) inside the Windows virtual-screen rectangle.
+    /// Restore only when the window meets the minimum size and its title-bar grip is on a display.
+    /// The grip is 80 by 16 WPF units in from the saved top left.
     pub fn fits(&self, min_width: f64, min_height: f64) -> bool {
         if ![self.left, self.top, self.width, self.height]
             .iter()
@@ -230,15 +229,11 @@ impl Placement {
         }
         let _coordinates = WpfCoordinates::enter();
         let s = scale();
-        let x = (self.left + 80.) * s;
-        let y = (self.top + 16.) * s;
-        let metric = |index| unsafe { GetSystemMetrics(index) } as f64;
-        let left = metric(SM_XVIRTUALSCREEN);
-        let top = metric(SM_YVIRTUALSCREEN);
-        x >= left
-            && y >= top
-            && x <= left + metric(SM_CXVIRTUALSCREEN)
-            && y <= top + metric(SM_CYVIRTUALSCREEN)
+        let grip = POINT {
+            x: ((self.left + 80.) * s).round() as i32,
+            y: ((self.top + 16.) * s).round() as i32,
+        };
+        !unsafe { MonitorFromPoint(grip, MONITOR_DEFAULTTONULL) }.is_invalid()
     }
 
     /// Moves and sizes the window to this place (normal, not maximised; [`show`] maximises). Meant for the hidden
@@ -448,6 +443,35 @@ mod tests {
             }
             .fits(960.0, 600.0)
         );
+    }
+
+    #[test]
+    fn restore_requires_a_grip_point_on_a_display() {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+            SM_YVIRTUALSCREEN,
+        };
+        let _coordinates = WpfCoordinates::enter();
+        let s = scale();
+        let metric = |index| unsafe { GetSystemMetrics(index) };
+        let left = metric(SM_XVIRTUALSCREEN);
+        let top = metric(SM_YVIRTUALSCREEN);
+        let right = left + metric(SM_CXVIRTUALSCREEN);
+        let bottom = top + metric(SM_CYVIRTUALSCREEN);
+        // Sample the desktop including any gaps and both exclusive outer edges.
+        for x in (left..right).step_by(64).chain([right]) {
+            for y in (top..bottom).step_by(64).chain([bottom]) {
+                let display = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL) };
+                let p = Placement {
+                    left: f64::from(x) / s - 80.,
+                    top: f64::from(y) / s - 16.,
+                    width: 1000.,
+                    height: 600.,
+                    max: false,
+                };
+                assert_eq!(p.fits(960., 600.), !display.is_invalid(), "grip ({x}, {y})");
+            }
+        }
     }
 
     #[test]

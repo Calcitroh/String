@@ -101,6 +101,7 @@ pub(super) struct Translator {
     jobs: Sender<Job>,
     events: Option<Receiver<Event>>,
     active: Option<(String, String, LanguageModel)>,
+    retry_on_open: bool,
     model: String,
     models: Option<Result<Vec<String>, String>>,
     listing: Option<Receiver<Result<Vec<String>, String>>>,
@@ -126,6 +127,7 @@ impl Translator {
             jobs,
             events: None,
             active: None,
+            retry_on_open: false,
             model: String::new(),
             models: None,
             listing: None,
@@ -134,11 +136,16 @@ impl Translator {
             layout_revision: 0,
         }
     }
-    pub fn song_changed(&self, song: &str) -> bool {
-        self.active.as_ref().is_some_and(|(id, _, _)| id != song)
+    pub fn page_opened(&mut self, song: &str, force: bool) {
+        self.poll();
+        if force || self.retry_on_open || self.active.as_ref().is_some_and(|(id, _, _)| id != song)
+        {
+            self.clear();
+        }
     }
     pub fn clear(&mut self) {
         if self.active.take().is_some() {
+            self.retry_on_open = false;
             self.revision.fetch_add(1, Ordering::AcqRel);
             self.service.stop();
             self.events = None;
@@ -192,8 +199,12 @@ impl Translator {
                         self.layout_revision += 1;
                     }
                 }
-                Event::Failed(e) => self.status = format!("Couldn't translate: {e}"),
+                Event::Failed(e) => {
+                    self.retry_on_open = true;
+                    self.status = format!("Couldn't translate: {e}");
+                }
                 Event::Done(done) if !done.stopped => {
+                    self.retry_on_open = done.error.is_some();
                     self.rows = done.lines;
                     self.layout_revision += 1;
                     self.status = if let Some(error) = &done.error
@@ -268,5 +279,57 @@ impl Drop for Translator {
     fn drop(&mut self) {
         self.revision.fetch_add(1, Ordering::AcqRel);
         self.service.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reopening_lyrics_retries_failed_jobs_once_and_keeps_other_jobs() {
+        use super::super::tests::fixture;
+
+        let (_dir, song, mut view, options) = fixture();
+        let ctx = Context::default();
+        let lyrics = view.lyrics.get(&song.lyrics_song(), false, false);
+        // Handle the submitted jobs here so a failure can arrive before or after leaving.
+        let (tx, jobs) = unbounded();
+        view.translator.jobs = tx;
+        let draw = |view: &mut super::super::LyricsView| {
+            view.update(&ctx, &song, None);
+            view.translator
+                .update(&ctx, &song, &lyrics, options.clone());
+        };
+        draw(&mut view);
+        let mut job = jobs.try_recv().unwrap();
+        view.check_visible(None, false, Some(&song.id));
+        draw(&mut view);
+        assert!(jobs.is_empty(), "keeps a running job");
+        job.post(Event::Failed("No models".into()));
+        draw(&mut view);
+        draw(&mut view);
+        assert!(view.translator.status.contains("No models") && jobs.is_empty());
+        view.check_visible(None, false, Some(&song.id));
+        draw(&mut view);
+        job = jobs.try_recv().expect("retry the failed model lookup");
+        view.check_visible(None, false, Some(&song.id));
+        job.post(Event::Done(Translation {
+            error: Some("Disconnected".into()),
+            ..Default::default()
+        }));
+        draw(&mut view);
+        job = jobs
+            .try_recv()
+            .expect("retry the translation that failed while away");
+        job.post(Event::Done(Translation {
+            lines: vec![Some("words".into())],
+            ..Default::default()
+        }));
+        draw(&mut view);
+        view.check_visible(None, false, Some(&song.id));
+        draw(&mut view);
+        assert!(jobs.is_empty(), "keeps a successful job");
+        assert_eq!(view.translator.rows, [Some("words".into())]);
     }
 }

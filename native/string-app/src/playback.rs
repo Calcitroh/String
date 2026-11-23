@@ -483,14 +483,16 @@ impl Session {
             && let Some(items) = pl["items"].as_array_mut()
         {
             let now = Local::now().timestamp_millis();
-            for id in ids.iter() {
-                if !items
-                    .iter()
-                    .any(|v| v["id"] == *id || v.as_str() == Some(id))
-                {
-                    items.push(json!({"id":id,"at":now}));
-                }
-            }
+            let mut seen: HashSet<_> = items
+                .iter()
+                .filter_map(|v| v.as_str().or_else(|| v["id"].as_str()))
+                .collect();
+            let fresh: Vec<_> = ids
+                .iter()
+                .filter(|id| seen.insert(id.as_str()))
+                .map(|id| json!({"id": id, "at": now}))
+                .collect();
+            items.extend(fresh);
             pl["updated"] = now.into();
             self.state_dirty = true;
             self.models.refresh_lists(&self.state);

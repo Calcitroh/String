@@ -436,7 +436,7 @@ impl Compound<'_> {
             && self.classes == ["brand"]
             && (self.tag.is_none() || self.tag_is("div"))
     }
-    /// The drawn logo: the wire between its pegs (`svg.string-logo`).
+    /// The drawn logo (`svg.string-logo`): 1.x's wire between its pegs, 2.0's turning logo disc.
     fn wire(&self) -> bool {
         !self.odd
             && self.ids.is_empty()

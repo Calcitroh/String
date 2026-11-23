@@ -299,6 +299,14 @@ impl Library {
             report.issues.extend(issue);
         }
         self.tracks = retained;
+        report.complete_folders = covers.into_keys().collect();
+        for path in &unread {
+            for parent in Path::new(path).ancestors() {
+                report
+                    .complete_folders
+                    .remove(parent.to_string_lossy().trim_end_matches(['\\', '/']));
+            }
+        }
         if report.changed() {
             self.saved = Some(now);
         }

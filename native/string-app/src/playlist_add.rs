@@ -7,18 +7,24 @@ use std::{
     time::Duration,
 };
 use string_core::library::track_id;
-use string_platform::instance::{self, Claim, Names};
+use string_platform::instance::{Claim, Names};
 
 pub(crate) fn claim(
     names: &Names,
     name: Option<&str>,
     paths: &[PathBuf],
     wait: Duration,
+    open_input: impl FnOnce() -> io::Result<crate::add_work::Input>,
 ) -> io::Result<Start> {
     if paths.is_empty() {
         return Ok(Start::Done(0));
     }
-    Ok(match instance::claim_quietly(names)? {
+    let owner = names.claim_for_add(|| {
+        let input = open_input()?;
+        input.startup(name, paths)?;
+        Ok(move |name, paths, bytes| input.submit(name, paths, bytes))
+    })?;
+    Ok(match owner {
         Claim::First(instance) => Start::Run(instance),
         Claim::AlreadyRunning => {
             let taken = match name {
@@ -33,6 +39,9 @@ pub(crate) fn claim(
 /// Reserve ordinary playlist entries immediately. The playlist view already hides IDs until the scan finds them.
 /// A trailing separator reserves a directory's position; no song ID can end in a directory separator.
 pub(crate) fn reserve(s: &mut Session, name: &str, paths: &[Location]) {
+    if paths.is_empty() {
+        return;
+    }
     let folded = name.trim().to_lowercase();
     let key = s
         .models
@@ -73,7 +82,7 @@ fn item_id(item: &Value) -> Option<&str> {
 
 /// Expand folder positions only after the normal library scan accepts the current roots and files.
 /// Unfinished positions survive closing and reopening in the same playlist document as file positions.
-pub(crate) fn resolve_folders(s: &mut Session) {
+pub(crate) fn resolve_folders(s: &mut Session, complete_folders: &HashSet<String>) {
     let Some(lists) = s
         .state
         .fields
@@ -87,11 +96,11 @@ pub(crate) fn resolve_folders(s: &mut Session) {
         let Some(items) = list.get_mut("items").and_then(Value::as_array_mut) else {
             continue;
         };
-        if !items
-            .iter()
-            .filter_map(item_id)
-            .any(|id| id.ends_with('\\'))
-        {
+        let complete = |id: &str| {
+            id.strip_suffix('\\')
+                .is_some_and(|f| complete_folders.contains(f))
+        };
+        if !items.iter().filter_map(item_id).any(complete) {
             continue;
         }
         let tracks =
@@ -100,7 +109,7 @@ pub(crate) fn resolve_folders(s: &mut Session) {
         let mut from_folder = HashSet::new();
         for item in std::mem::take(items) {
             match item_id(&item) {
-                Some(folder) if folder.ends_with('\\') => {
+                Some(folder) if complete(folder) => {
                     for id in tracks
                         .range(folder.to_owned()..)
                         .take_while(|id| id.starts_with(folder))

@@ -106,6 +106,16 @@ impl Viz {
         self.spin = (self.spin + self.velocity * dt) % 360.0;
     }
 
+    /// The record's angle in degrees: the Now Playing record and the sidebar's logo turn together.
+    pub fn spin(&self) -> f32 {
+        self.spin
+    }
+
+    /// Still turning: playing, or coasting to a stop after a pause.
+    pub fn turning(&self) -> bool {
+        self.velocity > 0.5
+    }
+
     pub fn settling(&self) -> bool {
         self.energy > 0.002 || self.pulse > 0.0 || !self.sparks.is_empty() || self.velocity > 0.5
     }

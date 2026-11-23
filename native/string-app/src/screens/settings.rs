@@ -124,6 +124,9 @@ pub(crate) fn add_roots_to(
     scan: &mut crate::scan::Scanner,
     list: &[PathBuf],
 ) -> Option<String> {
+    if list.is_empty() {
+        return None;
+    }
     let mut roots = strings(s.field("roots"));
     let mut added = 0;
     for p in list {
@@ -141,7 +144,7 @@ pub(crate) fn add_roots_to(
         added += 1;
     }
     if added == 0 {
-        return (!list.is_empty()).then(|| "Already in your library".to_owned());
+        return Some("Already in your library".to_owned());
     }
     s.set_field("roots", roots.into());
     scan.requested = true;
@@ -157,18 +160,22 @@ pub(crate) fn add_songs_to(
     scan: &mut crate::scan::Scanner,
     list: &[PathBuf],
 ) -> Option<String> {
+    if list.is_empty() {
+        return None;
+    }
     let mut files = strings(s.field("files"));
     let before = files.len();
+    let mut seen: std::collections::HashSet<_> = files.iter().map(|f| f.to_lowercase()).collect();
     for p in list.iter().filter(|p| is_song_path(p)) {
         let p = p.to_string_lossy().into_owned();
         let id = p.to_lowercase();
-        if !files.iter().any(|f| f.to_lowercase() == id) && !s.models.by_id.contains_key(&id) {
+        if !s.models.by_id.contains_key(&id) && seen.insert(id) {
             files.push(p);
         }
     }
     let fresh = files.len() - before;
     if fresh == 0 {
-        return (!list.is_empty()).then(|| "Those are already in your library".to_owned());
+        return Some("Those are already in your library".to_owned());
     }
     s.set_field("files", files.into());
     scan.requested = true;

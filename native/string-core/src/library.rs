@@ -150,6 +150,8 @@ pub struct Issue {
 }
 #[derive(Debug, Default)]
 pub struct ScanReport {
+    /// Case-folded directory paths (without a trailing separator) whose subtrees were enumerated.
+    pub complete_folders: std::collections::HashSet<String>,
     pub read: usize,
     pub reused: usize,
     pub removed: usize,

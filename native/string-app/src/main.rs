@@ -66,20 +66,15 @@ impl Args {
     #[cfg(test)]
     pub(crate) fn parse_from(args: impl IntoIterator<Item = OsString>) -> Result<Self, Error> {
         let mut args = Self::options(args)?;
-        args.classify_startup()?;
+        if let Some(paths) = args.add.take() {
+            args.add = Some(
+                add_work::classify(paths)
+                    .into_iter()
+                    .map(|l| l.path)
+                    .collect(),
+            );
+        }
         Ok(args)
-    }
-    fn classify_startup(&mut self) -> Result<Vec<add_work::Location>, Error> {
-        let Some(paths) = self.add.take() else {
-            return Ok(Vec::new());
-        };
-        let locations = std::thread::Builder::new()
-            .name("string-start-paths".into())
-            .spawn(move || add_work::classify(paths))?
-            .join()
-            .map_err(|_| "Path worker stopped")?;
-        self.add = Some(locations.iter().map(|p| p.path.clone()).collect());
-        Ok(locations)
     }
     fn options(args: impl IntoIterator<Item = OsString>) -> Result<Self, Error> {
         let mut args = args.into_iter().peekable();
@@ -181,6 +176,7 @@ impl Args {
 fn run() -> Result<i32, Error> {
     let mut args = Args::parse()?;
     let auto = args.smoke.is_some();
+    let mut startup_adds = None;
     let start = if !args.quit
         && let Some(paths) = &args.add
     {
@@ -195,6 +191,7 @@ fn run() -> Result<i32, Error> {
             args.playlist.as_deref(),
             paths,
             std::time::Duration::from_secs(5),
+            || Ok(startup_adds.insert(add_work::Adds::new()?).input.clone()),
         )?
     } else {
         platform::claim(&args)?
@@ -203,16 +200,19 @@ fn run() -> Result<i32, Error> {
         platform::Start::Run(instance) => instance,
         platform::Start::Done(code) => return Ok(code),
     };
-    let mut adds = add_work::Adds::new()?;
-    let input = adds.input.clone();
-    instance.route_adds(move |name, paths, bytes| input.submit(name, paths, bytes));
-    if args.add.is_some() {
-        let locations = args.classify_startup()?;
-        if locations.is_empty() && adds.close_if_idle() {
+    let adds = if let Some(mut adds) = startup_adds {
+        let paths = adds.finish_startup()?;
+        if paths.is_empty() && adds.close_if_idle() {
             return Ok(0);
         }
-        adds.startup = Some(add_work::Batch::startup(args.playlist.take(), locations));
-    }
+        args.add = Some(paths);
+        adds
+    } else {
+        let adds = add_work::Adds::new()?;
+        let input = adds.input.clone();
+        instance.route_adds(move |name, paths, bytes| input.submit(name, paths, bytes));
+        adds
+    };
     std::fs::create_dir_all(&args.root)?;
     let log = Arc::new(string_platform::errors_log::ErrorLog::new(&args.root));
     string_platform::errors_log::log_panics(log.clone());
