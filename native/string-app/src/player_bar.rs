@@ -394,7 +394,9 @@ mod player_tests {
             smoke: Some(dir.path().into()),
             quit: false,
             add: None,
+            playlist: None,
         };
+        let adds = crate::add_work::Adds::new().unwrap();
         let names = Names::custom(&format!("StringBarTest{:x}", rand::random::<u64>()));
         let Claim::First(instance) = instance::claim_quietly(&names).unwrap() else {
             panic!()
@@ -413,6 +415,7 @@ mod player_tests {
         let ctx = Context::default();
         crate::theme::install(&ctx);
         let mut v = View {
+            adds: &adds.input,
             platform: &mut Platform::new(instance, &args, Arc::new(ErrorLog::new(dir.path()))),
             s: &mut s,
             player: &Player::new(
