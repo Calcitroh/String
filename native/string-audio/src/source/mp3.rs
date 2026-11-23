@@ -6,15 +6,14 @@ mod cache;
 use super::codecs;
 use crate::resample::Resampler;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::sync::Arc;
 use symphonia::core::audio::Channels;
-use symphonia::core::checksum::Crc16AnsiLe;
 use symphonia::core::codecs::audio::well_known::CODEC_ID_MP3;
 use symphonia::core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
 use symphonia::core::errors::{Error, Result};
 use symphonia::core::formats::Track;
-use symphonia::core::io::{MediaSource, Monitor};
+use symphonia::core::io::MediaSource;
 use symphonia::core::packet::Packet;
 
 #[derive(Clone, Copy)]
@@ -27,10 +26,8 @@ pub(super) struct Length {
 /// omits embedded ID3 tags altogether, including artwork which resembles MPEG audio.
 pub(super) struct AudioBytes {
     file: File,
-    // Logical offset where each tag was removed and cumulative bytes removed there.
-    cuts: Arc<[(u64, u64)]>,
+    index: Arc<Index>,
     pos: u64,
-    len: u64,
 }
 
 impl MediaSource for AudioBytes {
@@ -38,7 +35,7 @@ impl MediaSource for AudioBytes {
         true
     }
     fn byte_len(&self) -> Option<u64> {
-        Some(self.len)
+        Some(self.index.audio_bytes)
     }
 }
 
@@ -47,11 +44,12 @@ impl Seek for AudioBytes {
         let pos = match from {
             SeekFrom::Start(n) => Some(n),
             SeekFrom::Current(n) => self.pos.checked_add_signed(n),
-            SeekFrom::End(n) => self.len.checked_add_signed(n),
+            SeekFrom::End(n) => self.index.audio_bytes.checked_add_signed(n),
         }
         .ok_or(io::ErrorKind::InvalidInput)?;
-        let i = self.cuts.partition_point(|&(at, _)| at <= pos);
-        let removed = i.checked_sub(1).map_or(0, |i| self.cuts[i].1);
+        let cuts = &self.index.cuts;
+        let i = cuts.partition_point(|&(at, _)| at <= pos);
+        let removed = i.checked_sub(1).map_or(0, |i| cuts[i].1);
         self.file.seek(SeekFrom::Start(
             pos.checked_add(removed)
                 .ok_or(io::ErrorKind::InvalidInput)?,
@@ -63,12 +61,13 @@ impl Seek for AudioBytes {
 
 impl Read for AudioBytes {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let i = self.cuts.partition_point(|&(at, _)| at <= self.pos);
-        let end = self.cuts.get(i).map_or(self.len, |c| c.0);
+        let cuts = &self.index.cuts;
+        let i = cuts.partition_point(|&(at, _)| at <= self.pos);
+        let end = cuts.get(i).map_or(self.index.audio_bytes, |c| c.0);
         let count = end.saturating_sub(self.pos).min(buf.len() as u64) as usize;
         let got = self.file.read(&mut buf[..count])?;
         self.pos += got as u64;
-        if got > 0 && self.cuts.get(i).is_some_and(|c| c.0 == self.pos) {
+        if got > 0 && cuts.get(i).is_some_and(|c| c.0 == self.pos) {
             self.seek(SeekFrom::Start(self.pos))?;
         }
         Ok(got)
@@ -116,64 +115,10 @@ impl Header {
     }
 }
 
-// A valid checksum describes the original segment. If other bytes follow it, verify
-// the claimed join too: a truncated first copy can otherwise borrow audio packets
-// from the second while its original header checksum is still intact.
-fn segment_boundary(
-    r: &mut BufReader<&mut File>,
-    next: u64,
-    len: u64,
-    resume: u64,
-) -> io::Result<bool> {
-    if next == len {
-        return Ok(true);
-    }
-    r.seek(SeekFrom::Start(next))?;
-    let mut prefix = [0; 40];
-    let n = (len - next).min(40) as usize;
-    r.read_exact(&mut prefix[..n])?;
-    r.seek(SeekFrom::Start(resume))?;
-    if matches!(prefix.get(..3), Some(b"ID3" | b"TAG")) {
-        return Ok(true);
-    }
-    let Some(header) = Header::parse(prefix[..4].try_into().unwrap()) else {
-        return Ok(false);
-    };
-    Ok(matches!(
-        prefix.get(header.side_end..header.side_end + 4),
-        Some(b"Xing" | b"Info")
-    ) || &prefix[36..40] == b"VBRI")
-}
-
-fn be32(bytes: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?))
-}
-
-// Only jump over an entire segment when the encoder checksum covers both the frame
-// count and byte span. A byte count alone cannot detect a stale duration.
-fn verified_span(frame: &[u8], at: usize) -> Option<(u64, u64)> {
-    let flags = be32(frame, at + 4)?;
-    if flags & 3 != 3 || flags & !15 != 0 {
-        return None;
-    }
-    let frames = be32(frame, at + 8)?;
-    let bytes = be32(frame, at + 12)?;
-    let ext = at + 16 + if flags & 4 != 0 { 100 } else { 0 } + if flags & 8 != 0 { 4 } else { 0 };
-    if !matches!(frame.get(ext..ext + 4), Some(b"LAME" | b"Lavc" | b"Lavf")) {
-        return None;
-    }
-    let crc_at = ext + 34;
-    let expected = u16::from_be_bytes(frame.get(crc_at..crc_at + 2)?.try_into().ok()?);
-    let mut crc = Crc16AnsiLe::new(0);
-    crc.process_buf_bytes(&frame[..crc_at]);
-    (frames != 0 && bytes as usize > frame.len() && expected != 0 && crc.crc() == expected)
-        .then_some((u64::from(bytes), u64::from(frames)))
-}
-
-#[derive(Clone)]
 struct Index {
     length: Length,
-    cuts: Arc<[(u64, u64)]>,
+    // Logical offset where each tag was removed and cumulative bytes removed there.
+    cuts: Box<[(u64, u64)]>,
     audio_bytes: u64,
 }
 
@@ -183,24 +128,40 @@ pub(super) fn length(mut file: File, track: &Track, rate: u32) -> Result<(Length
     #[cfg(not(windows))]
     let index = {
         let len = file.metadata()?.len();
-        scan(&mut file, len, track, rate)?.0
+        Arc::new(scan(&mut file, len, track, rate)?)
     };
     let mut audio = AudioBytes {
         file,
-        cuts: index.cuts,
+        index,
         pos: 0,
-        len: index.audio_bytes,
     };
     audio.rewind()?;
-    Ok((index.length, audio))
+    Ok((audio.index.length, audio))
 }
 
-fn scan(file: &mut File, len: u64, track: &Track, rate: u32) -> Result<(Index, bool)> {
-    let mut r = BufReader::with_capacity(64 * 1024, file);
+fn scan(file: &mut File, len: u64, track: &Track, rate: u32) -> Result<Index> {
+    match scan_headers(file, len, track, rate, 64 * 1024) {
+        // A byte-range lock on audio data may overlap read-ahead. Retry with exact
+        // header reads so a locked frame body need not be touched.
+        #[cfg(windows)]
+        Err(Error::IoError(e)) if e.raw_os_error() == Some(33) => {
+            scan_headers(file, len, track, rate, 0)
+        }
+        result => result,
+    }
+}
+
+fn scan_headers(
+    file: &mut File,
+    len: u64,
+    track: &Track,
+    rate: u32,
+    capacity: usize,
+) -> Result<Index> {
+    let mut r = BufReader::with_capacity(capacity, file);
     r.rewind()?;
     let mut pos = 0;
     let mut tags = Vec::new();
-    let mut walked = false;
     let mut run = None;
     let mut samples = 0;
     let mut converted = 0;
@@ -252,42 +213,19 @@ fn scan(file: &mut File, len: u64, track: &Track, rate: u32) -> Result<(Index, b
         let xing = matches!(prefix.get(at..at + 4), Some(b"Xing" | b"Info"))
             && prefix[side_start..at].iter().all(|&v| v == 0);
         let vbri = prefix[36..] == *b"VBRI" && prefix[side_start..36].iter().all(|&v| v == 0);
-        let mut span = header.size as u64;
-        let mut count = 1;
-        if xing || vbri {
-            let mut frame = vec![0; header.size];
-            frame[..n].copy_from_slice(&prefix[..n]);
-            r.read_exact(&mut frame[n..])?;
-            if xing {
-                count = 0;
-                if let Some((bytes, frames)) =
-                    verified_span(&frame, at).filter(|(b, _)| *b <= len - pos)
-                    && segment_boundary(&mut r, pos + bytes, len, pos + header.size as u64)?
-                {
-                    span = bytes;
-                    count = frames;
-                }
-            } else if frame.len() >= 62 && frame[40..42] == [0, 1] {
-                count = 0;
-            }
-            r.seek_relative((span - header.size as u64) as i64)?;
+        // A Xing/LAME CRC covers only its header. Count the following MPEG headers,
+        // even if the advertised byte span ends exactly at EOF.
+        let mut metadata = xing;
+        if vbri && header.size >= 62 {
+            let mut version = [0; 2];
+            r.read_exact(&mut version)?;
+            metadata = version == [0, 1];
+            r.seek_relative((header.size - n - 2) as i64)?;
         } else {
-            walked = true;
-            // Adjacent audio headers are usually less than 1 KiB apart. Advance
-            // through the read-ahead buffer without copying the body or breaking
-            // sequential I/O every time a frame straddles two buffers.
-            let mut skip = header.size - n;
-            while skip != 0 {
-                let chunk = skip.min(r.fill_buf()?.len());
-                if chunk == 0 {
-                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-                }
-                r.consume(chunk);
-                skip -= chunk;
-            }
+            r.seek_relative((header.size - n) as i64)?;
         }
-        pos += span;
-        if count == 0 {
+        pos += header.size as u64;
+        if metadata {
             continue;
         }
         if let Some(previous) = run
@@ -298,7 +236,7 @@ fn scan(file: &mut File, len: u64, track: &Track, rate: u32) -> Result<(Index, b
             samples = 0;
         }
         run = Some(header.spec);
-        let n = count * header.samples;
+        let n = header.samples;
         let drop = delay.min(n);
         samples += n - drop;
         delay -= drop;
@@ -315,14 +253,11 @@ fn scan(file: &mut File, len: u64, track: &Track, rate: u32) -> Result<(Index, b
             (at, removed)
         })
         .collect();
-    Ok((
-        Index {
-            length,
-            cuts,
-            audio_bytes: len - removed,
-        },
-        walked,
-    ))
+    Ok(Index {
+        length,
+        cuts,
+        audio_bytes: len - removed,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -456,5 +391,73 @@ impl Mixed {
         let before_target = skip.saturating_sub(self.cursor).min(frames as u64) as usize;
         out.extend_from_slice(&self.converted[(drop + before_target) * 2..]);
         self.cursor += frames as u64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Source;
+    use std::io::Write;
+
+    // At 48 kHz a stereo 128 kb/s frame is 384 bytes, a 64 kb/s frame is 192.
+    fn song(name: &str, tagged: bool) -> std::path::PathBuf {
+        use symphonia::core::{checksum::Crc16AnsiLe, io::Monitor};
+        let path = std::env::temp_dir().join(format!("string-{}-{name}.mp3", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        if tagged {
+            let mut tag = [0; 384];
+            tag[..4].copy_from_slice(&[0xff, 0xfb, 0x94, 0]);
+            tag[36..40].copy_from_slice(b"Info");
+            tag[43] = 3;
+            tag[44..48].copy_from_slice(&100u32.to_be_bytes());
+            tag[48..52].copy_from_slice(&(101u32 * 384).to_be_bytes());
+            tag[52..61].copy_from_slice(b"LAME3.100");
+            let mut crc = Crc16AnsiLe::new(0);
+            crc.process_buf_bytes(&tag[..86]);
+            tag[86..88].copy_from_slice(&crc.crc().to_be_bytes());
+            file.write_all(&tag).unwrap();
+        }
+        let mut frame = [0; 192];
+        frame[..4].copy_from_slice(&[0xff, 0xfb, 0x54, 0]);
+        for _ in 0..200 {
+            file.write_all(&frame).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn intact_xing_checksum_and_byte_span_require_a_payload_count() {
+        let path = song("same-span", true);
+        let mut source = Source::open(&path).unwrap();
+        let frames = source.info().frames.unwrap();
+        let mut decoded = Vec::new();
+        while source.read(&mut decoded, 4096).unwrap() != 0 {}
+        assert_eq!(
+            frames,
+            200 * 1152 - 529,
+            "200 audio frames less decoder delay"
+        );
+        assert_eq!(frames, decoded.len() as u64 / 2);
+        drop(source);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finished_mp3_allows_an_exclusive_tag_editor() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = song("exclusive", false);
+        let mut source = Source::open(&path).unwrap();
+        while source.read(&mut Vec::new(), 4096).unwrap() != 0 {}
+        drop(source);
+        drop(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .share_mode(0)
+                .open(&path)
+                .unwrap(),
+        );
+        std::fs::remove_file(path).unwrap();
     }
 }

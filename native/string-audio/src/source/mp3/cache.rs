@@ -2,13 +2,14 @@
 //! breaks it without waiting for our acknowledgement. Only reuse an index while the
 //! kernel still grants that lease, including on volumes with coarse timestamps.
 use super::{Index, scan};
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use symphonia::core::errors::Result;
 use symphonia::core::formats::Track;
 
@@ -80,19 +81,23 @@ struct ReadLease {
     request: Box<Overlapped>,
 }
 
+// Moving these owned kernel handles between threads does not move the boxed
+// OVERLAPPED. Drop waits for Windows to finish using that allocation.
+unsafe impl Send for ReadLease {}
+
 impl ReadLease {
     fn acquire(file: &File) -> Option<Self> {
-        const GENERIC_READ: u32 = 0x80000000;
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
         const SHARE_READ_WRITE_DELETE: u32 = 7;
         const FILE_FLAG_OVERLAPPED: u32 = 0x40000000;
         const FSCTL_REQUEST_OPLOCK_LEVEL_2: u32 = 0x90004;
         const ERROR_IO_PENDING: i32 = 997;
-        // ReOpenFile refers to the same object even if its path was replaced. Keep
-        // asynchronous I/O on a separate handle from the synchronous decoder.
+        // Attribute-only access does not conflict with an exclusive tag editor.
+        // ReOpenFile keeps the oplock attached to the exact object scanned.
         unsafe {
             let raw = ReOpenFile(
                 file.as_raw_handle(),
-                GENERIC_READ,
+                FILE_READ_ATTRIBUTES,
                 SHARE_READ_WRITE_DELETE,
                 FILE_FLAG_OVERLAPPED,
             );
@@ -155,35 +160,68 @@ impl Drop for ReadLease {
     }
 }
 
-thread_local! {
-    static RECENT: RefCell<VecDeque<(FileId, ReadLease, Index)>> = const { RefCell::new(VecDeque::new()) };
+struct Cached {
+    id: FileId,
+    lease: ReadLease,
+    index: Arc<Index>,
+    expires: Instant,
 }
 
-pub(super) fn index(file: &mut File, track: &Track, rate: u32) -> Result<Index> {
+static RECENT: Mutex<VecDeque<Cached>> = Mutex::new(VecDeque::new());
+const REOPEN_WINDOW: Duration = Duration::from_secs(2);
+
+fn expire_idle() {
+    loop {
+        let next = {
+            let mut items = RECENT.lock().unwrap();
+            let now = Instant::now();
+            items.retain_mut(|item| {
+                if Arc::strong_count(&item.index) > 1 {
+                    item.expires = now + REOPEN_WINDOW;
+                }
+                item.expires > now && item.lease.intact()
+            });
+            items.iter().map(|item| item.expires).min()
+        };
+        let Some(next) = next else { return };
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+}
+
+pub(super) fn index(file: &mut File, track: &Track, rate: u32) -> Result<Arc<Index>> {
     let id = file_id(file);
     let cached = id.and_then(|id| {
-        RECENT.with_borrow(|items| {
-            items
-                .iter()
-                .find(|(key, lease, _)| *key == id && lease.intact())
-                .map(|(_, _, index)| index.clone())
-        })
+        let mut items = RECENT.lock().unwrap();
+        let item = items
+            .iter_mut()
+            .find(|item| item.id == id && item.lease.intact())?;
+        item.expires = Instant::now() + REOPEN_WINDOW;
+        Some(item.index.clone())
     });
     if let Some(index) = cached {
         return Ok(index);
     }
 
     let lease = id.and_then(|id| ReadLease::acquire(file).map(|lease| (id, lease)));
-    let (index, walked) = scan(file, file.metadata()?.len(), track, rate)?;
-    if walked
-        && let Some((id, lease)) = lease
+    let index = Arc::new(scan(file, file.metadata()?.len(), track, rate)?);
+    if let Some((id, lease)) = lease
         && lease.intact()
     {
-        RECENT.with_borrow_mut(|items| {
-            items.retain(|(key, old, _)| *key != id && old.intact());
-            items.truncate(3);
-            items.push_front((id, lease, index.clone()));
+        let mut items = RECENT.lock().unwrap();
+        // Only the expiry thread empties the cache. Start it for the first
+        // entry in a burst, and let it exit when the last entry expires.
+        let start = items.is_empty();
+        items.retain(|item| item.id != id && item.lease.intact());
+        items.truncate(3);
+        items.push_front(Cached {
+            id,
+            lease,
+            index: index.clone(),
+            expires: Instant::now() + REOPEN_WINDOW,
         });
+        if start && std::thread::Builder::new().spawn(expire_idle).is_err() {
+            items.clear();
+        }
     }
     Ok(index)
 }
