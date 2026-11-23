@@ -2,7 +2,8 @@ use super::*;
 use std::{
     fs::File,
     net::{TcpListener, TcpStream},
-    process::{Child, Stdio},
+    os::windows::io::{AsRawHandle, OwnedHandle, RawHandle},
+    process::{Child, Command, Stdio},
     thread,
 };
 use tempfile::tempdir;
@@ -127,27 +128,16 @@ fn marker_spelling_does_not_select_the_installer_destination() {
 #[test]
 fn signed_release_feed_end_to_end() {
     with_prepared_release(FIXTURE_SETUP, |plan, root, install, origin, key| {
-        let mut command = plan.command();
         let child = plan
             .spawn_command(
-                command
-                    .env("STRING_TEST_TARGET", install)
-                    .env("LOCALAPPDATA", root)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped()),
+                &[("STRING_TEST_TARGET", install), ("LOCALAPPDATA", root)],
                 0x08000000,
             )
             .unwrap();
         drop(plan);
-        let run = child.wait_with_output().unwrap();
-        assert!(
-            run.status.success(),
-            "{}",
-            String::from_utf8_lossy(&run.stderr)
-        );
+        wait_for_setup(&child);
         let version = fs::read_to_string(install.join("setup/version.txt")).unwrap();
-        assert_eq!(version, "9.9.9", "{}", String::from_utf8_lossy(&run.stdout));
+        assert_eq!(version, "9.9.9");
         assert_eq!(fs::read(install.join("String.exe")).unwrap(), b"fixture");
         let updated =
             Updater::for_test_feed(install, &version, &format!("{origin}/repos/good"), key)
@@ -159,17 +149,31 @@ fn signed_release_feed_end_to_end() {
 #[test]
 fn launch_uses_the_signed_entry_spelling() {
     with_prepared_release("# Mixed-case entry\nparam($To)", |plan, _, _, _, _| {
-        let command = plan.command();
-        let script = command
-            .get_envs()
-            .find(|(key, _)| *key == "STRING_UPDATE_SCRIPT")
-            .and_then(|(_, value)| value)
-            .unwrap();
-        assert_eq!(
-            Path::new(script).file_name().unwrap().to_str(),
-            Some("Install.PS1")
+        let script = &plan.release.script;
+        assert_eq!(script.file_name().unwrap().to_str(), Some("Install.PS1"));
+        assert!(
+            script.to_string_lossy().starts_with(r"\\?\Volume{"),
+            "PowerShell still locates the signed script by a drive letter"
         );
     });
+}
+
+fn wait_for_setup(child: &OwnedHandle) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn WaitForSingleObject(handle: RawHandle, milliseconds: u32) -> u32;
+        fn GetExitCodeProcess(handle: RawHandle, code: *mut u32) -> i32;
+    }
+    let mut code = 0;
+    assert_eq!(
+        unsafe { WaitForSingleObject(child.as_raw_handle(), 90000) },
+        0
+    );
+    assert_ne!(
+        unsafe { GetExitCodeProcess(child.as_raw_handle(), &mut code) },
+        0
+    );
+    assert_eq!(code, 0);
 }
 
 fn delete_handle(dir: &Path) -> io::Result<File> {
@@ -191,11 +195,12 @@ fn prepared_release_holds_checked_folders_until_launch() {
     // This signed fixture entry point only checks its working directory and the target marker.
     let probe = r#"param([string]$To)
 $release = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($PSScriptRoot))
-if ($PWD.Path -eq $release -and (Test-Path -LiteralPath (Join-Path $To 'setup/installed.txt'))) {
-    [Console]::Write('prepared')
+if ($PWD.ProviderPath -eq $release -and [Environment]::CurrentDirectory -eq $release -and
+    (Test-Path -LiteralPath (Join-Path $To 'setup/installed.txt'))) {
+    [IO.File]::WriteAllText($env:STRING_TEST_RESULT, 'prepared')
 }
 "#;
-    with_prepared_release(probe, |plan, _, install, _, _| {
+    with_prepared_release(probe, |plan, root, install, _, _| {
         let dirs = [
             install.to_owned(),
             plan.release.path.clone(),
@@ -205,29 +210,13 @@ if ($PWD.Path -eq $release -and (Test-Path -LiteralPath (Join-Path $To 'setup/in
         for dir in &dirs {
             assert_delete_denied(dir);
         }
-        let mut command = plan.command();
+        let result = root.join("result");
         let child = plan
-            .spawn_command(
-                command
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped()),
-                0x08000000,
-            )
+            .spawn_command(&[("STRING_TEST_RESULT", &result)], 0x08000000)
             .unwrap();
         drop(plan);
-        let run = child.wait_with_output().unwrap();
-        assert!(
-            run.status.success(),
-            "{}",
-            String::from_utf8_lossy(&run.stderr)
-        );
-        assert_eq!(
-            run.stdout,
-            b"prepared",
-            "{}",
-            String::from_utf8_lossy(&run.stderr)
-        );
+        wait_for_setup(&child);
+        assert_eq!(fs::read(result).unwrap(), b"prepared");
         for dir in &dirs {
             delete_handle(dir).unwrap();
         }
@@ -250,15 +239,15 @@ fn prepared_payload_is_read_only_through_the_child_lifetime() {
             };
             let before = [&script, &exe].map(|p| write_error(p));
             let done = root.join("continue");
-            let mut command = plan.command();
-            command.env("STRING_TEST_WAIT", &done);
-            let mut child = plan.spawn_command(&mut command, 0x08000000).unwrap();
+            let child = plan
+                .spawn_command(&[("STRING_TEST_WAIT", &done)], 0x08000000)
+                .unwrap();
             drop(plan);
             // Opening for write is enough to check sharing. Leave the files untouched.
             let after = [&script, &exe].map(|p| write_error(p));
             let parent = delete_handle(root).err().and_then(|e| e.raw_os_error());
             fs::write(done, "").unwrap();
-            child.wait().unwrap();
+            wait_for_setup(&child);
             assert_eq!(
                 (before, after, parent),
                 ([Some(32); 2], [Some(32); 2], Some(32))
@@ -367,15 +356,15 @@ fn with_prepared_release(
         matches!(events.first(),Some(Progress::Receiving{got,total}) if got> &0 && *total==latest.size)
     );
     assert!(matches!(events.last(), Some(Progress::Verifying)));
-    assert_eq!(plan.release.path, data.join(r"updates\String-9.9.9"));
+    let expected = unpack::open_dir(&data.join(r"updates\String-9.9.9")).unwrap();
+    assert!(
+        file_id(&unpack::open_dir(&plan.release.path).unwrap()).unwrap()
+            == file_id(&expected).unwrap()
+    );
+    drop(expected);
     let prepared_script = plan.release.script.clone();
     assert_eq!(fs::read_to_string(&prepared_script).unwrap(), setup);
     assert_eq!(plan.to, install);
-    assert!(
-        plan.command()
-            .get_args()
-            .all(|s| !s.to_string_lossy().contains(install.to_str().unwrap()))
-    );
     // Another preparation must wait while the pending plan owns its release.
     assert_eq!(
         unpack::UpdateFolder::open(&data)

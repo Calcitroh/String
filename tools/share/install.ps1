@@ -111,6 +111,19 @@ function Sha256([string]$path) {
     $s = [IO.File]::OpenRead($path)
     try { [BitConverter]::ToString($sha.ComputeHash($s)) -replace '-', '' } finally { $s.Dispose() }
 }
+# Parse only the bytes that match the helper's manifest row. Keep them for the
+# installed uninstaller too, since the extracted ZIP may change during setup.
+function Read-BackupHelper($f) {
+    $bytes = [IO.File]::ReadAllBytes($f.Full)
+    if ($bytes.Length -ne $f.Size -or [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') -ne $f.Hash) {
+        throw 'The backup helper does not match the file list.'
+    }
+    $script = [scriptblock]::Create([Text.UTF8Encoding]::new($false, $true).GetString($bytes))
+    if ($script.Ast.ParamBlock.Parameters.Name.VariablePath.UserPath -notcontains 'BackupFunctionsOnly') {
+        throw 'The backup helper is incomplete.'
+    }
+    [PSCustomObject]@{ Script = $script; Bytes = $bytes }
+}
 # String copies running from the install folder or from the unzipped folder (another copy elsewhere is left alone)
 function Running { @(Get-Process -Name String -ErrorAction SilentlyContinue | Where-Object { (Under $_.Path $To) -or (Under $_.Path $from) }) }
 function WebView2Version {
@@ -171,7 +184,13 @@ try {
     foreach ($required in 'String.exe', 'setup\install.ps1', 'setup\uninstall.ps1', 'setup\version.txt') {
         if ($files.Rel -notcontains $required) { Fail $unzipAgain }
     }
+    $helper = $null
     foreach ($f in $files) {
+        if ($f.Rel -ieq 'setup\uninstall.ps1') {
+            if ($helper) { Fail $unzipAgain }
+            $helper = Read-BackupHelper $f
+            continue
+        }
         if (-not [IO.File]::Exists($f.Full) -or (New-Object IO.FileInfo $f.Full).Length -ne $f.Size -or (Sha256 $f.Full) -ne $f.Hash) { Fail $unzipAgain }
     }
     $version = [version]([IO.File]::ReadAllText((Join-Path $from 'setup\version.txt')).Trim())
@@ -182,9 +201,8 @@ catch { Fail "$unzipAgain ($($_.Exception.Message))" }
 
 # Load the backup functions from the incoming, manifest-checked setup scripts.
 # Reject an incomplete or mixed package before closing the old player.
-$backupScript = Join-Path $from 'setup\uninstall.ps1'
-if (-not (Get-Command -Name $backupScript).Parameters.ContainsKey('BackupFunctionsOnly')) { Fail $unzipAgain }
-. $backupScript -BackupFunctionsOnly -To $To -Menu $Menu -Desktop $Desktop -AppsKey $AppsKey -Data $env:LOCALAPPDATA -DataChoice keep
+$verifiedHelper = $helper.Script
+. $verifiedHelper -BackupFunctionsOnly -To $To -Menu $Menu -Desktop $Desktop -AppsKey $AppsKey -Data $env:LOCALAPPDATA -DataChoice keep
 Initialize-Backup
 
 if (-not $needsWebView) {
@@ -217,7 +235,8 @@ try {
     foreach ($f in $files) {
         $dst = Join-Path $new $f.Rel
         [void][IO.Directory]::CreateDirectory((Split-Path $dst -Parent))
-        [IO.File]::Copy($f.Full, $dst, $true)
+        if ($f.Rel -ieq 'setup\uninstall.ps1') { [IO.File]::WriteAllBytes($dst, $helper.Bytes) }
+        else { [IO.File]::Copy($f.Full, $dst, $true) }
         if ((New-Object IO.FileInfo $dst).Length -ne $f.Size) { throw "incomplete: $($f.Rel)" }
     }
     [IO.File]::Copy((Join-Path $from 'setup\files.txt'), (Join-Path $new 'setup\files.txt'), $true)
@@ -309,19 +328,14 @@ if (Has $old) {
         $p = Join-Path $old $rel; $k = $rel.ToLower()
         try {
             if ((IsLink $p) -or -not (NoLinks $old $p)) { continue }
-            $len = (New-Object IO.FileInfo $p).Length
             $was = $cur[$k]
-            $go = $k -eq 'setup\files.txt' -or $k -eq 'setup\installed.txt' -or (Split-Path $k -Leaf) -in 'desktop.ini', 'thumbs.db'
-            if (-not $go -and $was -and $len -eq $was.Size) { $go = (Sha256 $p) -eq $was.Hash }
-            if ($go -and @(Named-Streams $p).Count) { $go = $false }
-            # The verified backup and its parent directories are still held open.
-            if (-not $go -and $savedHashes.ContainsKey($rel)) { $go = Matches-Backup $p $savedHashes[$rel] }
-            if ($go) { [IO.File]::SetAttributes($p, [IO.FileAttributes]::Normal); [IO.File]::Delete($p) }
+            $metadata = $k -eq 'setup\files.txt' -or $k -eq 'setup\installed.txt' -or (Split-Path $k -Leaf) -in 'desktop.ini', 'thumbs.db'
+            [void](Remove-VerifiedFile $p $savedHashes[$rel] -OriginalHash $was.Hash -SetupMetadata:$metadata)
         }
         catch { }
     }
     Remove-Empty $old
-    if (Has $old) { Say "Some files of the copy you had weren't String's or in the saved copy, so they were left here: $old" }
+    if (Has $old) { Say "Some files of the previous copy could not be safely removed. They were left here: $old" }
 }
 Close-Backups
 if ($edits) {

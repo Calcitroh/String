@@ -23,16 +23,20 @@ function Close-Backups {
 }
 # Pin from the root down. OPEN_REPARSE_POINT opens the directory itself;
 # denying write/delete sharing keeps it from being redirected after the check.
-function Pin-BackupDir([string]$dir) {
-    if ($backupDirs.ContainsKey($dir)) { return }
-    $parent = [IO.Path]::GetDirectoryName($dir)
+function Pin-BackupDir([string]$dir, $pins = $backupDirs) {
+    # .NET Framework treats the Win32 volume prefix as a UNC server. Stop at
+    # the volume root and keep the trailing slash that opens its directory.
+    $volumeRoot = $dir -match '^\\\\\?\\Volume\{[0-9a-f-]+\}\\?$'
+    if ($volumeRoot) { $dir = $dir.TrimEnd('\') + '\' }
+    if ($pins.ContainsKey($dir)) { return }
+    $parent = if (-not $volumeRoot) { [IO.Path]::GetDirectoryName($dir) }
     if ($parent) {
-        Pin-BackupDir $parent
-        [void][IO.Directory]::CreateDirectory($dir)
+        Pin-BackupDir $parent $pins
+        if ($pins -eq $backupDirs) { [void][IO.Directory]::CreateDirectory($dir) }
     }
     $handle = [StringSetup.Backup]::CreateFileW($dir, 0x81, 1, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
     if ($handle.IsInvalid) { $handle.Dispose(); throw "Cannot secure the backup folder $dir." }
-    $backupDirs.Add($dir, $handle)
+    $pins.Add($dir, $handle)
     $attrs = [StringSetup.Backup]::Attributes($handle)
     if (($attrs -band 0x410) -ne 0x10) { throw "$dir is not a regular directory or is a folder link." }
 }
@@ -53,6 +57,16 @@ public static uint Attributes(Microsoft.Win32.SafeHandles.SafeFileHandle file) {
     if (!GetFileInformationByHandleEx(file, 9, out info, 8))
         throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
     return (uint)info;
+}
+
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+private static extern uint GetFinalPathNameByHandleW(Microsoft.Win32.SafeHandles.SafeFileHandle file,
+    System.Text.StringBuilder name, uint size, uint flags);
+public static string VolumePath(Microsoft.Win32.SafeHandles.SafeFileHandle file) {
+    var name = new System.Text.StringBuilder(32768);
+    uint n = GetFinalPathNameByHandleW(file, name, (uint)name.Capacity, 1);
+    if (n == 0 || n >= name.Capacity) throw new System.IO.IOException("Cannot resolve a stable local file path.");
+    return name.ToString();
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -84,9 +98,52 @@ public static void RenameSibling(string source, string destination) {
     }
 }
 
+// NTFS write transactions exclude changes to the whole file, even creation of
+// a previously unknown stream. Closing an uncommitted transaction rolls back.
+[DllImport("ktmw32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateTransaction(IntPtr security, IntPtr guid,
+    uint options, uint isolation, uint flags, uint timeout, string description);
+[DllImport("ktmw32.dll", SetLastError=true)]
+public static extern bool CommitTransaction(Microsoft.Win32.SafeHandles.SafeFileHandle transaction);
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true, SetLastError=true)]
+private static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileTransactedW(string path, uint access,
+    uint share, IntPtr security, uint disposition, uint flags, IntPtr template,
+    Microsoft.Win32.SafeHandles.SafeFileHandle transaction, IntPtr version, IntPtr extended);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file,
+    int kind, ref byte value, uint length);
+[StructLayout(LayoutKind.Sequential)]
+private struct BasicInfo { public long created, accessed, written, changed; public uint attributes; }
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool SetFileInformationByHandle(Microsoft.Win32.SafeHandles.SafeFileHandle file,
+    int kind, ref BasicInfo info, uint length);
+
+public static Microsoft.Win32.SafeHandles.SafeFileHandle OpenForRetirement(string path,
+        Microsoft.Win32.SafeHandles.SafeFileHandle transaction) {
+    var file = CreateFileTransactedW(path, 0x10180, 1, IntPtr.Zero, 3, 0x00200000, IntPtr.Zero,
+        transaction, IntPtr.Zero, IntPtr.Zero);
+    if (file.IsInvalid) { file.Dispose(); throw new System.IO.IOException("Cannot protect the original for removal."); }
+    try {
+        if ((Attributes(file) & 0x410) != 0) throw new System.IO.IOException("Expected a regular file.");
+        return file;
+    } catch { file.Dispose(); throw; }
+}
+
+public static void MarkForRemoval(Microsoft.Win32.SafeHandles.SafeFileHandle file) {
+    uint attrs = Attributes(file);
+    if ((attrs & 1) != 0) {
+        var info = new BasicInfo { attributes = (attrs & ~1u) == 0 ? 0x80u : attrs & ~1u };
+        if (!SetFileInformationByHandle(file, 0, ref info, (uint)Marshal.SizeOf(typeof(BasicInfo))))
+            throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+    }
+    byte remove = 1; // FileDispositionInfo, on the same object checked in the transaction.
+    if (!SetFileInformationByHandle(file, 4, ref remove, 1))
+        throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+}
+
 // Under .NET Framework, File.Open does not accept a named stream pathname.
-public static System.IO.FileStream OpenStream(string path, bool create) {
-    var handle = CreateFileW(path, create ? 0xc0000000u : 0x80000000u, 1, IntPtr.Zero,
+public static System.IO.FileStream OpenStream(string path, bool create, bool retiring = false) {
+    var handle = CreateFileW(path, create ? 0xc0000000u : 0x80000000u, retiring ? 5u : 1u, IntPtr.Zero,
         create ? 1u : 3u, 0x00200000, IntPtr.Zero);
     if (handle.IsInvalid) {
         int error = Marshal.GetLastWin32Error();
@@ -131,18 +188,43 @@ function Save-Backup([string]$source, [string]$dest) {
     return $hashes
 }
 
-function Matches-Backup([string]$path, $hashes) {
+function Matches-Backup([string]$path, $hashes, [string]$OriginalHash, [switch]$SetupMetadata) {
     $streams = @('') + @(Named-Streams $path)
-    if ($streams.Count -ne $hashes.get_Count()) { return $false }
+    $single = $streams.Count -eq 1
+    if ($single -and $SetupMetadata) { return $true }
+    $saved = $null -ne $hashes -and $streams.Count -eq $hashes.get_Count()
+    if (-not $saved -and -not ($single -and $OriginalHash)) { return $false }
     foreach ($stream in $streams) {
-        if (-not $hashes.ContainsKey($stream)) { return $false }
         $suffix = if ($stream) { ':' + $stream } else { '' }
-        $file = [StringSetup.Backup]::OpenStream($path + $suffix, $false)
-        try {
-            if ([BitConverter]::ToString($sha.ComputeHash($file)) -cne $hashes[$stream]) { return $false }
-        } finally { $file.Dispose() }
+        $file = [StringSetup.Backup]::OpenStream($path + $suffix, $false, $true)
+        try { $digest = [BitConverter]::ToString($sha.ComputeHash($file)) } finally { $file.Dispose() }
+        if ($single -and $digest.Replace('-', '') -eq $OriginalHash) { return $true }
+        if (-not $saved -or $hashes[$stream] -cne $digest) { return $false }
     }
     return $true
+}
+
+function Remove-VerifiedFile([string]$path, $hashes, [string]$OriginalHash, [switch]$SetupMetadata) {
+    $pins = [Collections.Generic.Dictionary[string,IDisposable]]::new([StringComparer]::Ordinal)
+    $transaction = $null; $original = $null
+    try {
+        Initialize-Backup
+        Pin-BackupDir ([IO.Path]::GetDirectoryName($path)) $pins
+        $transaction = [StringSetup.Backup]::CreateTransaction([IntPtr]::Zero, [IntPtr]::Zero, 0, 0, 0, 0, 'String cleanup')
+        if ($transaction.IsInvalid) { return $false }
+        $original = [StringSetup.Backup]::OpenForRetirement($path, $transaction)
+        $path = [StringSetup.Backup]::VolumePath($original)
+        Pin-BackupDir ([IO.Path]::GetDirectoryName($path)) $pins
+        if ([StringSetup.Backup]::VolumePath($original) -cne $path -or
+            -not (Matches-Backup $path $hashes $OriginalHash -SetupMetadata:$SetupMetadata)) { return $false }
+        [StringSetup.Backup]::MarkForRemoval($original)
+        $original.Dispose()
+        return [StringSetup.Backup]::CommitTransaction($transaction)
+    } finally {
+        if ($original) { $original.Dispose() }
+        if ($transaction) { $transaction.Dispose() }
+        foreach ($dir in $pins.Values) { $dir.Dispose() }
+    }
 }
 
 # The installer imports the backup functions from the verified incoming package.
@@ -251,11 +333,7 @@ if ($saved) { Say "Your own changes to String's files ($saved) are saved in: $ed
 # changed in the meantime (an editor saving it) stays.
 function Remove-Verified($t) {
     try {
-        $len = (New-Object IO.FileInfo $t.Full).Length
-        $h = Sha256 $t.Full
-        $same = $len -eq $t.Size -and $h -eq $t.Hash -and -not @(Named-Streams $t.Full).Count
-        if (-not $same -and $t.Copy) { $same = Matches-Backup $t.Full $t.Copy }
-        if ($same) { [IO.File]::SetAttributes($t.Full, [IO.FileAttributes]::Normal); [IO.File]::Delete($t.Full) }
+        [void](Remove-VerifiedFile $t.Full $t.Copy -OriginalHash $t.Hash)
     }
     catch { }
     return -not [IO.File]::Exists($t.Full)
@@ -268,7 +346,7 @@ foreach ($t in $targets) {
 if (-not $stuck.Count -and $selfFile -and -not (Remove-Verified $selfFile)) { $stuck += $selfFile.Rel }
 if ($stuck.Count) {
     $where = ''; if ($saved) { $where = " Your changes so far are saved in: $edits" }
-    Done "Some of String's files are still in use or were just changed ($(($stuck | Select-Object -First 3) -join ', ')), so String isn't fully removed yet. Close what uses them (or restart the PC), then uninstall it again from Settings > Apps.$where" 1
+    Done "Windows couldn't safely remove some of String's files ($(($stuck | Select-Object -First 3) -join ', ')). They are still in $To. If they are open, close them, then uninstall again from Settings > Apps.$where" 1
 }
 
 # then the shortcuts and the Apps entry (only String's own, pointing at this folder)
@@ -286,7 +364,7 @@ try {
 }
 catch { }
 foreach ($f in $list, $mark) {
-    try { if (-not @(Named-Streams $f).Count) { [IO.File]::Delete($f) } } catch { }
+    try { [void](Remove-VerifiedFile $f $null -SetupMetadata) } catch { }
 }
 Remove-Empty $To
 $left = ''

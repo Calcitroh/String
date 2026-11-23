@@ -14,7 +14,6 @@ use std::{
     fmt, fs,
     io::{self, Read, Seek, Write},
     path::{Path, PathBuf},
-    process::Command,
     str::FromStr,
     time::{Duration, Instant},
 };
@@ -106,36 +105,26 @@ pub struct InstallPlan {
 }
 impl InstallPlan {
     /// Hand the verified files and their directory guards to the installer process.
-    pub fn spawn(&self) -> io::Result<std::process::Child> {
-        self.spawn_command(&mut self.command(), 0x10) // CREATE_NEW_CONSOLE
+    pub fn spawn(&self) -> io::Result<std::os::windows::io::OwnedHandle> {
+        self.spawn_command(&[], 0x10) // CREATE_NEW_CONSOLE
     }
 
-    fn spawn_command(&self, command: &mut Command, flags: u32) -> io::Result<std::process::Child> {
+    fn spawn_command(
+        &self,
+        extra: &[(&str, &Path)],
+        flags: u32,
+    ) -> io::Result<std::os::windows::io::OwnedHandle> {
+        let mut paths = vec![
+            ("STRING_UPDATE_RELEASE", self.release.path.as_path()),
+            ("STRING_UPDATE_SCRIPT", self.release.script.as_path()),
+            ("STRING_UPDATE_TO", self.to.as_path()),
+        ];
+        paths.extend_from_slice(extra);
         launch::spawn(
-            command,
+            &paths,
             flags,
             self.release.guards().chain(&self.install_parents),
         )
-    }
-
-    fn command(&self) -> Command {
-        let mut cmd = Command::new("powershell.exe");
-        const RUN: &str = concat!(
-            "Set-Location -LiteralPath $env:STRING_UPDATE_RELEASE -ErrorAction Stop; ",
-            "[Environment]::CurrentDirectory = $env:STRING_UPDATE_RELEASE; ",
-            "$Host.UI.RawUI.WindowTitle = 'Updating String'; ",
-            "& $env:STRING_UPDATE_SCRIPT -To $env:STRING_UPDATE_TO; ",
-            "if ($LASTEXITCODE) { Read-Host 'Press Enter to close' }"
-        );
-        // Before assignment to the handoff job, even a suspended child must
-        // not own a working-directory handle inside the prepared release.
-        cmd.current_dir(self.release.path.ancestors().last().unwrap())
-            .env("STRING_UPDATE_RELEASE", &self.release.path)
-            .env_remove("PSModulePath")
-            .env("STRING_UPDATE_SCRIPT", &self.release.script)
-            .env("STRING_UPDATE_TO", &self.to)
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", RUN]);
-        cmd
     }
 }
 pub struct Updater {
