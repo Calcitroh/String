@@ -37,9 +37,6 @@ pub fn filter(ui: &mut Ui, v: &mut View<'_>, field: Rect, hint: &str) {
             .hint_text(hint)
             .frame(egui::Frame::NONE),
     );
-    if resp.changed() {
-        v.views.selection = Default::default();
-    }
     if clear
         && ui::icon_btn(
             ui,
@@ -52,7 +49,6 @@ pub fn filter(ui: &mut Ui, v: &mut View<'_>, field: Rect, hint: &str) {
         .clicked()
     {
         v.views.filter.clear();
-        v.views.selection = Default::default();
         resp.request_focus();
     }
 }

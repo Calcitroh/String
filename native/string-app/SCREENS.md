@@ -31,8 +31,8 @@ For an existing route, replace that file’s body. All twelve routes are already
 | `theme::{font,hud,mono,Tint}` | Use the shared UI, Strong, HUD and Mono faces, surface colours and selected tint. Sizes are logical points. |
 | `ui::{btn,seg,icon_btn,play_big}` | Buttons return an egui response. Icon buttons take a rectangle, glyph name, accessible title, selected state and tint. |
 | `ui::glyph::draw` | Paint a named HUD outline into a rectangle. The glyph inventory is in `ui/glyphs.json`. |
-| `ui::songs::show` | Supply `Table`, a persistent `Selection`, the cover cache and a right-click menu callback. Handle the returned `Action` for play, queue, like, sort or playlist removal. `screens::library_table` is the complete wiring example. |
-| `Selection::ids` | Resolve selected row indices against the displayed order. Drag payloads use the same `model::Ids` type. A target can accept `response.dnd_release_payload::<Ids>()`. |
+| `ui::songs::show` | Supply `Table`, a persistent `Selection`, the cover cache and a right-click menu callback. Handle the returned `Action` for play, queue, like or sort. `screens::library_table` is the complete wiring example. |
+| `Selection::ids` | Return the selected songs from the current bound list. Rebinding retains surviving song IDs and identifies playlist occurrences by their added time and order. Drag payloads use the same `model::Ids` type. A target can accept `response.dnd_release_payload::<Ids>()`. |
 | `v.covers.get(&song.cover, size, tint)` | Request a 176, 420 or 960 pixel image. Pass `None` for colour or `Some(v.tint)` for tinted art. Paint the optional result with `ui::sleeve`. Workers decode on cache misses and wake the UI. Large art includes grooved record and blurred backdrop textures. |
 | `ui::{rail,hit,child,label}` | Seek or volume input, accessible click target, clipped child UI and clipped single-line text for custom layouts. |
 | `v.views.toast.set`, `ui::confirm`, `ui::context_menu` | Transient feedback, a modal returning the user’s decision and a standard context menu. |
@@ -61,13 +61,13 @@ Add a `smoke::Case` to `smoke::CASES` between Songs and Now Playing. Implement `
 use crate::ui::menus::{self, Origin};
 // A song row: the selected ids, where the click landed, and the list they came from.
 if let Some(at) = menus::menu_pos(&response) {
-    menus::track_menu(selection.ids(&ids), at, Origin::list(ids.clone(), row, v.context()));
+    menus::track_menu(selection.ids(), at, Origin::list(ids.clone(), row, v.context()));
 }
 // An album, artist or playlist card, or a page's "more" button.
 menus::ctx_menu(json!({"kind":"album","key":key}), at, None);
 ```
 
-- `Origin::list(ids, row, ctx)` makes Play start that list at `row` (the first selected row for several songs). `Origin::none()` plays just the songs. Set `Origin::playlist` to the playlist id and the entries' places to add "Remove from this playlist".
+- `Origin::list(ids, row, ctx)` makes Play start that list at `row` (the first selected row for several songs). `Origin::none()` plays just the songs. Set `Origin::playlist` to the playlist id and a clone of its bound selection to add "Remove from this playlist".
 - `ctx_menu`'s last argument is the filtered list on screen, when there is one.
 - The same actions are free functions for buttons: `play_ctx`, `shuffle_ctx`, `play_next`, `queue_tracks`, `add_to_playlist`, `toggle_like`, `new_playlist`, `rename_playlist`, `delete_playlist`, `playlist_picker`. Each says what it did in the toast. `ctx_name`, `ctx_route`, `same_ctx`, `plural`, `long` and `when` give the words; `caps`, `empty_note` and `eq_bars` draw the shared bits.
 - `menus::hooks().edit_info = Some(fn(&mut View, &str))` adds "Edit info". `hooks().reveal` replaces the built-in Show in Explorer.

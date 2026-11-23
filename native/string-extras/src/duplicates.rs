@@ -133,6 +133,37 @@ pub fn forget_not_same(state: &mut State) {
 pub fn unhide_all(state: &mut State) {
     object(&mut state.fields, "hidden").clear();
 }
+fn title_parts(title: &str) -> (String, String) {
+    let (plain, core) = titles(title);
+    let key = if core.is_empty() { plain.clone() } else { core };
+    (plain, key)
+}
+
+// Possible and sure edges use the same two-second window in the list and at confirmation.
+fn related(a: f64, b: f64, same: bool) -> bool {
+    (a > 0. && b > 0. && (a - b).abs() <= 2.) || (same && (a == 0. || b == 0.))
+}
+
+pub fn still_copies(state: &State, keep: &Track, drop: &Track) -> bool {
+    let (k, d) = (keep.id(), drop.id());
+    if k == d
+        || state.hidden(&k)
+        || state.hidden(&d)
+        || truthy(&state.fields["notDupes"][pair_key(&k, &d)])
+    {
+        return false;
+    }
+    let (a, b) = (display_names(state, keep), display_names(state, drop));
+    let (ap, ak) = title_parts(&a.title);
+    let (bp, bk) = title_parts(&b.title);
+    !ak.is_empty()
+        && ak == bk
+        && related(
+            keep.tags.duration,
+            drop.tags.duration,
+            ap == bp && norm(&a.artist) == norm(&b.artist),
+        )
+}
 pub fn duplicates(lib: &Library, state: &State) -> Vec<DuplicateGroup> {
     let playlists = state.fields["playlists"].as_array().into_iter().flatten();
     let listed: HashSet<_> = playlists
@@ -150,8 +181,7 @@ pub fn duplicates(lib: &Library, state: &State) -> Vec<DuplicateGroup> {
     for (i, &track) in tracks.iter().enumerate() {
         let id = track.id();
         let names = display_names(state, track);
-        let (plain, core) = titles(&names.title);
-        let key = if core.is_empty() { plain.clone() } else { core };
+        let (plain, key) = title_parts(&names.title);
         if !key.is_empty() {
             buckets.entry(key).or_default().push(i);
         }
@@ -182,13 +212,12 @@ pub fn duplicates(lib: &Library, state: &State) -> Vec<DuplicateGroup> {
                     continue;
                 }
                 let (a, b) = (x.track.tags.duration, y.track.tags.duration);
-                let near = a > 0. && b > 0. && (a - b).abs() <= 2.;
                 let same = x.plain == y.plain && x.artist == y.artist;
-                if !(near || same && (a == 0. || b == 0.)) {
+                if !related(a, b, same) {
                     continue;
                 }
                 all.join(i, j);
-                if near && same && !x.artist.is_empty() {
+                if a > 0. && b > 0. && same && !x.artist.is_empty() {
                     let (r, s) = (sure.root(i), sure.root(j));
                     let range = (bounds[r].0.min(bounds[s].0), bounds[r].1.max(bounds[s].1));
                     if range.1 - range.0 <= 2. {

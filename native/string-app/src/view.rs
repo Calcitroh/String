@@ -24,6 +24,7 @@ pub struct Views {
     pub query: String,
     pub search_focus: bool,
     pub selection: Selection,
+    pub artist_popular_selection: Selection,
     pub toast: Toast,
     pub adding_playlist: bool,
     pub playlist_name: String,
@@ -63,6 +64,7 @@ impl View<'_> {
         self.views.overlay = None;
         self.views.queue = false;
         self.views.selection = Default::default();
+        self.views.artist_popular_selection = Default::default();
         self.views.filter.clear();
         self.views.cache = None;
         self.s

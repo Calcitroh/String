@@ -81,11 +81,20 @@ impl Files {
                 "The Recycle Bin is unavailable in smoke mode",
             ));
         }
-        if !path.is_absolute() || !song_path(path) {
+        if !path.is_absolute() || !recyclable_song(path) {
             return Err(io::Error::other("A full path to a song file is required"));
         }
         files::recycle(path)
     }
+}
+
+pub(crate) fn recyclable_song(path: &Path) -> bool {
+    // The library can play WebM video containers. Only audio types may go to the bin.
+    song_path(path)
+        && !path
+            .extension()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("webm")
 }
 
 fn song_path(path: &Path) -> bool {

@@ -3,11 +3,7 @@ use super::{
     detail::{self, Hero},
     library::{self, Index, count, section},
 };
-use crate::{
-    model::Ids,
-    ui::songs::{Columns, Selection},
-    view::View,
-};
+use crate::{model::Ids, ui::songs::Columns, view::View};
 use egui::{Id, Ui};
 use std::cmp::Reverse;
 pub fn show(ui: &mut Ui, v: &mut View<'_>) {
@@ -62,18 +58,15 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
         section(ui, heading, None, v);
         let ctx = v.context();
         ui.push_id("popular tracks", |ui| {
-            if ids.len() > 5 {
-                let key = ui.scope_id().with(("selection", v.s.generation));
-                let mut selection = ui
-                    .data_mut(|d| d.remove_temp::<Selection>(key))
-                    .unwrap_or_default();
-                std::mem::swap(&mut selection, &mut v.views.selection);
-                super::track_rows(ui, v, &popular, ctx.clone(), Columns::Popular);
-                std::mem::swap(&mut selection, &mut v.views.selection);
-                ui.data_mut(|d| d.insert_temp(key, selection));
-            } else {
-                super::track_rows(ui, v, &popular, ctx.clone(), Columns::Popular);
-            }
+            std::mem::swap(
+                &mut v.views.artist_popular_selection,
+                &mut v.views.selection,
+            );
+            super::track_rows(ui, v, &popular, ctx.clone(), Columns::Popular);
+            std::mem::swap(
+                &mut v.views.artist_popular_selection,
+                &mut v.views.selection,
+            );
         });
         if !a.albums.is_empty() {
             section(ui, "Albums", None, v);

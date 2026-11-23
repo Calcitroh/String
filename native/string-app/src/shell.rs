@@ -36,7 +36,6 @@ pub fn shortcuts(ui: &Ui, v: &mut View<'_>) {
             })
         {
             v.views.filter.clear();
-            v.views.selection = Default::default();
         }
         if v.views.adding_playlist {
             v.views.adding_playlist = false;
@@ -385,9 +384,6 @@ fn topbar(ui: &mut Ui, v: &mut View<'_>) {
     );
     if std::mem::take(&mut v.views.search_focus) {
         edit.request_focus();
-    }
-    if edit.changed() {
-        v.views.selection = Default::default();
     }
     if edit.changed() && v.views.history.current != Route::Search {
         v.go(Route::Search);

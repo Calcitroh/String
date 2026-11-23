@@ -70,9 +70,12 @@ pub fn open(v: &View<'_>, id: &str) {
         fresh: true,
     });
 }
+pub(crate) fn save_info(s: &mut crate::playback::Session, id: &str, info: &Info) {
+    edit_info(&mut s.state, id, info);
+    s.rebuild();
+}
 fn changed(v: &mut View<'_>, id: &str) {
     v.s.state_dirty = true;
-    v.s.rebuild();
     v.s.queue_changed(v.player);
     services::get().event(Event::Edited(id));
 }
@@ -87,6 +90,7 @@ pub fn swap(v: &mut View<'_>, id: &str) {
     v.views
         .toast
         .set(format!("Now “{}” by {}", now.title, now.artist));
+    v.s.rebuild();
     changed(v, id);
 }
 /// Draw the dialog while it is open, and pass on what worker threads had to say.
@@ -222,7 +226,7 @@ pub fn show(ctx: &Context, v: &mut View<'_>) {
         let form = st.form.take().unwrap();
         let mut info = form.info;
         info.art = info.art.trim().trim_matches('"').to_owned();
-        edit_info(&mut v.s.state, &form.id, &info);
+        save_info(v.s, &form.id, &info);
         changed(v, &form.id);
         v.views.toast.set("Saved");
     } else if close || dismissed {

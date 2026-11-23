@@ -9,10 +9,10 @@ pub mod home;
 pub(crate) mod library;
 pub(crate) mod library_input;
 pub(crate) mod library_smoke;
-#[path = "../ui/library_motion.rs"]
-mod motion;
 pub mod liked;
 pub mod lyrics;
+#[path = "../ui/library_motion.rs"]
+mod motion;
 pub mod now_playing;
 pub mod playlist;
 pub mod search;
@@ -50,7 +50,17 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     // Cards have their own rise, including when the album order changes.
     let motion = motion::Motion::for_page(ui.ctx(), &v.views.history.current);
     ui.multiply_opacity(motion.page_progress(ui.ctx()));
+    v.views.selection.shown = false;
+    v.views.artist_popular_selection.shown = false;
     draw(ui, v);
+    for selection in [
+        &mut v.views.selection,
+        &mut v.views.artist_popular_selection,
+    ] {
+        if !selection.shown {
+            selection.left_list();
+        }
+    }
 }
 pub fn heading(ui: &mut Ui, title: &str, detail: &str) {
     library::heading(ui, title, detail);
@@ -90,12 +100,12 @@ pub fn library_table(ui: &mut Ui, v: &mut View<'_>) {
             query: v.views.query.clone(),
             filter: v.views.filter.clone(),
         });
-        v.views.selection = Default::default();
     }
     let ids = v.views.cache.as_ref().unwrap().ids.clone();
     if let Some(id) = v.views.reveal_id.take()
         && let Some(i) = ids.iter().position(|j| j == &id)
     {
+        v.views.selection.display(&ids, None);
         v.views.selection.choose(i, false, false);
         v.views.selection.reveal = Some(i);
     }
@@ -212,7 +222,7 @@ fn track_rows(
     } else {
         true
     };
-    if keys_here && !ui.ctx().text_edit_focused() {
+    if keys_here && !ui.ctx().text_edit_focused() && !ui::menus::is_open() {
         ui.input(|i| {
             if i.modifiers.ctrl && i.key_pressed(egui::Key::A) {
                 v.views.selection.indices.extend(0..ids.len());
@@ -222,12 +232,9 @@ fn track_rows(
             {
                 action = Some(Action::Play(row));
             }
-            if i.key_pressed(egui::Key::Delete) && matches!(route, Route::Playlist(_)) {
-                action = Some(Action::Remove);
-            }
         });
     }
-    let selected = || v.views.selection.ids(ids);
+    let selected = || v.views.selection.ids();
     match action {
         Some(Action::Menu(i, at)) => {
             // Play from the menu starts the list at the first selected row.
@@ -260,30 +267,6 @@ fn track_rows(
             v.s.generation += 1;
             v.s.queue_changed(v.player);
             v.views.cache = None;
-            v.views.selection = Default::default();
-        }
-        Some(Action::Remove) => {
-            if let Route::Playlist(key) = &route {
-                let picked = selected();
-                if let Some(pl) =
-                    v.s.state
-                        .fields
-                        .get_mut("playlists")
-                        .and_then(|a| a.as_array_mut())
-                        .and_then(|a| a.iter_mut().find(|p| &p["id"] == key))
-                    && let Some(items) = pl["items"].as_array_mut()
-                {
-                    items.retain(|item| {
-                        !picked
-                            .iter()
-                            .any(|id| item.as_str() == Some(id) || item["id"] == *id)
-                    });
-                    pl["updated"] = chrono::Local::now().timestamp_millis().into();
-                    v.s.models.refresh_lists(&v.s.state);
-                    v.s.state_dirty = true;
-                    v.s.generation += 1;
-                }
-            }
         }
         None => {}
     }
