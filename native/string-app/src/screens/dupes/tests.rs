@@ -1,7 +1,9 @@
 use super::*;
 use serde_json::json;
 use std::{
-    fs, thread,
+    fs,
+    path::PathBuf,
+    thread,
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use string_core::{
@@ -150,6 +152,21 @@ impl Fixture {
             assert!(start.elapsed() < Duration::from_secs(10));
             thread::sleep(Duration::from_millis(2));
         }
+    }
+    fn preserved_filename(&mut self) -> PathBuf {
+        use std::os::windows::ffi::OsStringExt;
+        let wide = std::ffi::OsString::from_wide(&[0xd800, 46, 119, 97, 118]);
+        let path = self._dir.path().join(wide);
+        let track = &mut self.session.library.tracks[1];
+        fs::rename(&track.path, &path).unwrap();
+        let mut scanned = Library::default();
+        scanned.scan(&[], std::slice::from_ref(&path));
+        track.path = scanned.tracks.pop().unwrap().path;
+        self.ids[1] = track.id();
+        self.session.rebuild();
+        self.page = State::default();
+        self.refresh();
+        path
     }
     fn history(&self) -> Value {
         json!([
@@ -484,7 +501,10 @@ fn final_shell_success_for_a_substituted_file_must_not_authorize_a_merge() {
         );
         assert_eq!((progress.moved, progress.failed.len()), (0, 1));
         let warning = &progress.failed[0];
-        assert!(warning.contains("Original Location") && warning.contains("b.wav"), "{warning}");
+        assert!(
+            warning.contains("Original Location") && warning.contains("b.wav"),
+            "{warning}"
+        );
     });
     assert_eq!(f.history(), history);
 }
@@ -492,13 +512,33 @@ fn final_shell_success_for_a_substituted_file_must_not_authorize_a_merge() {
 #[test]
 #[ignore = "uses the Windows Recycle Bin and restores one generated song"]
 fn windows_recycle_restores_the_checked_song_to_its_original_path() {
+    check_windows_restore(false);
+}
+
+#[test]
+#[ignore = "uses the Windows Recycle Bin and restores one generated song"]
+fn windows_recycle_restores_a_preserved_filename_from_a_mixed_case_path() {
+    check_windows_restore(true);
+}
+
+fn check_windows_restore(wide: bool) {
     use std::os::windows::process::CommandExt;
     let runs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-runs");
     fs::create_dir_all(&runs).unwrap();
     let mut f = Fixture::in_dir(tempfile::tempdir_in(std::path::absolute(runs).unwrap()).unwrap());
+    let source = if wide {
+        let original = f.preserved_filename();
+        let track = &mut f.session.library.tracks[1];
+        track.path = track.path.to_uppercase();
+        f.session.rebuild();
+        f.page = State::default();
+        f.refresh();
+        original
+    } else {
+        native_path(&f.session.library.tracks[1].path)
+    };
     f.page.drop = HashSet::from([f.ids[1].clone()]);
     let mut checked = f.act(Intent::Recycle).unwrap();
-    let source = PathBuf::from(&checked.plan[0].path);
     let before = fs::read(&source).unwrap();
     let moved = checked.recycle(0, string_platform::files::recycle);
     drop(checked);
@@ -736,7 +776,11 @@ fn final_removed_keeper_location_cancels_pending_moves() {
     for location in ["roots", "files"] {
         let mut f = Fixture::new();
         let tracks = &f.session.library.tracks;
-        let loose: Vec<_> = tracks.iter().skip(usize::from(location == "roots")).map(|t| t.path.clone()).collect();
+        let loose: Vec<_> = tracks
+            .iter()
+            .skip(usize::from(location == "roots"))
+            .map(|t| t.path.clone())
+            .collect();
         f.session.set_field("files", json!(loose));
         if location == "files" {
             f.session.set_field("roots", json!([]));
@@ -745,10 +789,19 @@ fn final_removed_keeper_location_cancels_pending_moves() {
         f.refresh();
         let checked = f.act(Intent::Recycle).unwrap();
         let mut progress = Progress::default();
-        assert!(f.page.next_pair(&checked, &mut progress, &f.session).is_some());
+        assert!(
+            f.page
+                .next_pair(&checked, &mut progress, &f.session)
+                .is_some()
+        );
         f.session.set_field(location, json!([]));
         let before = f.history();
-        assert!(f.page.next_pair(&checked, &mut progress, &f.session).is_none(), "{location}");
+        assert!(
+            f.page
+                .next_pair(&checked, &mut progress, &f.session)
+                .is_none(),
+            "{location}"
+        );
         assert_eq!(progress.failed.len(), 1);
         assert!(std::path::Path::new(&checked.plan[1].path).is_file());
         assert_eq!(f.history(), before);
@@ -757,22 +810,145 @@ fn final_removed_keeper_location_cancels_pending_moves() {
 
 #[test]
 fn final_drag_skips_song_that_left_its_artist_but_remains_in_library() {
+    use crate::model::Ids;
+    use egui::{Event, Modifiers, PointerButton, Pos2, RawInput};
     let mut f = Fixture::new();
     let list = f.session.new_playlist("Destination", &[]);
-    let ids = f.ids[..2].to_vec();
+    let ids = Ids::from(f.ids[..2].to_vec());
+    let ctx = f.ctx.clone();
+    crate::theme::install(&ctx);
     f.with_view(|_, v| {
-        v.views.selection.bind(&ids.clone().into(), None);
+        let row =
+            v.s.models
+                .playlists
+                .iter()
+                .position(|p| p.id == list)
+                .unwrap();
+        let target = pos2(120., 57. + 47. * row as f32);
+        let start = pos2(360., 57.);
+        let button = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let frame = |v: &mut View<'_>, events, rows: &Ids| {
+            let input = RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(600., 400.))),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                ui::side_playlists::show(ui, v, ui::area(0., 0., 240., 400.));
+                v.views.selection.display(rows, None);
+            });
+        };
+        frame(v, vec![], &ids);
         v.views.selection.choose(0, false, false);
         v.views.selection.choose(1, true, false);
-        let payload = v.views.selection.ids();
+        frame(
+            v,
+            vec![Event::PointerMoved(start), button(start, true)],
+            &ids,
+        );
+        egui::DragAndDrop::set_payload(&ctx, v.views.selection.ids());
+        frame(v, vec![Event::PointerMoved(target)], &ids);
         v.s.library.tracks[1].tags.artist = "Other artist".into();
         v.s.rebuild();
-        v.views.selection.bind(&vec![ids[0].clone()].into(), None);
         assert!(v.s.models.by_id.contains_key(&ids[1]));
-        ui::side_playlists::drop_songs(v, &list, &payload);
+        let remaining = Ids::from(vec![ids[0].clone()]);
+        frame(v, vec![button(target, false)], &remaining);
+        frame(v, vec![], &remaining);
         let entries = v.s.playlist_entries(&list);
         assert_eq!(entries.iter().map(|e| &e.1).collect::<Vec<_>>(), [&ids[0]]);
     });
+}
+
+#[test]
+fn location_removed_during_preflight_refuses_the_whole_batch() {
+    let mut f = Fixture::new();
+    let before = f.history();
+    f.page.request(&f.session, Intent::Recycle);
+    f.session.set_field("roots", json!([]));
+    let start = Instant::now();
+    while f.page.checking.is_some() {
+        assert!(f.page.checked(&f.session).is_none());
+        assert!(start.elapsed() < Duration::from_secs(10));
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(f.page.drop.is_empty());
+    assert_eq!(f.history(), before);
+}
+
+#[test]
+fn in_flight_history_depends_on_which_keeper_location_was_removed() {
+    for remove_keeper in [false, true] {
+        let mut f = Fixture::new();
+        let root = f._dir.path().to_owned();
+        let other = root.join("elsewhere");
+        f.session.set_field("roots", json!([root, other]));
+        f.session.rebuild();
+        f.refresh();
+        f.page.drop = HashSet::from([f.ids[1].clone()]);
+        let mut checked = f.act(Intent::Recycle).unwrap();
+        let mut progress = Progress::default();
+        let (at, original) = f
+            .page
+            .next_pair(&checked, &mut progress, &f.session)
+            .unwrap();
+        checked
+            .move_one(
+                at,
+                |p| fs::rename(p, root.join("moved.wav")),
+                |p| p.ends_with("moved.wav"),
+            )
+            .unwrap();
+        f.session
+            .set_field("roots", json!([if remove_keeper { other } else { root }]));
+        f.with_view(|page, v| {
+            page.finish_move(&checked.plan[at], &original, Ok(()), &mut progress, v)
+        });
+        assert_eq!(progress.moved, 1);
+        assert_eq!(
+            f.session.field("plays")[&f.ids[1]].is_null(),
+            !remove_keeper
+        );
+    }
+}
+
+#[test]
+fn a_directory_junction_still_refuses_the_whole_hide() {
+    use std::os::windows::process::CommandExt;
+    let mut f = Fixture::new();
+    let root = f._dir.path();
+    let nested = root.join("actual").join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let track = &mut f.session.library.tracks[1];
+    fs::rename(&track.path, nested.join("b.wav")).unwrap();
+    assert!(
+        std::process::Command::new("cmd.exe")
+            .args(["/d", "/c", "mklink", "/j", "linked", "actual"])
+            .current_dir(root)
+            .creation_flags(0x08000000)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    track.path = root
+        .join("linked")
+        .join("nested")
+        .join("b.wav")
+        .to_str()
+        .unwrap()
+        .into();
+    f.session.rebuild();
+    f.page = State::default();
+    f.refresh();
+    let before = f.history();
+    assert!(f.act(Intent::Hide).is_none());
+    assert_eq!(f.history(), before);
+    assert!(!f.session.state.hidden(&f.ids[2]));
 }
 
 #[test]
@@ -793,26 +969,21 @@ fn final_mixed_case_path_can_hide_checked_copies() {
 
 #[test]
 fn final_preserved_filename_can_be_checked_hidden_and_moved() {
-    use std::os::windows::ffi::OsStringExt;
     let mut f = Fixture::new();
-    let wide = std::ffi::OsString::from_wide(&[0xd800, 46, 119, 97, 118]);
-    let path = f._dir.path().join(wide);
-    let track = &mut f.session.library.tracks[1];
-    fs::rename(&track.path, &path).unwrap();
-    let mut scanned = Library::default();
-    scanned.scan(&[], std::slice::from_ref(&path));
-    track.path = scanned.tracks.pop().unwrap().path;
-    let id = track.id();
-    f.session.rebuild();
-    f.page = State::default();
-    f.refresh();
+    let path = f.preserved_filename();
     assert!(f.act(Intent::Hide).is_some());
-    f.page.drop = HashSet::from([id]);
+    f.page.drop = HashSet::from([f.ids[1].clone()]);
     let mut checked = f.act(Intent::Recycle).unwrap();
-    checked.move_one(0, |p| {
-        assert_eq!(p, path);
-        fs::rename(p, f._dir.path().join("moved.wav"))
-    }, |p| p.ends_with("moved.wav")).unwrap();
+    checked
+        .move_one(
+            0,
+            |p| {
+                assert_eq!(p, path);
+                fs::rename(p, f._dir.path().join("moved.wav"))
+            },
+            |p| p.ends_with("moved.wav"),
+        )
+        .unwrap();
 }
 
 #[test]
@@ -825,11 +996,19 @@ fn final_batch_rebuilds_models_once_and_transfers_history_per_move() {
         let start = v.s.generation;
         let mut progress = Progress::default();
         while let Some((at, original)) = page.next_pair(&checked, &mut progress, v.s) {
-            checked.move_one(at, |p| fs::rename(p, bin.join(p.file_name().unwrap())), |p| p.parent().unwrap().ends_with("bin")).unwrap();
+            checked
+                .move_one(
+                    at,
+                    |p| fs::rename(p, bin.join(p.file_name().unwrap())),
+                    |p| p.parent().unwrap().ends_with("bin"),
+                )
+                .unwrap();
             let copy = &checked.plan[at];
             page.finish_move(copy, &original, Ok(()), &mut progress, v);
             assert!(v.s.field("plays")[&copy.drop_id].is_null());
-            assert!(v.s.state_dirty && v.s.listening_dirty);
+            assert!(v.s.state_dirty && v.s.listening_dirty && v.s.library_dirty);
+            assert!(v.s.library.tracks.iter().all(|t| t.path != copy.path));
+            assert!(!v.s.models.catalog.tracks.contains_key(&copy.drop_id));
         }
         assert_eq!(progress.moved, 2);
         page.dispatch(checked, progress, v);

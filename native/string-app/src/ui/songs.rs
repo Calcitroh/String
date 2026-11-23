@@ -4,15 +4,24 @@ use crate::{
     ui::covers::{CoverCache, Size},
 };
 use std::{
+    cell::RefCell,
     collections::{BTreeSet, HashMap},
-    sync::Arc,
+    sync::{Arc, Weak},
 };
+#[derive(Clone)]
+struct ExportedRows {
+    ids: Weak<[String]>,
+    indices: Vec<usize>,
+}
 #[derive(Default, Clone)]
 pub struct Selection {
     pub indices: BTreeSet<usize>,
     // Indices always belong to this immutable list. A playlist row also has an added time.
     rows: Option<Ids>,
     added: Option<Arc<[i64]>>,
+    // Both song tables and playlists export Ids. Track the exact occurrences while
+    // the payload is held, including their original order across a sort.
+    exported: RefCell<Option<ExportedRows>>,
     anchor: Option<usize>,
     pub(crate) shown: bool,
     pub reveal: Option<usize>,
@@ -40,7 +49,11 @@ impl Selection {
             return;
         }
         if let Some(old) = &self.rows {
-            if !self.indices.is_empty() || self.anchor.is_some() {
+            let exported = self.exported.get_mut();
+            if exported.as_ref().is_some_and(|e| e.ids.strong_count() == 0) {
+                *exported = None;
+            }
+            if !self.indices.is_empty() || self.anchor.is_some() || exported.is_some() {
                 // For legacy entries without a timestamp, distinguish equal occurrences by their
                 // order. If their count changed, there is no way to identify the surviving one.
                 let old_added = self.added.as_deref();
@@ -50,6 +63,7 @@ impl Selection {
                     .iter()
                     .copied()
                     .chain(self.anchor)
+                    .chain(exported.iter().flat_map(|e| e.indices.iter().copied()))
                     .filter(|&i| i < old.len())
                     .map(|i| (key(i), Default::default()))
                     .collect();
@@ -77,6 +91,9 @@ impl Selection {
                 };
                 self.indices = self.indices.iter().copied().filter_map(remap).collect();
                 self.anchor = self.anchor.and_then(remap);
+                if let Some(e) = exported {
+                    e.indices = e.indices.iter().copied().filter_map(remap).collect();
+                }
             }
             self.reveal = None;
         } else {
@@ -115,11 +132,37 @@ impl Selection {
     }
     pub fn ids(&self) -> Ids {
         let ids = self.rows.as_deref().unwrap_or_default();
-        self.indices
+        let selected: Ids = self
+            .indices
             .iter()
             .filter_map(|&i| ids.get(i))
             .cloned()
-            .collect()
+            .collect();
+        *self.exported.borrow_mut() = Some(ExportedRows {
+            ids: Arc::downgrade(&selected),
+            indices: self
+                .indices
+                .iter()
+                .copied()
+                .filter(|&i| i < ids.len())
+                .collect(),
+        });
+        selected
+    }
+    pub(super) fn dragged_ids(&self, payload: &Ids) -> Option<Vec<String>> {
+        let exported = self.exported.borrow();
+        let e = exported.as_ref()?;
+        if !e.ids.ptr_eq(&Arc::downgrade(payload)) {
+            return None;
+        }
+        let rows = self.rows.as_ref()?;
+        Some(
+            e.indices
+                .iter()
+                .filter(|i| self.indices.contains(i))
+                .map(|&i| rows[i].clone())
+                .collect(),
+        )
     }
 }
 #[derive(Debug, Clone, Copy)]
@@ -475,6 +518,23 @@ mod selection_tests {
     use crate::playback::Session;
     fn ids(names: &[&str]) -> Ids {
         names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn drag_keeps_source_order_and_cannot_adopt_a_replacement_occurrence() {
+        let mut source = Selection::default();
+        source.bind(&ids(&["x", "b", "a", "x"]), Some(&[1, 2, 3, 4]));
+        source.choose(0, false, false);
+        source.choose(1, true, false);
+        source.choose(2, true, false);
+        let payload = source.ids();
+        let mut other = source.clone();
+        other.left_list();
+        other.bind(&payload, None);
+        assert!(other.dragged_ids(&payload).is_none());
+        source.bind(&ids(&["a", "x", "b"]), Some(&[3, 4, 2]));
+        source.indices.insert(1);
+        assert_eq!(source.dragged_ids(&payload).unwrap(), ["b", "a"]);
     }
 
     #[test]

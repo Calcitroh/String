@@ -178,6 +178,26 @@ fn start_helper(v: &mut View<'_>, id: &str) {
 }
 /// `r` runs from the "Playlists" heading down to the sidebar's foot.
 pub fn show(ui: &mut Ui, v: &mut View<'_>, r: Rect) {
+    // The sidebar paints before the source list. Let the release frame rebind its
+    // rows (including playlist occurrences) before committing the drop.
+    let slot = egui::Id::unique("released playlist drop");
+    type Released = (String, Ids, u64, u64, Route, String, String);
+    if let Some((playlist, ids, generation, plays, route, filter, query)) =
+        ui.data_mut(|d| d.remove_temp::<Released>(slot))
+    {
+        if generation == v.s.generation
+            && plays == v.s.plays_revision
+            && route == v.views.history.current
+            && filter == v.views.filter
+            && query == v.views.query
+        {
+            drop_songs(v, &playlist, &ids);
+        } else {
+            v.views
+                .toast
+                .set("The song list changed. Drag the songs again.");
+        }
+    }
     let hi = v.tint;
     let p = ui.painter().clone();
     let cy = r.top() + 14.;
@@ -341,20 +361,34 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>, r: Rect) {
         menus::ctx_menu(json!({"kind":"pl","key":id}), at, None);
     }
     if let Some((id, ids)) = dropped {
-        drop_songs(v, &id, &ids);
+        ui.data_mut(|d| {
+            d.insert_temp(
+                slot,
+                (
+                    id,
+                    ids,
+                    v.s.generation,
+                    v.s.plays_revision,
+                    v.views.history.current.clone(),
+                    v.views.filter.clone(),
+                    v.views.query.clone(),
+                ),
+            )
+        });
+        ui.ctx().request_repaint();
     }
 }
 
-pub(crate) fn drop_songs(v: &mut View<'_>, playlist: &str, ids: &[String]) {
-    let live: Vec<_> = ids
-        .iter()
-        .filter(|id| v.s.models.by_id.contains_key(*id))
-        .cloned()
-        .collect();
+pub(crate) fn drop_songs(v: &mut View<'_>, playlist: &str, ids: &Ids) {
+    let mut live = [&v.views.selection, &v.views.artist_popular_selection]
+        .into_iter()
+        .find_map(|source| source.dragged_ids(ids))
+        .unwrap_or_default();
+    live.retain(|id| v.s.models.catalog.tracks.contains_key(id));
     if live.is_empty() {
         v.views
             .toast
-            .set("The dragged songs are no longer in the library.");
+            .set("The dragged songs are no longer selected in the source list.");
     } else {
         menus::add_to_playlist(v, playlist, &live);
         if live.len() < ids.len()
@@ -362,9 +396,9 @@ pub(crate) fn drop_songs(v: &mut View<'_>, playlist: &str, ids: &[String]) {
         {
             let missing = ids.len() - live.len();
             if missing == 1 {
-                message.push_str(". One song is no longer in the library.");
+                message.push_str(". One song left the selection.");
             } else {
-                message.push_str(&format!(". {missing} songs are no longer in the library."));
+                message.push_str(&format!(". {missing} songs left the selection."));
             }
         }
     }
