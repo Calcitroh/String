@@ -3,15 +3,17 @@
 mod duration;
 
 use lofty::{
+    ape::{APE_PICTURE_TYPES, ApeTag},
     config::ParseOptions,
     file::{AudioFile, FileType, TaggedFile, TaggedFileExt},
     flac::FlacFile,
     id3::v2::{AttachedPictureFrame, Id3v2Version},
     mpeg::MpegFile,
     ogg::{OpusFile, VorbisFile, tag::VorbisComments},
-    picture::PictureType,
+    picture::{Picture, PictureType},
     prelude::{Accessor, ItemKey},
     probe::Probe,
+    tag::Tag,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -135,13 +137,25 @@ pub fn read(path: &Path) -> io::Result<Metadata> {
     if file.file_type() == FileType::Mp4 {
         tags.duration = duration::movie(&mut reader)?.unwrap_or(tags.duration);
     }
-    let mut cover_mime = None;
+    let mut meta = Metadata {
+        tags,
+        lyrics,
+        cover_mime: None,
+    };
     let primary = file.primary_tag();
     for tag in primary.into_iter().chain(
         file.tags()
             .iter()
             .filter(|t| !primary.is_some_and(|p| std::ptr::eq(p, *t))),
     ) {
+        meta.fill_from(tag);
+    }
+    Ok(meta)
+}
+
+impl Metadata {
+    fn fill_from(&mut self, tag: &Tag) {
+        let tags = &mut self.tags;
         for (dest, src) in [
             (&mut tags.title, tag.title()),
             (&mut tags.artist, tag.artist()),
@@ -191,26 +205,21 @@ pub fn read(path: &Path) -> io::Result<Metadata> {
                 .unwrap_or_default()
                 .into();
         }
-        if cover_mime.is_none()
+        if self.cover_mime.is_none()
             && let Some(pic) = tag
                 .pictures()
                 .iter()
                 .find(|p| p.pic_type() == PictureType::CoverFront)
                 .or_else(|| tag.pictures().first())
         {
-            cover_mime = Some(pic.mime_type().map_or("image/jpeg", |m| m.as_str()).into());
+            self.cover_mime = Some(pic.mime_type().map_or("image/jpeg", |m| m.as_str()).into());
         }
-        if lyrics.is_none() {
-            lyrics = [ItemKey::Lyrics, ItemKey::UnsyncLyrics]
+        if self.lyrics.is_none() {
+            self.lyrics = [ItemKey::Lyrics, ItemKey::UnsyncLyrics]
                 .iter()
                 .find_map(|k| tag.get_string(*k).and_then(clean));
         }
     }
-    Ok(Metadata {
-        tags,
-        cover_mime,
-        lyrics,
-    })
 }
 /// The picture inside a song (its front cover, else the first one), for songs whose picture can't be cut straight out
 /// of the file: Ogg Opus and Vorbis keep it base64-encoded in a comment.
@@ -465,7 +474,7 @@ impl Id3 {
     }
 
     fn text(&mut self, id: &[u8], body: &[u8]) {
-        let Some((&enc, data)) = body.split_first() else {
+        let Some((&enc @ 0..=3, data)) = body.split_first() else {
             return;
         };
         let tags = &mut self.meta.tags;
@@ -512,7 +521,11 @@ impl Id3 {
             b"TPOS" | b"TPA" if tags.disc == 0 => tags.disc = number(value),
             b"TYER" | b"TDRC" | b"TDOR" | b"TYE" if tags.year == 0 => tags.year = year(value),
             b"TLEN" | b"TLE" if tags.duration == 0. => {
-                tags.duration = f64::from(number(value)) / 1000.
+                if value.bytes().all(|b| b.is_ascii_digit())
+                    && let Ok(ms) = value.parse::<u64>()
+                {
+                    tags.duration = ms as f64 / 1000.;
+                }
             }
             _ => {}
         }
@@ -613,9 +626,6 @@ impl Id3 {
     }
 
     fn id3v1(&mut self, tail: &[u8; 128]) {
-        if &tail[..3] != b"TAG" {
-            return;
-        }
         let t = &mut self.meta.tags;
         let field = |bytes: &[u8]| {
             windows_text(bytes.split(|&b| b == 0).next().unwrap_or_default())
@@ -643,6 +653,28 @@ impl Id3 {
                 .copied()
                 .unwrap_or("")
                 .into();
+        }
+    }
+
+    fn fill_from_ape(&mut self, ape: ApeTag, want_picture: bool) {
+        // APE stores pictures as named binary items. Converting to a generic tag
+        // exposes the text fields but does not promote these items to pictures.
+        if self.meta.cover_mime.is_none() {
+            let mut items = ape.get("Cover Art (Front)").into_iter().chain(&ape);
+            if let Some(pic) = items.find_map(|item| {
+                let key = APE_PICTURE_TYPES
+                    .iter()
+                    .find(|k| k.eq_ignore_ascii_case(item.key()))?;
+                Picture::from_ape_bytes(key, item.value().binary()?).ok()
+            }) {
+                self.meta.cover_mime = pic.mime_type().map(|m| m.as_str().into());
+                if want_picture {
+                    self.picture = Some(pic.into_data());
+                }
+            }
+        }
+        if !want_picture {
+            self.meta.fill_from(&ape.into());
         }
     }
 }
@@ -683,13 +715,44 @@ fn read_id3_audio(r: &mut BufReader<File>, format: &str, want_picture: bool) -> 
             }
         }
     }
-    if !want_picture {
-        if size >= 128 {
-            let mut tail = [0; 128];
-            r.seek(SeekFrom::End(-128))?;
-            r.read_exact(&mut tail)?;
-            id3.id3v1(&tail);
+    if want_picture && (id3.picture.is_some() || format != "mp3") {
+        return Ok(id3);
+    }
+    // The APE footer can precede ID3v1 or an old Lyrics3 tag. Read the common
+    // tail once and leave ordinary MP3s on the bounded, frame-by-frame path.
+    let mut tail = [0; 160];
+    let n = size.min(tail.len() as u64) as usize;
+    r.seek(SeekFrom::End(-(n as i64)))?;
+    r.read_exact(&mut tail[..n])?;
+    let mut tail = &tail[..n];
+    if let Some(v1) = tail.last_chunk::<128>().filter(|t| t.starts_with(b"TAG")) {
+        if !want_picture {
+            id3.id3v1(v1);
         }
+        tail = &tail[..tail.len() - 128];
+    }
+    if format == "mp3" {
+        r.seek(SeekFrom::Start(audio_start))?;
+        if tail
+            .last_chunk::<32>()
+            .is_some_and(|f| f.starts_with(b"APETAGEX"))
+            || tail.ends_with(b"LYRICS200")
+            || r.fill_buf()?.starts_with(b"APETAGEX")
+        {
+            // Start after the ID3v2 we already recovered. A rejected ID3 frame
+            // must not prevent the independent APE tag from filling gaps.
+            let options = ParseOptions::new()
+                .read_properties(false)
+                .max_junk_bytes(0)
+                .read_cover_art(id3.meta.cover_mime.is_none());
+            if let Ok(mut file) = MpegFile::read_from(r, options)
+                && let Some(ape) = file.remove_ape()
+            {
+                id3.fill_from_ape(ape, want_picture);
+            }
+        }
+    }
+    if !want_picture {
         let t = &mut id3.meta.tags;
         t.format = format.into();
         if format == "aac" {
@@ -816,4 +879,121 @@ fn webm_duration(r: &mut BufReader<File>) -> io::Result<Option<f64>> {
     Ok(duration
         .map(|ticks| ticks * scale as f64 / 1e9)
         .filter(|n| n.is_finite() && *n > 0.))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lofty::{
+        ape::{ApeItem, ApeTag},
+        tag::{ItemValue, TagExt},
+    };
+    use std::fs;
+
+    // Ten 128 kbps MPEG frames, optionally preceded by one small ID3v2.3 frame.
+    fn cbr_mp3(frame: Option<(&[u8; 4], &[u8])>, tail: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        if let Some((id, body)) = frame {
+            assert!(body.len() + 10 < 128);
+            bytes.extend_from_slice(b"ID3\x03\0\0\0\0\0");
+            bytes.push((10 + body.len()) as u8);
+            bytes.extend_from_slice(id);
+            bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            bytes.extend([0, 0]);
+            bytes.extend_from_slice(body);
+        }
+        let mut audio = [0; 417];
+        audio[..4].copy_from_slice(&[0xff, 0xfb, 0x90, 0]);
+        for _ in 0..10 {
+            bytes.extend(audio);
+        }
+        bytes.extend_from_slice(tail);
+        bytes
+    }
+
+    #[test]
+    fn unknown_text_encoding_leaves_the_field_for_a_valid_frame_or_id3v1() {
+        let mut id3 = Id3::default();
+        id3.text(b"TIT2", b"\x07AB");
+        id3.text(b"TPE1", b"\0Neighbor");
+        id3.text(b"TIT2", b"\x03Title");
+        assert_eq!(id3.meta.tags.title, "Title");
+        assert_eq!(id3.meta.tags.artist, "Neighbor");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.mp3");
+        let mut tail = [0; 128];
+        tail[..11].copy_from_slice(b"TAGFallback");
+        fs::write(&path, cbr_mp3(Some((b"TIT2", b"\x07AB")), &tail)).unwrap();
+        assert_eq!(read(&path).unwrap().tags.title, "Fallback");
+    }
+
+    #[test]
+    fn only_a_complete_millisecond_count_overrides_cbr_timing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.mp3");
+        let measured = 4170. * 8. / 128000.;
+        for (value, expected) in [
+            ("-1", measured),
+            ("+1", measured),
+            ("1ms", measured),
+            ("1.5", measured),
+            ("999999999999999999999999", measured),
+            ("0", measured),
+            (" 0123 ", 0.123),
+        ] {
+            let body = format!("\0{value}");
+            fs::write(&path, cbr_mp3(Some((b"TLEN", body.as_bytes())), &[])).unwrap();
+            assert_eq!(read(&path).unwrap().tags.duration, expected, "{value}");
+        }
+    }
+
+    #[test]
+    fn ape_fields_and_picture_fill_gaps_in_mp3_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("song.mp3");
+        let mut ape = ApeTag::new();
+        ape.set_title("APE title".into());
+        ape.set_artist("APE artist".into());
+        ape.set_track(4);
+        ape.insert(ApeItem::new("Lyrics".into(), ItemValue::Text("First line".into())).unwrap());
+        let gif = b"GIF89a\x01\0\x01\0\x80\0\0\0\0\0\xff\xff\xff,\0\0\0\0\x01\0\x01\0\0\x02\x02D\x01\0;";
+        let art = [b"front.gif\0".as_slice(), gif].concat();
+        ape.insert(ApeItem::new("Cover Art (Front)".into(), ItemValue::Binary(art)).unwrap());
+        let mut tail = Vec::new();
+        ape.dump_to(&mut tail, Default::default()).unwrap();
+
+        for (frame, title) in [
+            (None, "APE title"),
+            (Some((b"TIT2", b"\0ID3 title".as_slice())), "ID3 title"),
+            (Some((b"COMM", b"\0e".as_slice())), "APE title"),
+        ] {
+            fs::write(&path, cbr_mp3(frame, &tail)).unwrap();
+            let meta = read(&path).unwrap();
+            assert_eq!(meta.tags.title, title);
+            assert_eq!(meta.tags.artist, "APE artist");
+            assert_eq!(meta.tags.track, 4);
+            assert_eq!(meta.lyrics.as_deref(), Some("First line"));
+            assert_eq!(meta.cover_mime.as_deref(), Some("image/gif"));
+            assert_eq!(picture(&path).unwrap().as_deref(), Some(gif.as_slice()));
+        }
+        let id3_art = b"\0image/jpeg\0\x03\0\xff\xd8\xff";
+        fs::write(&path, cbr_mp3(Some((b"APIC", id3_art)), &tail)).unwrap();
+        assert_eq!(
+            read(&path).unwrap().cover_mime.as_deref(),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            picture(&path).unwrap().as_deref(),
+            Some(b"\xff\xd8\xff".as_slice())
+        );
+        let mut v1 = [0; 128];
+        v1[..9].copy_from_slice(b"TAGLegacy");
+        tail.extend(v1);
+        fs::write(&path, cbr_mp3(None, &tail)).unwrap();
+        let meta = read(&path).unwrap();
+        assert_eq!(meta.tags.title, "Legacy");
+        assert_eq!(meta.tags.artist, "APE artist");
+        assert_eq!(picture(&path).unwrap().as_deref(), Some(gif.as_slice()));
+    }
 }
