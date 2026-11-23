@@ -1,8 +1,10 @@
 //! The Duplicates page: songs the library has more than once. For each, play the copies, pick the one to keep and
 //! tick the ones to drop, then hide those in String or move them to the Recycle Bin. Either way the kept copy takes
 //! over their likes, plays, loops, listening time and playlist places.
+mod files;
 use super::settings::plural;
 use crate::{
+    playback::Session,
     services::{self, Event, Task},
     theme::*,
     ui::{
@@ -15,16 +17,18 @@ use chrono::Local;
 use egui::{
     Align, Context, Layout, Rect, Sense, Stroke, StrokeKind, Ui, pos2, text::LayoutJob, vec2,
 };
+use files::{Checked, Pair, Stamp};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{LazyLock, Mutex, MutexGuard},
 };
+use string_core::{library::Library, state::State as Saved};
 use string_extras::{
     duplicates::{
         CopyToMerge, Disposition, DuplicateGroup, duplicates, forget_not_same, mark_not_same,
-        merge_copy, unhide_all,
+        merge_copy, still_copies, unhide_all,
     },
     edit::display_names,
 };
@@ -39,6 +43,7 @@ struct Copy {
     title: String,
     artist: String,
     size: u64,
+    stamp: Option<Stamp>,
 }
 struct Group {
     found: DuplicateGroup,
@@ -46,18 +51,41 @@ struct Group {
     artists: String,
 }
 /// What the list was made from: a change to any of it means looking again.
-type Basis = (usize, Option<i64>, usize, usize);
+type Basis = (u64, u64);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Intent {
+    Hide,
+    Ask,
+    Recycle,
+}
+
+type FileCheck = Result<Checked, (Problem, HashSet<String>)>;
+
+struct Problem {
+    ids: Vec<String>,
+    reason: String,
+}
 /// How each file of a plan fared on its way to the Recycle Bin.
-type Moved = Vec<Result<(), String>>;
+struct Moved {
+    checked: Checked,
+    outcomes: Vec<Result<(), String>>,
+}
 #[derive(Default)]
 pub struct State {
     groups: Vec<Group>,
     basis: Option<Basis>,
-    looking: Option<(Basis, Task<Vec<DuplicateGroup>>)>,
+    look_number: u64,
+    looking: Option<(Basis, Task<Vec<Group>>)>,
     keep: Vec<String>,
     drop: HashSet<String>,
     pub ask: bool,
-    recycling: Option<(Vec<CopyToMerge>, Task<Moved>)>,
+    ctx: Option<Context>,
+    checking: Option<(Intent, Basis, Task<FileCheck>)>,
+    unticked: HashSet<String>,
+    reread: HashSet<String>,
+    awaiting_scan: bool,
+    recycling: Option<(Basis, Task<Moved>)>,
 }
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Default::default);
 pub fn state() -> MutexGuard<'static, State> {
@@ -76,13 +104,8 @@ fn megabytes(bytes: u64) -> String {
 fn count(v: &View<'_>, field: &str) -> usize {
     v.s.field(field).as_object().map_or(0, |m| m.len())
 }
-fn basis(v: &View<'_>) -> Basis {
-    (
-        v.s.library.tracks.len(),
-        v.s.library.saved,
-        count(v, "hidden"),
-        count(v, "notDupes"),
-    )
+fn basis(s: &Session) -> Basis {
+    (s.generation, s.plays_revision)
 }
 /// "N songs hidden from String · show them again", for this page and the Library page.
 pub fn hidden_note(ui: &mut Ui, v: &mut View<'_>) {
@@ -119,13 +142,44 @@ fn apart_note(ui: &mut Ui, v: &mut View<'_>) {
         "list them again",
     ) {
         forget_not_same(&mut v.s.state);
+        v.s.generation += 1;
         v.s.state_dirty = true;
     }
 }
 impl State {
-    fn look(&mut self, ctx: &Context, v: &View<'_>) {
-        let (lib, state) = (v.s.library.clone(), v.s.state.clone());
-        self.looking = Some((basis(v), Task::run(ctx, move |_| duplicates(&lib, &state))));
+    fn refresh(&mut self, ctx: &Context, s: &Session) {
+        let current = basis(s);
+        if self.awaiting_scan || self.checking.is_some() || self.recycling.is_some() {
+            return;
+        }
+        if self.ask && self.basis != Some(current) {
+            self.refuse(self.changed());
+        }
+        if let Some((_, task)) = &self.looking
+            && let Some(groups) = task.poll()
+        {
+            let (revision, _) = self.looking.take().unwrap();
+            if revision == current {
+                self.basis = Some(revision);
+                self.take(groups);
+            }
+        }
+        if self.looking.is_none() && self.basis != Some(current) {
+            self.look(ctx, s);
+        }
+    }
+    fn look(&mut self, ctx: &Context, s: &Session) {
+        self.ctx = Some(ctx.clone());
+        self.look_number += 1;
+        self.basis = None;
+        self.groups.clear();
+        self.drop.clear();
+        self.keep.clear();
+        let (lib, state) = (s.library.clone(), s.state.clone());
+        self.looking = Some((
+            basis(s),
+            Task::run(ctx, move |_| Self::groups(&lib, &state)),
+        ));
     }
     /// The copies surely the same as the kept one are ticked; "maybe" ones wait for the person.
     fn tick(&mut self, gi: usize) {
@@ -141,9 +195,9 @@ impl State {
         self.drop
             .extend(g.found.suggested_drops(keep).map(str::to_owned));
     }
-    fn take(&mut self, found: Vec<DuplicateGroup>, v: &View<'_>) {
-        let tracks: HashMap<_, _> = v.s.library.tracks.iter().map(|t| (t.id(), t)).collect();
-        self.groups = found
+    fn groups(lib: &Library, state: &Saved) -> Vec<Group> {
+        let tracks: HashMap<_, _> = lib.tracks.iter().map(|t| (t.id(), t)).collect();
+        duplicates(lib, state)
             .into_iter()
             .filter_map(|found| {
                 let copies = found
@@ -152,7 +206,7 @@ impl State {
                     .map(|id| {
                         let t = tracks.get(id)?;
                         let path = std::path::Path::new(&t.path);
-                        let names = display_names(&v.s.state, t);
+                        let names = display_names(state, t);
                         let kbps = if t.tags.duration > 0. && t.size > 0 {
                             (t.size as f64 * 8. / t.tags.duration / 1000.).round() as u64
                         } else {
@@ -181,6 +235,7 @@ impl State {
                             title: names.title,
                             artist: names.artist,
                             size: t.size,
+                            stamp: Stamp::seen(t),
                         })
                     })
                     .collect::<Option<Vec<_>>>()?;
@@ -196,29 +251,126 @@ impl State {
                     copies,
                 })
             })
-            .collect();
+            .collect()
+    }
+    fn take(&mut self, groups: Vec<Group>) {
+        self.groups = groups;
         self.keep = self.groups.iter().map(|g| g.copies[0].id.clone()).collect();
         self.drop.clear();
         for gi in 0..self.groups.len() {
             self.tick(gi);
         }
+        self.drop.retain(|id| !self.unticked.contains(id));
     }
-    fn plan(&self, v: &View<'_>) -> Vec<CopyToMerge> {
-        let tracks: HashMap<_, _> = v.s.library.tracks.iter().map(|t| (t.id(), t)).collect();
+    fn changed(&self) -> Problem {
+        Problem {
+            ids: self.drop.iter().cloned().collect(),
+            reason: "The song list changed. Review the copies and tick them again.".into(),
+        }
+    }
+    fn refuse(&mut self, problem: Problem) {
+        for id in problem.ids {
+            self.drop.remove(&id);
+            self.unticked.insert(id);
+        }
+        self.ask = false;
+        self.basis = None;
+        services::notice(problem.reason);
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+    fn plan(&self, s: &Session, intent: Intent) -> Result<Vec<Pair>, Problem> {
+        if self.basis != Some(basis(s)) {
+            return Err(self.changed());
+        }
+        let tracks: HashMap<_, _> = s.library.tracks.iter().map(|t| (t.id(), t)).collect();
         let mut plan = vec![];
+        let mut refused = vec![];
+        let mut reason = None;
         for (g, keep) in self.groups.iter().zip(&self.keep) {
-            let Some(k) = tracks.get(keep) else { continue };
-            for c in &g.copies {
-                if c.id != *keep
-                    && self.drop.contains(&c.id)
-                    && let Some(d) = tracks.get(&c.id)
-                    && let Some(copy) = CopyToMerge::new(k, d)
+            let Some(k) = g.copies.iter().find(|c| &c.id == keep) else {
+                return Err(self.changed());
+            };
+            for d in g.copies.iter().filter(|c| self.drop.contains(&c.id)) {
+                let pair = tracks
+                    .get(keep)
+                    .zip(tracks.get(&d.id))
+                    .filter(|(k, d)| still_copies(&s.state, k, d))
+                    .and_then(|(k, d)| CopyToMerge::new(k, d));
+                let Some(copy) = pair else {
+                    refused.push(d.id.clone());
+                    reason.get_or_insert_with(|| {
+                        format!(
+                            "{} no longer matches the copy to keep. Nothing was merged.",
+                            d.name
+                        )
+                    });
+                    continue;
+                };
+                if intent != Intent::Hide
+                    && !crate::integration::files::recyclable_song(std::path::Path::new(&copy.path))
                 {
-                    plan.push(copy);
+                    refused.push(d.id.clone());
+                    reason.get_or_insert_with(|| {
+                        format!(
+                            "Only audio files can go to the Recycle Bin. {} was left in place.",
+                            d.name
+                        )
+                    });
+                    continue;
                 }
+                plan.push(Pair {
+                    copy,
+                    keep_path: k.path.clone(),
+                    keep: k.stamp,
+                    drop: d.stamp,
+                });
             }
         }
-        plan
+        if let Some(reason) = reason {
+            return Err(Problem {
+                ids: refused,
+                reason,
+            });
+        }
+        if plan.len() != self.drop.len() {
+            return Err(self.changed());
+        }
+        Ok(plan)
+    }
+    fn request(&mut self, s: &Session, intent: Intent) {
+        if self.checking.is_some() || self.recycling.is_some() {
+            return;
+        }
+        match self.plan(s, intent) {
+            Ok(plan) if !plan.is_empty() => {
+                let ctx = self.ctx.as_ref().expect("a displayed list has a context");
+                self.checking = Some((
+                    intent,
+                    basis(s),
+                    Task::run(ctx, move |_| files::check(plan)),
+                ));
+            }
+            Ok(_) => {}
+            Err(problem) => self.refuse(problem),
+        }
+    }
+    fn checked(&mut self, s: &Session) -> Option<(Intent, Checked)> {
+        let result = self.checking.as_ref()?.2.poll()?;
+        let (intent, revision, _) = self.checking.take()?;
+        match result {
+            Ok(_) if revision != basis(s) => {
+                self.refuse(self.changed());
+                None
+            }
+            Ok(checked) => Some((intent, checked)),
+            Err((problem, paths)) => {
+                self.reread.extend(paths);
+                self.refuse(problem);
+                None
+            }
+        }
     }
     fn ticked(&self) -> (usize, u64) {
         let mut total = (0, 0);
@@ -231,63 +383,58 @@ impl State {
     }
     /// The list matches the library and nothing is under way.
     pub fn settled(&self, v: &View<'_>) -> bool {
-        self.looking.is_none() && self.recycling.is_none() && self.basis == Some(basis(v))
+        self.looking.is_none()
+            && self.checking.is_none()
+            && self.recycling.is_none()
+            && self.basis == Some(basis(v.s))
     }
-    pub fn hide(&mut self, v: &mut View<'_>) {
-        let plan = self.plan(v);
-        if plan.is_empty() {
-            return;
-        }
+    fn merge_hidden(s: &mut Session, plan: &[CopyToMerge]) {
         let now = Local::now().timestamp_millis();
         let svc = services::get();
-        for copy in &plan {
-            merge_copy(
-                &mut v.s.state,
-                &mut v.s.listening,
-                copy,
-                Disposition::Hide,
-                now,
-            );
+        for copy in plan {
+            merge_copy(&mut s.state, &mut s.listening, copy, Disposition::Hide, now);
             svc.event(Event::Merged {
                 from: &copy.drop_id,
                 to: &copy.keep_id,
             });
         }
-        v.s.listening_dirty = true;
-        v.s.rebuild();
-        v.s.queue_changed(v.player);
-        v.views.toast.set(format!(
-            "{} hidden from String: the files are still there",
-            copies(plan.len())
-        ));
+        s.listening_dirty = true;
+        s.rebuild();
     }
-    fn recycle(&mut self, ctx: &Context, v: &View<'_>) {
-        let plan = self.plan(v);
-        let paths: Vec<PathBuf> = plan.iter().map(|c| PathBuf::from(&c.path)).collect();
+    fn recycle(&mut self, checked: Checked, revision: Basis) {
         self.recycling = Some((
-            plan,
-            Task::run(ctx, move |s| {
-                paths
-                    .iter()
-                    .map(|p| s.recycle(p).map_err(|e| e.to_string()))
-                    .collect()
+            revision,
+            Task::run(self.ctx.as_ref().unwrap(), move |s| {
+                checked.recycle(|path| s.recycle(path))
             }),
         ));
     }
     /// The files that really moved are merged into the copies kept. A copy that was playing hands over to the
     /// kept one at the same moment of the song.
-    fn recycled(
-        &mut self,
-        plan: Vec<CopyToMerge>,
-        done: Vec<Result<(), String>>,
-        v: &mut View<'_>,
-    ) {
+    fn recycled(&mut self, revision: Basis, done: Moved, v: &mut View<'_>) {
         let now = Local::now().timestamp_millis();
         let svc = services::get();
         let (mut moved, mut swap, mut failed) = (vec![], false, vec![]);
-        for (copy, result) in plan.iter().zip(done) {
+        // The shell can take time. If the library changed after Yes, never transfer history
+        // to a different recording, even when Windows already moved its file.
+        let plan = &done.checked.plan;
+        let merge = revision == basis(v.s) || {
+            let tracks: HashMap<_, _> = v.s.library.tracks.iter().map(|t| (t.id(), t)).collect();
+            plan.iter().zip(&done.outcomes).all(|(c, result)| {
+                result.is_err()
+                    || tracks
+                        .get(&c.keep_id)
+                        .zip(tracks.get(&c.drop_id))
+                        .is_some_and(|(k, d)| still_copies(&v.s.state, k, d))
+            })
+        };
+        for (copy, result) in plan.iter().zip(done.outcomes) {
             match result {
                 Ok(()) => {
+                    moved.push(copy.drop_id.clone());
+                    if !merge {
+                        continue;
+                    }
                     swap |= merge_copy(
                         &mut v.s.state,
                         &mut v.s.listening,
@@ -300,7 +447,6 @@ impl State {
                         from: &copy.drop_id,
                         to: &copy.keep_id,
                     });
-                    moved.push(copy.drop_id.clone());
                 }
                 Err(e) => failed.push(e),
             }
@@ -310,7 +456,7 @@ impl State {
             v.s.removals += 1;
             v.s.library.tracks.retain(|t| !moved.contains(&t.id()));
             v.s.library_dirty = true;
-            v.s.listening_dirty = true;
+            v.s.listening_dirty |= merge;
             v.s.rebuild();
             v.s.queue_changed(v.player);
             if swap {
@@ -319,6 +465,7 @@ impl State {
             v.scan.requested = true;
         }
         v.views.toast.set(match failed.first() {
+            _ if !merge => format!("{} moved to the Recycle Bin. The song list changed during the move, so their history and playlists were left alone.", copies(moved.len())),
             Some(e) => format!(
                 "{} moved to the Recycle Bin; {} couldn't be: {e}",
                 copies(moved.len()),
@@ -333,43 +480,55 @@ impl State {
 /// gone. Closing String waits while `recycling()`.
 pub fn settle(v: &mut View<'_>) {
     let mut st = state();
+    if let Some((intent, checked)) = st.checked(v.s) {
+        match intent {
+            Intent::Ask => st.ask = true,
+            Intent::Recycle => st.recycle(checked, basis(v.s)),
+            Intent::Hide => {
+                State::merge_hidden(v.s, &checked.plan);
+                v.s.queue_changed(v.player);
+                v.views.toast.set(format!(
+                    "{} hidden from String: the files are still there",
+                    copies(checked.plan.len())
+                ));
+            }
+        }
+    }
+    if !st.reread.is_empty() {
+        v.scan.reread_files(std::mem::take(&mut st.reread));
+        st.awaiting_scan = true;
+    } else if st.awaiting_scan && !v.scan.requested && !v.scan.running() {
+        st.awaiting_scan = false;
+    }
     if let Some((_, task)) = &st.recycling
         && let Some(done) = task.poll()
     {
-        let (plan, _) = st.recycling.take().unwrap();
-        st.recycled(plan, done, v);
+        let (revision, _) = st.recycling.take().unwrap();
+        st.recycled(revision, done, v);
     }
 }
 pub fn recycling() -> bool {
-    state().recycling.is_some()
+    let st = state();
+    st.recycling.is_some() || st.checking.is_some()
 }
 pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     settle(v);
     let mut st = state();
     let st = &mut *st;
     let tint = v.tint;
-    if let Some((_, task)) = &st.looking
-        && let Some(found) = task.poll()
-    {
-        let (made_from, _) = st.looking.take().unwrap();
-        st.basis = Some(made_from);
-        st.take(found, v);
-    }
-    if st.looking.is_none() && st.recycling.is_none() && st.basis != Some(basis(v)) {
-        st.look(ui.ctx(), v);
-    }
+    st.refresh(ui.ctx(), v.s);
     let mut again = false;
     panel::page_title(ui, "Duplicates", "Songs you have more than once", |ui| {
         ui.add_space(2.);
         again = Btn::new("Look again", tint)
             .icon("reload")
             .sm()
-            .enabled(st.looking.is_none())
+            .enabled(st.settled(v) && !st.ask)
             .show(ui)
             .clicked();
     });
     if again {
-        st.look(ui.ctx(), v);
+        st.look(ui.ctx(), v.s);
     }
     if st.ask {
         let (n, bytes) = st.ticked();
@@ -386,7 +545,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
         ) {
             st.ask = false;
             if yes {
-                st.recycle(ui.ctx(), v);
+                st.request(v.s, Intent::Recycle);
             }
         }
     }
@@ -401,11 +560,17 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             if st.groups.is_empty() {
                 panel::empty_note(ui, "No duplicates: every song is here once");
             } else {
-                summary(ui, v, st);
+                // A release from a mouse press on the previous list cannot activate this one.
+                ui.push_id(("duplicate actions", st.look_number), |ui| {
+                    summary(ui, v, st)
+                });
                 ui.add_space(20.);
                 let mut apart = None;
                 for gi in 0..st.groups.len() {
-                    if group(ui, v, st, gi) {
+                    if ui
+                        .add_enabled_ui(st.settled(v) && !st.ask, |ui| group(ui, v, st, gi))
+                        .inner
+                    {
                         apart = Some(gi);
                     }
                     ui.add_space(16.);
@@ -416,6 +581,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                         &st.groups[gi].found,
                         Local::now().timestamp_millis(),
                     );
+                    v.s.generation += 1;
                     v.s.state_dirty = true;
                 }
             }
@@ -429,7 +595,7 @@ fn summary(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
     let extra: usize = st.groups.iter().map(|g| g.copies.len() - 1).sum();
     let maybes = st.groups.iter().filter(|g| !g.found.sure).count();
     let (ticked, bytes) = st.ticked();
-    let busy = st.recycling.is_some();
+    let busy = !st.settled(v) || st.ask;
     panel::panel(ui, 0., |ui| {
         let big = panel::line(ui, &super::settings::num(groups as u64), "HUD", 34., 0.02);
         let words = panel::line(
@@ -517,7 +683,7 @@ fn summary(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
                     .show(ui)
                     .clicked()
                 {
-                    st.ask = true;
+                    st.request(v.s, Intent::Ask);
                 }
                 if Btn::new("Hide in String", tint)
                     .sm()
@@ -526,7 +692,7 @@ fn summary(ui: &mut Ui, v: &mut View<'_>, st: &mut State) {
                     .show(ui)
                     .clicked()
                 {
-                    st.hide(v);
+                    st.request(v.s, Intent::Hide);
                 }
             });
         });
@@ -572,7 +738,7 @@ fn group(ui: &mut Ui, v: &mut View<'_>, st: &mut State, gi: usize) -> bool {
     let tint = v.tint;
     let mut apart = false;
     let sure = st.groups[gi].found.sure;
-    ui.push_id(("group", gi), |ui| {
+    ui.push_id(("group", st.look_number, gi), |ui| {
         ui.spacing_mut().item_spacing.y = 0.;
         let g = &st.groups[gi];
         let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.), Sense::hover());
@@ -823,6 +989,7 @@ fn row(ui: &mut Ui, v: &mut View<'_>, st: &mut State, gi: usize, ci: usize) {
             st.drop.remove(&id);
         }
         Some(2) => {
+            st.unticked.remove(&id);
             st.drop.insert(id);
         }
         Some(3) => {
@@ -853,7 +1020,7 @@ pub mod smoke {
     pub fn hide(v: &mut View<'_>) {
         let mut st = state();
         st.ask = false;
-        st.hide(v);
+        st.request(v.s, Intent::Hide);
     }
     /// Put the hidden songs back, the way the link does.
     pub fn back(v: &mut View<'_>) {
@@ -863,3 +1030,6 @@ pub mod smoke {
         v.views.toast.set("Hidden songs are back");
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -3,14 +3,98 @@ use crate::{
     model::{Ids, Models},
     ui::covers::{CoverCache, Size},
 };
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 #[derive(Default, Clone)]
 pub struct Selection {
     pub indices: BTreeSet<usize>,
+    // Indices always belong to this immutable list. A playlist row also has an added time.
+    rows: Option<Ids>,
+    added: Option<Arc<[i64]>>,
     anchor: Option<usize>,
+    pub(crate) shown: bool,
     pub reveal: Option<usize>,
 }
 impl Selection {
+    pub fn display(&mut self, ids: &Ids, added: Option<&[i64]>) {
+        if let Some(old) = &self.rows
+            && !Arc::ptr_eq(old, ids)
+        {
+            super::menus::list_replaced(old, Some(ids));
+        }
+        self.bind(ids, added);
+    }
+
+    pub fn left_list(&mut self) {
+        if let Some(old) = &self.rows {
+            super::menus::list_replaced(old, None);
+        }
+        *self = Self::default();
+    }
+
+    pub fn bind(&mut self, ids: &Ids, added: Option<&[i64]>) {
+        self.shown = true;
+        if self.rows.as_ref().is_some_and(|old| Arc::ptr_eq(old, ids)) {
+            return;
+        }
+        if let Some(old) = &self.rows {
+            if !self.indices.is_empty() || self.anchor.is_some() {
+                // For legacy entries without a timestamp, distinguish equal occurrences by their
+                // order. If their count changed, there is no way to identify the surviving one.
+                let old_added = self.added.as_deref();
+                let key = |i: usize| (old[i].as_str(), old_added.map(|at| at[i]));
+                let mut positions: HashMap<_, (Vec<usize>, Vec<usize>)> = self
+                    .indices
+                    .iter()
+                    .copied()
+                    .chain(self.anchor)
+                    .filter(|&i| i < old.len())
+                    .map(|i| (key(i), Default::default()))
+                    .collect();
+                for i in 0..old.len() {
+                    if let Some((before, _)) = positions.get_mut(&key(i)) {
+                        before.push(i);
+                    }
+                }
+                for (i, id) in ids.iter().enumerate() {
+                    if let Some((_, after)) =
+                        positions.get_mut(&(id.as_str(), added.map(|at| at[i])))
+                    {
+                        after.push(i);
+                    }
+                }
+                let remap = |i: usize| {
+                    if i >= old.len() {
+                        return None;
+                    }
+                    let (before, after) = positions.get(&key(i))?;
+                    if before.len() != after.len() {
+                        return None;
+                    }
+                    Some(after[before.binary_search(&i).ok()?])
+                };
+                self.indices = self.indices.iter().copied().filter_map(remap).collect();
+                self.anchor = self.anchor.and_then(remap);
+            }
+            self.reveal = None;
+        } else {
+            self.indices.retain(|&i| i < ids.len());
+            self.anchor = self.anchor.filter(|&i| i < ids.len());
+        }
+        self.rows = Some(ids.clone());
+        self.added = added.map(Arc::from);
+    }
+
+    /// Resolve a menu opened before playlist edits against the current raw playlist places.
+    pub fn playlist_places(&mut self, entries: &[(usize, String, i64)]) -> Vec<usize> {
+        let ids = entries.iter().map(|(_, id, _)| id.clone()).collect();
+        let added: Vec<_> = entries.iter().map(|(_, _, at)| *at).collect();
+        self.bind(&ids, Some(&added));
+        self.indices.iter().map(|&i| entries[i].0).collect()
+    }
+
     pub fn choose(&mut self, i: usize, ctrl: bool, shift: bool) {
         if shift {
             let a = self.anchor.unwrap_or(i);
@@ -29,7 +113,8 @@ impl Selection {
             self.anchor = Some(i);
         }
     }
-    pub fn ids(&self, ids: &[String]) -> Ids {
+    pub fn ids(&self) -> Ids {
+        let ids = self.rows.as_deref().unwrap_or_default();
         self.indices
             .iter()
             .filter_map(|&i| ids.get(i))
@@ -44,7 +129,6 @@ pub enum Action {
     Append,
     Like,
     Sort(&'static str),
-    Remove,
     LikeOne(usize),
     Toggle,
     Album(usize),
@@ -93,6 +177,7 @@ pub fn show(
         playlist,
         sort,
     } = table;
+    selection.display(ids, None);
     let mut action = None;
     let w = ui.available_width();
     let compact = w < 670.;
@@ -345,7 +430,7 @@ pub fn show(
                 selection.choose(i, false, false);
             }
             if response.drag_started() {
-                response.dnd_set_drag_payload(selection.ids(ids));
+                response.dnd_set_drag_payload(selection.ids());
             }
             if response.double_clicked() {
                 action = Some(Action::Play(i));
@@ -382,4 +467,74 @@ pub fn show(
         }
     }
     action
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use crate::playback::Session;
+    fn ids(names: &[&str]) -> Ids {
+        names.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn audit_selection_plays_and_adds_only_the_surviving_song() {
+        let mut selection = Selection::default();
+        selection.bind(&ids(&["a", "b", "c", "d"]), None);
+        selection.choose(1, false, false);
+        selection.choose(3, true, false);
+        let visible = ids(&["c", "a", "b"]);
+        selection.bind(&visible, None);
+        let mut library = string_core::library::Library::default();
+        library.tracks = visible
+            .iter()
+            .map(|id| string_core::library::Track {
+                path: id.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let mut s = Session::new(Default::default(), Default::default(), library);
+        let key = s.new_playlist("Mix", &[]);
+        s.playlist_add(&key, &selection.ids());
+        assert_eq!(s.playlist_entries(&key)[0].1, "b");
+        assert_eq!(selection.indices.len(), 1);
+        let start = *selection.indices.first().unwrap() as isize;
+        assert!(s.state.play_ids(
+            &visible,
+            start,
+            serde_json::json!({"kind":"songs"}),
+            &s.models.catalog,
+            1
+        ));
+        assert_eq!(s.state.queue.current(), Some("b"));
+        selection.bind(&ids(&[]), None);
+        selection.bind(&visible, None);
+        assert!(selection.indices.is_empty());
+    }
+    #[test]
+    fn audit_delete_removes_only_the_chosen_playlist_occurrence() {
+        let mut selection = Selection::default();
+        let before = ids(&["a", "a", "b"]);
+        selection.bind(&before, Some(&[101, 102, 103]));
+        selection.choose(1, false, false);
+        let after = ids(&["b", "a", "a"]);
+        selection.bind(&after, Some(&[103, 101, 102]));
+        let mut s = Session::new(Default::default(), Default::default(), Default::default());
+        s.set_field("playlists", serde_json::json!([{"id":"p","items":[{"id":"b","at":103},{"id":"a","at":101},{"id":"a","at":102}]}]));
+        s.playlist_remove("p", &selection.indices.iter().copied().collect::<Vec<_>>());
+        assert_eq!(
+            s.playlist_entries("p"),
+            vec![(0, "b".into(), 103), (1, "a".into(), 101)]
+        );
+    }
+    #[test]
+    fn open_menu_resolves_current_raw_places_and_drops_ambiguous_legacy_rows() {
+        let mut picked = Selection::default();
+        picked.bind(&ids(&["a", "a", "b", "b"]), Some(&[0, 0, 80, 90]));
+        picked.choose(1, false, false);
+        picked.choose(3, true, false);
+        let current = [(0, "a".into(), 0), (2, "b".into(), 90), (3, "b".into(), 80)];
+        assert_eq!(picked.playlist_places(&current), [2]);
+        assert_eq!(picked.ids().as_ref(), ["b"]);
+    }
 }

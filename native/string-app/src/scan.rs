@@ -1,13 +1,14 @@
 use crate::playback::Session;
 use crossbeam_channel::{Receiver, bounded};
 use egui::Context;
-use std::{path::PathBuf, thread, time::Instant};
+use std::{collections::HashSet, path::PathBuf, thread, time::Instant};
 use string_core::library::{Library, ScanReport};
 struct Job {
     rx: Receiver<(Library, ScanReport)>,
     inputs: [Vec<PathBuf>; 2],
     /// `Session::removals` when the scan started
     removals: u64,
+    reread: HashSet<String>,
     start: Instant,
 }
 #[derive(Default)]
@@ -15,8 +16,14 @@ pub struct Scanner {
     job: Option<Job>,
     pub requested: bool,
     pub completed: usize,
+    reread: HashSet<String>,
 }
 impl Scanner {
+    /// A file changed identity even though its cached length and write time can still match.
+    pub fn reread_files(&mut self, paths: HashSet<String>) {
+        self.reread.extend(paths);
+        self.requested = true;
+    }
     pub fn running(&self) -> bool {
         self.job.is_some()
     }
@@ -57,6 +64,7 @@ impl Scanner {
                                 .map(|e| format!("Scanning {}: {}", e.path.display(), e.error)),
                         );
                     } else {
+                        self.reread.extend(j.reread.iter().cloned());
                         self.requested = true;
                     }
                     self.job = None;
@@ -75,11 +83,20 @@ impl Scanner {
             let [roots, files] = inputs.clone();
             let (tx, rx) = bounded(1);
             let mut lib = s.library.clone();
+            let reread = std::mem::take(&mut self.reread);
+            if !reread.is_empty() {
+                for t in &mut lib.tracks {
+                    if reread.contains(&t.path) {
+                        t.read_error = 1; // bypass cache reuse in this scan only
+                    }
+                }
+            }
             let ctx = ctx.clone();
             self.job = Some(Job {
                 rx,
                 inputs,
                 removals: s.removals,
+                reread,
                 start: Instant::now(),
             });
             thread::spawn(move || {

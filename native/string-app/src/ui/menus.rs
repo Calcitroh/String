@@ -63,7 +63,7 @@ pub struct Origin {
     /// What the queue says it plays from: `{"kind","key","name"}`.
     pub ctx: Option<Value>,
     /// A playlist id and the places of the picked songs in its items, for "Remove from this playlist".
-    pub playlist: Option<(String, Vec<usize>)>,
+    pub playlist: Option<(String, super::songs::Selection)>,
 }
 impl Origin {
     /// A song picked outside any list: Play starts just these songs.
@@ -155,6 +155,24 @@ pub fn menu_pos(res: &Response) -> Option<Pos2> {
 }
 pub fn close_menu() {
     state().menu = None;
+}
+/// A track menu shares the table it opened on. Close it if its rows disappear or move
+/// before the command, so Play cannot fall through to a different song.
+pub fn list_replaced(old: &Ids, next: Option<&Ids>) {
+    let mut st = state();
+    if let Some(Menu {
+        kind: Kind::Track { origin, .. },
+        ..
+    }) = &mut st.menu
+        && let Some((rows, _)) = &mut origin.list
+        && std::sync::Arc::ptr_eq(rows, old)
+    {
+        if let Some(next) = next.filter(|next| next.as_ref() == old.as_ref()) {
+            *rows = next.clone();
+        } else {
+            st.menu = None;
+        }
+    }
 }
 pub fn is_open() -> bool {
     let s = state();
@@ -810,10 +828,11 @@ fn run(v: &mut View<'_>, kind: Kind, cmd: Cmd) {
         Cmd::AddTo(key) => add_to_playlist(v, &key, &ids),
         Cmd::Like => toggle_like(v, &ids),
         Cmd::RemoveFromPlaylist => {
-            if let Kind::Track { origin, .. } = &kind
-                && let Some((key, places)) = &origin.playlist
+            if let Kind::Track { origin, .. } = kind
+                && let Some((key, mut picked)) = origin.playlist
             {
-                v.s.playlist_remove(key, places);
+                let places = picked.playlist_places(&v.s.playlist_entries(&key));
+                v.s.playlist_remove(&key, &places);
                 v.views.selection = Default::default();
             }
         }
@@ -1524,13 +1543,16 @@ pub mod smoke {
             })
             .collect();
         let ids: Ids = shown.iter().map(|e| e.1.clone()).collect();
+        let mut selection = crate::ui::songs::Selection::default();
+        selection.bind(&ids, Some(&shown.iter().map(|e| e.2).collect::<Vec<_>>()));
+        selection.indices.extend(0..ids.len());
         track_menu(
             ids.clone(),
             pos2(700., 500.),
             Origin {
                 list: Some((ids, 0)),
                 ctx: Some(json!({"kind":"pl","key":id})),
-                playlist: Some((id, shown.iter().map(|e| e.0).collect())),
+                playlist: Some((id, selection)),
             },
         );
     }

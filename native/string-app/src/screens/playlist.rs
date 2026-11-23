@@ -30,6 +30,7 @@ struct Page {
     generation: u64,
     filter: String,
     rows: Vec<Entry>,
+    added: Vec<i64>,
     ids: Ids,
     /// Entries in the playlist, and how many of them the library still has.
     total: usize,
@@ -71,6 +72,7 @@ fn build(v: &View<'_>, key: &str) -> Page {
         generation: v.s.generation,
         filter,
         ids: rows.iter().map(|r| r.id.clone()).collect(),
+        added: rows.iter().map(|r| r.added).collect(),
         rows,
         total,
         have,
@@ -213,17 +215,9 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     let old = PAGE.lock().unwrap().take().filter(|p| p.key == key);
     let mut page = match old {
         Some(p) if p.generation == v.s.generation && p.filter == v.views.filter => p,
-        old => {
-            let mut page = build(v, &key);
-            if old.is_some_and(|o| o.filter == page.filter) {
-                v.views.selection.indices.retain(|&i| i < page.rows.len());
-            } else {
-                v.views.selection = Default::default();
-            }
-            page.scroll = None;
-            page
-        }
+        _ => build(v, &key),
     };
+    v.views.selection.display(&page.ids, Some(&page.added));
     let n = page.rows.len();
     let ids = page.ids.clone();
     let list_ctx = json!({"kind":"pl","key":key,"name":name});
@@ -651,7 +645,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                 if !selected {
                     v.views.selection.choose(i, false, false);
                 }
-                res.dnd_set_drag_payload(v.views.selection.ids(&ids));
+                res.dnd_set_drag_payload(v.views.selection.ids());
                 act = Some(Act::Drag);
             }
         }
@@ -699,11 +693,17 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                     .collect();
                 let before = page.rows.get(at).map_or(page.total, |r| r.place);
                 v.s.playlist_move(&key, &places, before);
+                // Bind the selected rows to their new places, including identical legacy entries.
                 let start = at - page.drag.iter().filter(|&&i| i < at).count();
+                let next = build(v, &key);
                 v.views.selection = Default::default();
+                v.views.selection.bind(&next.ids, Some(&next.added));
                 for i in start..start + places.len() {
                     v.views.selection.choose(i, true, false);
                 }
+                *PAGE.lock().unwrap() = Some(next);
+                ctx.request_repaint();
+                return;
             }
             page.drag.clear();
         } else if !down {
@@ -731,6 +731,8 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             let places = selected_places(v, &page);
             v.s.playlist_remove(&key, &places);
             v.views.selection = Default::default();
+            ctx.request_repaint();
+            return;
         }
     }
     match act {
@@ -748,7 +750,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             }
             let row = v.views.selection.indices.first().copied().unwrap_or(i);
             menus::track_menu(
-                v.views.selection.ids(&ids),
+                v.views.selection.ids(),
                 at,
                 Origin {
                     list: Some((
@@ -760,7 +762,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                         },
                     )),
                     ctx: Some(list_ctx),
-                    playlist: Some((key.clone(), selected_places(v, &page))),
+                    playlist: Some((key.clone(), v.views.selection.clone())),
                 },
             );
         }

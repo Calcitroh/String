@@ -71,6 +71,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     if let Some(id) = v.views.reveal_id.take()
         && let Some(i) = ids.iter().position(|s| s == &id)
     {
+        v.views.selection.display(&ids, None);
         v.views.selection.choose(i, false, false);
         v.views.selection.reveal = Some(i);
     }
