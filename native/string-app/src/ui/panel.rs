@@ -605,3 +605,60 @@ pub fn ask(
     });
     answer.or(closed.then_some(false))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hover_and_selection_paint_the_hud_switch_and_segment_states() {
+        let ctx = Context::default();
+        crate::theme::install(&ctx);
+        let tint = Tint::Mono;
+        let frame = |time, pointer, mut on, selected| {
+            let options = [("a", "First"), ("b", "Second")];
+            let out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(300., 120.))),
+                    time: Some(time),
+                    events: vec![egui::Event::PointerMoved(pointer)],
+                    ..Default::default()
+                },
+                |ui| {
+                    switch(ui, "Example", &mut on, tint);
+                    seg(ui, &options, selected, tint);
+                },
+            );
+            let mut row_hovered = false;
+            let mut thumb = None;
+            let mut second = None;
+            for clipped in &out.shapes {
+                match &clipped.shape {
+                    Shape::Rect(r) if r.rect.height() == 38. && r.fill == white(0.04) => {
+                        row_hovered = true
+                    }
+                    Shape::Rect(r) if r.rect.size() == vec2(10., 10.) => {
+                        thumb = Some((r.rect.left(), r.fill))
+                    }
+                    Shape::Text(t) if t.galley.job.text == "SECOND" => {
+                        second = Some((t.pos, t.fallback_color))
+                    }
+                    _ => {}
+                }
+            }
+            out.drop_without_applying_deltas();
+            (row_hovered, thumb.unwrap(), second.unwrap())
+        };
+        let outside = pos2(290., 110.);
+        let (hovered, off, second) = frame(0., outside, false, "a");
+        assert!(!hovered);
+        assert_eq!(off.1, MUTED);
+        assert_eq!(second.1, MUTED);
+        assert!(frame(0.1, pos2(12., 15.), false, "a").0);
+        let over_second = second.0 + vec2(2., 5.);
+        assert_eq!(frame(0.2, over_second, true, "a").2.1, TEXT);
+        let (_, on, selected) = frame(1., over_second, true, "b");
+        assert_eq!(on, (off.0 + 18., tint.ink(1.)));
+        assert_eq!(selected.1, tint.ink(1.));
+    }
+}
