@@ -21,6 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 use string_audio::{Player, Spectrum};
+const ADD_CLOSE_WAIT: Duration = Duration::from_secs(1);
 struct Runtime {
     session: Shared,
     player: Player,
@@ -41,7 +42,7 @@ pub struct App {
     exit: Arc<AtomicI32>,
     closing: bool,
     /// Finish accepted adds and pending moves to the Recycle Bin before closing.
-    close_after_work: bool,
+    close_work_deadline: Option<Instant>,
     minimized: bool,
     last: Instant,
     close_reason: String,
@@ -77,7 +78,7 @@ impl App {
             scan: Default::default(),
             exit,
             closing: false,
-            close_after_work: false,
+            close_work_deadline: None,
             minimized: false,
             last: now,
             close_reason: String::new(),
@@ -125,24 +126,40 @@ impl App {
     }
     fn flush(&mut self) -> bool {
         self.adds.set_closed(true);
+        let add_deadline = self
+            .close_work_deadline
+            .take()
+            .unwrap_or_else(|| Instant::now() + ADD_CLOSE_WAIT);
         if let Some(rt) = &self.runtime {
-            while let Some(batch) = self.adds.next_at_exit() {
+            while let Some(batch) = self.adds.next_at_exit(add_deadline) {
                 batch.apply(&mut rt.session.lock().unwrap(), &mut self.scan);
             }
-        } else if self.adds.pending() {
-            return false;
+        }
+        let mut reasons = Vec::new();
+        if self.adds.pending() {
+            reasons.push(
+                if self.runtime.is_some() {
+                    "String is still checking paths for a pending add."
+                } else {
+                    "String cannot apply the pending add because the profile could not open."
+                }
+                .to_owned(),
+            );
         }
         self.platform.save_placement();
+        // Completed work gets the full save window even when a filesystem check has stalled.
         let deadline = Instant::now() + Duration::from_secs(10);
         if let Some(error) = self.platform.phone.wait(deadline) {
             if self.platform.phone.busy() {
-                self.close_reason = error;
+                reasons.push(error);
+                self.close_reason = reasons.join("\n");
                 return false;
             }
             self.platform.log.write("phone listening", &error);
         }
         let Some(rt) = self.runtime.as_mut() else {
-            return true;
+            self.close_reason = reasons.join("\n");
+            return reasons.is_empty();
         };
         let mut s = rt.session.lock().unwrap();
         s.tick(rt.player.status(), true);
@@ -150,9 +167,18 @@ impl App {
             rt.store.feedback.backup(msg);
         }
         let r = rt.store.flush_until(&mut s, deadline);
-        self.close_reason = rt.store.feedback.reason.clone().unwrap_or_default();
+        if r.failed() {
+            reasons.push(
+                rt.store
+                    .feedback
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "The profile could not be saved.".into()),
+            );
+        }
+        self.close_reason = reasons.join("\n");
         Self::save_feedback(&self.platform, &mut self.views, &mut rt.store);
-        !r.failed()
+        reasons.is_empty()
     }
     fn finish(&mut self, ctx: &Context, mut err: Option<String>) {
         if !self.flush() && err.is_none() {
@@ -183,12 +209,14 @@ impl eframe::App for App {
         }
         if ctx.input(|i| i.viewport().close_requested()) {
             self.adds.set_closed(true);
+            let now = Instant::now();
+            let deadline = *self.close_work_deadline.get_or_insert(now + ADD_CLOSE_WAIT);
             // songs still moving to the Recycle Bin: wait for them, so the copies kept take over their likes,
             // plays and playlist places before the last save
-            if crate::screens::dupes::recycling() || (self.runtime.is_some() && self.adds.pending())
+            if crate::screens::dupes::recycling()
+                || (self.runtime.is_some() && self.adds.pending() && now < deadline)
             {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-                self.close_after_work = true;
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else if self.flush() {
                 self.closing = true;
@@ -221,8 +249,11 @@ impl eframe::App for App {
         // Songs moved to the Recycle Bin are merged into the copies kept here, which runs while String is minimised
         // too; a close that waited for them goes on once they are. Paths from `--add` are added here too, so a
         // helper's songs come in while String is minimised.
-        self.adds
-            .poll(&mut s, &mut self.scan, &mut self.views.toast);
+        if !self.views.close_failed {
+            // Hold unapplied results until the person decides whether to keep the profile open.
+            self.adds
+                .poll(&mut s, &mut self.scan, &mut self.views.toast);
+        }
         let recycling = crate::screens::dupes::recycling();
         if recycling {
             let tint = Tint::parse(s.setting("tint").as_str());
@@ -243,11 +274,12 @@ impl eframe::App for App {
             };
             crate::screens::dupes::settle(&mut v);
         }
-        if self.close_after_work {
-            if crate::screens::dupes::recycling() || self.adds.pending() {
+        if let Some(deadline) = self.close_work_deadline {
+            if crate::screens::dupes::recycling()
+                || (self.adds.pending() && Instant::now() < deadline)
+            {
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
-                self.close_after_work = false;
                 ctx.send_viewport_cmd(ViewportCommand::Close);
             }
         }
@@ -258,11 +290,7 @@ impl eframe::App for App {
             s.load_current(&rt.player, st.playing, pos);
         }
         let generation = s.generation;
-        let scans = self.scan.completed;
         let errors = self.scan.poll(&mut s, ctx);
-        if self.scan.completed != scans && !self.scan.running() {
-            crate::playlist_add::resolve_folders(&mut s);
-        }
         if generation != s.generation {
             rt.player.queue_changed();
             if st.key.is_none() && s.current().is_some() {
@@ -321,10 +349,19 @@ impl eframe::App for App {
         if self.views.close_failed
             && let Some(quit) = ui::confirm(
                 &ctx,
-                "Your latest changes aren’t saved",
+                if self.adds.pending() {
+                    "String couldn’t finish the add"
+                } else {
+                    "Your latest changes aren’t saved"
+                },
                 &format!(
-                    "{}\n\nKeep String open to retry saving, or close and discard the unsaved changes.",
-                    self.close_reason
+                    "{}\n\n{}",
+                    self.close_reason,
+                    if self.adds.pending() {
+                        "Keep String open to retry, or close and discard the pending add and any unsaved changes."
+                    } else {
+                        "Keep String open to retry saving, or close and discard the unsaved changes."
+                    }
                 ),
                 "Close anyway",
             )
@@ -411,8 +448,155 @@ impl eframe::App for App {
         }
     }
     fn on_exit(&mut self) {
-        if !self.closing {
-            self.flush();
+        if !self.closing && !self.flush() {
+            self.platform.log.write("close", &self.close_reason);
         }
+    }
+}
+
+#[cfg(test)]
+mod add_close_tests {
+    use super::*;
+    use crate::add_work::Adds;
+    use std::{path::Path, sync::mpsc};
+    use string_platform::instance::{self, Claim, Names};
+
+    fn app(root: &Path, adds: Adds) -> App {
+        let ctx = Context::default();
+        let args = Args {
+            root: root.to_owned(),
+            explicit: true,
+            smoke: Some(root.join("out")),
+            quit: false,
+            add: None,
+            playlist: None,
+        };
+        let names = Names {
+            add: None,
+            ..Names::custom(&format!("AddClose.{}", rand::random::<u64>()))
+        };
+        let Claim::First(first) = instance::claim_quietly(&names).unwrap() else {
+            panic!()
+        };
+        let log = Arc::new(string_platform::errors_log::ErrorLog::new(root));
+        let now = Instant::now();
+        App {
+            platform: Platform::new(first, &args, log),
+            args,
+            runtime: None,
+            adds,
+            error: String::new(),
+            views: Views::default(),
+            covers: CoverCache::new(&ctx),
+            viz: Default::default(),
+            scan: Scanner::default(),
+            smoke: Some(Smoke::new(root.join("out"))),
+            exit: Default::default(),
+            closing: false,
+            close_work_deadline: None,
+            minimized: false,
+            last: now,
+            close_reason: String::new(),
+            transport_until: now,
+        }
+    }
+
+    #[test]
+    fn review_close_explains_pending_add_without_an_open_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = app(dir.path(), Adds::new().unwrap());
+        assert!(
+            a.adds
+                .input
+                .submit(None, vec![dir.path().join("song.wav")], 128)
+        );
+        assert!(!a.flush());
+        assert!(
+            a.close_reason.contains("profile") && a.close_reason.contains("add"),
+            "close reason: {:?}",
+            a.close_reason
+        );
+    }
+
+    #[test]
+    fn review_close_saves_completed_changes_with_a_stalled_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let (release, gate) = mpsc::channel();
+        let adds = Adds::with_classifier(move |paths| {
+            let _ = gate.recv_timeout(Duration::from_secs(5));
+            crate::add_work::classify(paths)
+        })
+        .unwrap();
+        let mut a = app(dir.path(), adds);
+        a.open(&Context::default());
+        let song = dir.path().join("song.wav");
+        std::fs::write(&song, []).unwrap();
+        a.runtime
+            .as_ref()
+            .unwrap()
+            .session
+            .lock()
+            .unwrap()
+            .set_field("route", "liked".into());
+        assert!(a.adds.input.submit(None, vec![song.clone()], 128));
+        let start = Instant::now();
+        assert!(
+            !a.flush(),
+            "close consumed a stalled add without a decision"
+        );
+        assert!(start.elapsed() < Duration::from_secs(4));
+        assert!(a.close_reason.contains("add"), "{}", a.close_reason);
+        let folder = storage::folder(dir.path(), true);
+        assert_eq!(folder.open().unwrap().state.value.fields["route"], "liked");
+        release.send(()).unwrap();
+        assert!(a.flush());
+        assert_eq!(
+            folder.open().unwrap().state.value.fields["files"],
+            serde_json::json!([song])
+        );
+    }
+
+    #[test]
+    fn review_normal_close_reaches_a_decision_while_worker_is_stalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_release, gate) = mpsc::channel::<()>();
+        let adds = Adds::with_classifier(move |_| {
+            let _ = gate.recv_timeout(Duration::from_secs(8));
+            Vec::new()
+        })
+        .unwrap();
+        let ctx = Context::default();
+        let mut a = app(dir.path(), adds);
+        a.open(&ctx);
+        assert!(
+            a.adds
+                .input
+                .submit(None, vec![dir.path().join("pending.wav")], 128)
+        );
+        let start = Instant::now();
+        let mut close = true;
+        let mut frame = eframe::Frame::_new_kittest();
+        while !a.views.close_failed {
+            let mut input = egui::RawInput::default();
+            if close {
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .events
+                    .push(egui::ViewportEvent::Close);
+            }
+            let out = ctx.run_ui(input, |ui| eframe::App::logic(&mut a, ui.ctx(), &mut frame));
+            close = out.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|cmd| matches!(cmd, ViewportCommand::Close));
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "close never offered a decision"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(a.adds.pending() && !a.closing);
     }
 }

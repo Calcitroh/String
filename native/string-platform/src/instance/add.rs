@@ -47,7 +47,7 @@ thread_local! {
 }
 
 type PlaylistAdd = (String, Vec<PathBuf>);
-type Accept = Box<dyn Fn(Option<String>, Vec<PathBuf>, usize) -> bool + Send>;
+pub(super) type Accept = Box<dyn Fn(Option<String>, Vec<PathBuf>, usize) -> bool + Send>;
 
 struct Router {
     hub: Arc<Mutex<Hub>>,
@@ -107,14 +107,21 @@ pub(super) struct Receiver {
 }
 
 impl Receiver {
-    pub(super) fn open(class: &str, hub: Arc<Mutex<Hub>>) -> io::Result<Receiver> {
+    pub(super) fn open(
+        class: &str,
+        hub: Arc<Mutex<Hub>>,
+        accept: Option<Accept>,
+    ) -> io::Result<Receiver> {
         let class = HSTRING::from(class);
         let stop = Arc::new(Owned(unsafe {
             CreateEventW(None, true, false, PCWSTR::null())
         }?));
         let stopping = stop.clone();
         let (tx, rx) = mpsc::channel();
-        let router = Arc::new(Mutex::new(Router::new(hub)));
+        let router = Arc::new(Mutex::new(Router {
+            accept,
+            ..Router::new(hub)
+        }));
         let incoming = router.clone();
         let thread = thread::Builder::new()
             .name("string-add".into())
@@ -252,20 +259,6 @@ unsafe fn take(lparam: LPARAM) -> bool {
     })
 }
 
-/// The other launch's end: finds the window (waiting up to `wait` for a copy still starting), sends every part.
-pub(super) fn send(class: &str, paths: &[PathBuf], wait: Duration) -> bool {
-    let Some(prefix) = class.strip_suffix(".Add") else {
-        return false;
-    };
-    send_parts(
-        &Names::custom(prefix).mutex,
-        class,
-        MAGIC,
-        &encode(paths),
-        wait,
-    )
-}
-
 impl Instance {
     pub const MAX_ADD_PATHS: usize = 8192;
     pub const MAX_ADD_BYTES: usize = 8 << 20;
@@ -299,6 +292,17 @@ impl Instance {
 }
 
 impl Names {
+    /// The first owner admits its startup request and installs the shared handler before publishing the window.
+    pub fn claim_for_add<F>(
+        &self,
+        prepare: impl FnOnce() -> io::Result<F>,
+    ) -> io::Result<super::Claim>
+    where
+        F: Fn(Option<String>, Vec<PathBuf>, usize) -> bool + Send + 'static,
+    {
+        super::claim_as(self, false, || Ok(Some(Box::new(prepare()?))))
+    }
+
     /// Verify the receiver against this instance's mutex before giving it any paths.
     pub fn send_paths(&self, paths: &[PathBuf], wait: Duration) -> bool {
         self.add
@@ -474,6 +478,25 @@ mod tests {
 
     fn bytes(units: &[u16]) -> Vec<u8> {
         units.iter().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn review_public_plain_add_uses_the_supplied_mutex() {
+        use super::super::{Claim, claim_quietly, send_add};
+        let names = Names {
+            add: Some(format!("PlainReceiver.{}", std::process::id())),
+            ..Names::custom(&format!("PlainOwner.{}", std::process::id()))
+        };
+        let Claim::First(_first) = claim_quietly(&names).unwrap() else {
+            panic!("expected isolated owner")
+        };
+        let paths = [PathBuf::from(r"C:\music\one.wav")];
+        assert!(send_add(&names, &paths, Duration::ZERO));
+        let absent = Names {
+            mutex: format!("{}.absent", names.mutex),
+            ..names
+        };
+        assert!(!send_add(&absent, &paths, Duration::ZERO));
     }
 
     #[test]

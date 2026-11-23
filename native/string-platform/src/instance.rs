@@ -130,16 +130,20 @@ fn lock(hub: &Mutex<Hub>) -> std::sync::MutexGuard<'_, Hub> {
 
 /// Takes the mutex, or (another copy has it) asks that copy to come forward.
 pub fn claim(names: &Names) -> io::Result<Claim> {
-    claim_as(names, true)
+    claim_as(names, true, || Ok(None))
 }
 
 /// As [`claim`], but a copy already running is left as it is, not brought forward: for `--add`, whose caller keeps its
 /// own window in front.
 pub fn claim_quietly(names: &Names) -> io::Result<Claim> {
-    claim_as(names, false)
+    claim_as(names, false, || Ok(None))
 }
 
-fn claim_as(names: &Names, raise: bool) -> io::Result<Claim> {
+fn claim_as(
+    names: &Names,
+    raise: bool,
+    prepare_adds: impl FnOnce() -> io::Result<Option<add::Accept>>,
+) -> io::Result<Claim> {
     let mutex = unsafe { CreateMutexW(None, true, &HSTRING::from(names.mutex.as_str())) }?;
     let existed = unsafe { GetLastError() } == ERROR_ALREADY_EXISTS;
     let mutex = Owned(mutex);
@@ -163,8 +167,9 @@ fn claim_as(names: &Names, raise: bool) -> io::Result<Claim> {
     // `--add`'s window opens at once, before the app's own: a helper's paths sent while String is still starting are
     // kept for its listener. Without it String runs as usual; `add_error` says why.
     let hub = Arc::new(Mutex::new(Hub::default()));
+    let accept = prepare_adds()?;
     let (add, add_error) = match names.add.as_deref() {
-        Some(class) => match add::Receiver::open(class, hub.clone()) {
+        Some(class) => match add::Receiver::open(class, hub.clone(), accept) {
             Ok(r) => (Some(r), None),
             Err(e) => (None, Some(e)),
         },
@@ -187,10 +192,7 @@ fn claim_as(names: &Names, raise: bool) -> io::Result<Claim> {
 /// for a copy that is still starting. True once that copy has them; false when none took them: none runs, or the one
 /// running has no such channel (String 1.x, a self-test).
 pub fn send_add(names: &Names, paths: &[PathBuf], wait: Duration) -> bool {
-    match &names.add {
-        Some(class) => add::send(class, paths, wait),
-        None => false,
-    }
+    names.send_paths(paths, wait)
 }
 
 /// `--quit`: asks the running copy (String 1.x or this one) to save and close. False when none runs.

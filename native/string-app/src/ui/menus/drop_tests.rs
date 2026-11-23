@@ -143,3 +143,36 @@ fn rejected_and_duplicate_drops_keep_their_messages() {
         "String could not take more songs."
     );
 }
+
+#[test]
+fn review_partial_drop_reports_added_and_skipped_together() {
+    let temp = tempfile::tempdir().unwrap();
+    let song = temp.path().join("a.wav");
+    let second = temp.path().join("b.wav");
+    std::fs::write(&song, []).unwrap();
+    std::fs::write(&second, []).unwrap();
+    let mut adds = Adds::new().unwrap();
+    use std::os::windows::ffi::OsStrExt;
+    let room = (song.as_os_str().encode_wide().count() + 1) * 2;
+    let taken = string_platform::instance::Instance::MAX_ADD_BYTES - room;
+    assert!(
+        adds.input
+            .submit(None, vec![temp.path().join("missing")], taken)
+    );
+    let mut toast = ui::Toast::default();
+    drop_frame(
+        &Context::default(),
+        &adds,
+        &mut toast,
+        &[song.clone(), second],
+    );
+    let immediate = toast.current.take();
+    let mut session = Session::new(Default::default(), Default::default(), Default::default());
+    finish(&mut adds, &mut session, &mut Scanner::default(), &mut toast);
+    assert_eq!(*session.field("files"), json!([song]));
+    assert_eq!(toast.current.unwrap().0, "1 song added · 1 skipped");
+    assert!(
+        immediate.is_none(),
+        "a partially admitted drop has one completion message"
+    );
+}
