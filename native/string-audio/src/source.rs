@@ -163,7 +163,10 @@ impl Source {
 
     fn open_using(
         path: &Path,
-        #[cfg(windows)] open_aac: fn(&Path) -> Result<media_foundation::AacSource, Error>,
+        #[cfg(windows)] open_aac: fn(
+            &Path,
+            Option<f64>,
+        ) -> Result<media_foundation::AacSource, Error>,
     ) -> Result<Self, Error> {
         let mut format = probe(path)?;
         let track = format

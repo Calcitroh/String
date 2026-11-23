@@ -123,7 +123,7 @@ impl AacSource {
         format: &mut dyn symphonia::core::formats::FormatReader,
         rate: u32,
         native: Option<&dyn symphonia::core::codecs::audio::AudioDecoder>,
-        open: fn(&Path) -> Result<Self>,
+        open: fn(&Path, Option<f64>) -> Result<Self>,
     ) -> Result<Option<Self>> {
         // An LC AudioSpecificConfig may explicitly signal that SBR is absent. A raw AAC
         // stream (or an abbreviated config) can carry SBR/PS in-band at a different clock.
@@ -138,7 +138,18 @@ impl AacSource {
         {
             return Ok(None);
         }
-        let mut source = match open(path) {
+        // MF presentation duration can include an empty MP4 edit before the first sample.
+        // Its reader starts the audio at time zero, so use the audio track's time span.
+        let track_seconds = format
+            .default_track(symphonia::core::formats::TrackType::Audio)
+            .and_then(|t| {
+                let tb = t.time_base?;
+                Some(
+                    t.duration?.get() as f64 * f64::from(tb.numer.get())
+                        / f64::from(tb.denom.get()),
+                )
+            });
+        let mut source = match open(path, track_seconds) {
             Ok(source) => source,
             Err(_) if native.is_some() => return Ok(None),
             Err(e) => return Err(e),
@@ -164,10 +175,14 @@ impl AacSource {
         Ok(Some(source))
     }
 
-    pub(super) fn open(path: &Path) -> Result<Self> {
-        Self::open_with_platform(path, "mfplat.dll")
+    pub(super) fn open(path: &Path, track_seconds: Option<f64>) -> Result<Self> {
+        Self::open_with_platform(path, track_seconds, "mfplat.dll")
     }
-    pub(super) fn open_with_platform(path: &Path, platform_name: &'static str) -> Result<Self> {
+    pub(super) fn open_with_platform(
+        path: &Path,
+        track_seconds: Option<f64>,
+        platform_name: &'static str,
+    ) -> Result<Self> {
         use std::sync::mpsc::channel;
         let (requests, inbox) = channel();
         let (tx, replies) = channel();
@@ -176,7 +191,7 @@ impl AacSource {
         let thread = std::thread::Builder::new()
             .name("AAC decoder".into())
             .spawn(move || {
-                let mut reader = match Reader::open(&path, platform_name) {
+                let mut reader = match Reader::open(&path, track_seconds, platform_name) {
                     Ok(r) => r,
                     Err(e) => {
                         let _ = opened.send(Err(e));
@@ -248,7 +263,7 @@ struct Reader {
 }
 
 impl Reader {
-    fn open(path: &Path, platform_name: &str) -> Result<Self> {
+    fn open(path: &Path, track_seconds: Option<f64>, platform_name: &str) -> Result<Self> {
         let (runtime, create_reader, create_type) = Runtime::start(platform_name)?;
         let local = std::path::absolute(path).map_err(failure)?;
         let wide: Vec<u16> = local.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -299,7 +314,13 @@ impl Reader {
                 _runtime: runtime,
                 info: Info {
                     rate,
-                    frames: limit.or(frames),
+                    frames: limit
+                        .or_else(|| {
+                            track_seconds.map(|s| {
+                                ((s * f64::from(rate)).round() as u64).saturating_sub(delay)
+                            })
+                        })
+                        .or(frames),
                 },
                 mix,
                 delay,

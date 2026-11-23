@@ -85,9 +85,10 @@ fn surround_aac_mp4_and_adts_render_the_center() {
             "aevalsrc=0|0|0.1*sin(2*PI*480*t)|0|0|0:s=48000:d=2:c=5.1",
             &["-c:a", "aac", "-b:a", "320k"],
         );
-        let missing = Source::open_using(&path, |p| {
+        let missing = Source::open_using(&path, |p, seconds| {
             super::media_foundation::AacSource::open_with_platform(
                 p,
+                seconds,
                 "absent-test-media-runtime.dll",
             )
         });
@@ -308,6 +309,7 @@ fn he_aac_v2_plays_both_parametric_stereo_channels() {
     );
     let (info, pcm) = decode(&path);
     assert_eq!(info.rate, 24000);
+    assert_eq!(info.frames, Some(pcm.len() as u64 / 2));
     assert!((pcm.len() / 2).abs_diff(48000) < 4096);
     assert!(
         pcm[40000..80000]
