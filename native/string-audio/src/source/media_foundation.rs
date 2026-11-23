@@ -117,6 +117,12 @@ impl Drop for AacSource {
     }
 }
 
+pub(super) enum Fallback {
+    Native,
+    Check(super::aac_profile::ProfileCheck),
+    Platform(AacSource),
+}
+
 impl AacSource {
     pub(super) fn fallback(
         path: &Path,
@@ -124,7 +130,7 @@ impl AacSource {
         rate: u32,
         native: Option<&dyn symphonia::core::codecs::audio::AudioDecoder>,
         open: fn(&Path, Option<f64>) -> Result<Self>,
-    ) -> Result<Option<Self>> {
+    ) -> Result<Fallback> {
         // An LC AudioSpecificConfig may explicitly signal that SBR is absent. A raw AAC
         // stream (or an abbreviated config) can carry SBR/PS in-band at a different clock.
         let core = native.map(|d| d.codec_params());
@@ -136,7 +142,7 @@ impl AacSource {
             && config & 7 == 0
             && flag & 0x80 == 0
         {
-            return Ok(None);
+            return Ok(Fallback::Native);
         }
         // MF presentation duration can include an empty MP4 edit before the first sample.
         // Its reader starts the audio at time zero, so use the audio track's time span.
@@ -151,8 +157,12 @@ impl AacSource {
             });
         let mut source = match open(path, track_seconds) {
             Ok(source) => source,
-            Err(_) if native.is_some() => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let Some(check) = core.and_then(super::aac_profile::ProfileCheck::new) else {
+                    return Err(e);
+                };
+                return Ok(Fallback::Check(check));
+            }
         };
         if core.is_some_and(|p| {
             p.sample_rate == Some(source.info.rate)
@@ -160,7 +170,7 @@ impl AacSource {
                     .as_ref()
                     .is_some_and(|c| c.count() == source.channels)
         }) {
-            return Ok(None);
+            return Ok(Fallback::Native);
         }
         if format.format_info().format == symphonia::core::formats::well_known::FORMAT_ID_ADTS {
             // Raw ADTS has no length header. Count compressed access units at the core rate.
@@ -172,7 +182,7 @@ impl AacSource {
             source.info.frames =
                 Some((u128::from(ticks) * u128::from(source.info.rate) / u128::from(rate)) as u64);
         }
-        Ok(Some(source))
+        Ok(Fallback::Platform(source))
     }
 
     pub(super) fn open(path: &Path, track_seconds: Option<f64>) -> Result<Self> {
