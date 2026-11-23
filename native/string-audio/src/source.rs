@@ -455,7 +455,13 @@ impl NativeSource {
 
     /// The next read starts at playable frame `frame`.
     pub fn seek(&mut self, frame: u64) -> Result<(), Error> {
-        let preroll = (self.rate as f64 * self.preroll) as u64;
+        // A reset WebM Opus decoder still differed by 2e-7 after 400 ms on
+        // the seek fixture. Allow 800 ms, including one skipped long packet.
+        let preroll = if self.webm.as_ref().is_some_and(|w| w.opus_delay.is_some()) {
+            u64::from(self.rate) * 4 / 5
+        } else {
+            (self.rate as f64 * self.preroll) as u64
+        };
         // the priming frames before playable frame 0 serve as pre-roll too
         let target = if self.trims_itself {
             frame
@@ -468,7 +474,7 @@ impl NativeSource {
             (decoded as u128 * self.tb.1 as u128 / (self.tb.0 as u128 * self.rate as u128)) as i64;
         self.pending.clear();
         self.pending_at = 0;
-        self.cursor = None;
+        let previous_cursor = self.cursor.take();
         self.skip_to = frame;
         self.done = false;
         if let Some(limit) = self.limit
@@ -477,23 +483,8 @@ impl NativeSource {
             self.done = true;
             return Ok(());
         }
-        if let Some(webm) = &mut self.webm
-            && (!webm.cues || decoded == 0)
-        {
-            // Without Cues Matroska only searches forwards from its current position.
-            // Reprobe the same open file so a rename cannot substitute a different song.
-            webm.file
-                .rewind()
-                .map_err(|e| Error::Decode(e.to_string()))?;
-            let file = webm
-                .file
-                .try_clone()
-                .map_err(|e| Error::Decode(e.to_string()))?;
-            self.format = probe_media(&Hint::new(), Box::new(file))
-                .map_err(|e| Error::Decode(e.to_string()))?;
-            self.decoder.reset();
-            self.cursor = Some(-(webm.opus_delay.unwrap_or(0) as i64));
-            return Ok(());
+        if self.webm.is_some() {
+            return webm::seek(self, previous_cursor, frame.saturating_sub(preroll), ts);
         }
         let ts = if let Some(mixed) = &mut self.mixed_mp3 {
             mixed.rewind()
