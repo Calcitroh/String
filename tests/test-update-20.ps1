@@ -12,6 +12,29 @@ $run = Join-Path $root "test-runs\update-20-$id"
 function Check([bool]$pass, [string]$message) {
     if (-not $pass) { throw $message }
 }
+# The manual ZIP installer must import a script block made from verified bytes.
+function CheckHelperImport {
+    $installer = Join-Path $root 'tools\share\install.ps1'
+    $ast = [Management.Automation.Language.Parser]::ParseFile($installer, [ref]$null, [ref]$null)
+    $imports = @($ast.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and
+        $n.InvocationOperator -eq 'Dot' }, $true))
+    Check ($imports.Count -eq 1 -and $imports[0].CommandElements[0].Extent.Text -ceq '$verifiedHelper') 'Setup imports the helper by pathname after checking it'
+    $reader = $ast.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Read-BackupHelper' }, $true)
+    . ([scriptblock]::Create($reader.Extent.Text))
+    $path = Join-Path $run 'helper.ps1'
+    [IO.File]::WriteAllText($path, 'param([switch]$BackupFunctionsOnly) "verified"')
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($path))).Replace('-', '')
+        $row = @{ Full = $path; Size = (Get-Item $path).Length; Hash = $digest }
+        $helper = Read-BackupHelper $row
+        [IO.File]::WriteAllText($path, '')
+        Check ((& $helper.Script -BackupFunctionsOnly) -ceq 'verified') 'Import lost the verified helper after extraction changed'
+        $refused = $false
+        try { [void](Read-BackupHelper $row) } catch { $refused = $true }
+        Check $refused 'Helper content inconsistent with its manifest row was accepted'
+    } finally { $sha.Dispose() }
+}
 # Exercise just the backup functions on a private tree. Loading their definitions
 # separately keeps the Windows setup entry point out of this sharing check.
 function CheckBackupFunctions([string]$script, [string]$folder) {
@@ -27,6 +50,12 @@ function CheckBackupFunctions([string]$script, [string]$folder) {
     try {
         $snapshot = Save-Backup $source $dest
         Check (Matches-Backup $source $snapshot) 'A complete backup failed verification'
+        $writer = [StringSetup.Backup]::CreateFileW(($source + ':rating'), 2, 7, [IntPtr]::Zero, 3, 0, [IntPtr]::Zero)
+        try {
+            Check (-not $writer.IsInvalid) 'Could not open the fixture stream for editing'
+            try { $retired = Remove-VerifiedFile $source $snapshot } catch { $retired = $false }
+            Check (-not $retired -and [IO.File]::Exists($source)) 'A file with an open stream writer was retired'
+        } finally { $writer.Dispose() }
         $dir = [IO.Path]::GetDirectoryName($dest)
         $probe = [StringSetup.Backup]::CreateFileW($dir, 0x10000, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
         try { $denied = $probe.IsInvalid } finally { $probe.Dispose() }
@@ -39,14 +68,34 @@ function CheckBackupFunctions([string]$script, [string]$folder) {
         try { [StringSetup.Backup]::RenameSibling($first, $second) } catch { $refused = $true }
         Check ($refused -and [IO.Directory]::Exists($first) -and [IO.Directory]::Exists($second)) 'Guarded swap replaced an existing directory'
         Set-Content -LiteralPath $source -Stream 'rating' -Value '6' -NoNewline
-        Check (-not (Matches-Backup $source $snapshot)) 'A newer stream edit was eligible for retirement'
+        Check (-not (Remove-VerifiedFile $source $snapshot)) 'A newer stream edit was eligible for retirement'
         Set-Content -LiteralPath $source -Stream 'rating' -Value '5' -NoNewline
         Set-Content -LiteralPath $source -Stream 'empty' -Value '' -NoNewline
-        Check (-not (Matches-Backup $source $snapshot)) 'A new empty stream was eligible for retirement'
+        Check (-not (Remove-VerifiedFile $source $snapshot)) 'A new empty stream was eligible for retirement'
         Check ($denied -and $stream -ceq '5') "Backup contract failed (folder denies delete access: $denied, saved rating: '$stream')"
+        Remove-Item -LiteralPath $source -Stream 'empty'
+        # Inspect sharing during enumeration without changing the contents.
+        $enumerate = ${function:Named-Streams}
+        $probes = [Collections.Generic.List[bool]]::new()
+        function Named-Streams([string]$path) {
+            foreach ($suffix in '', ':rating', ':new') {
+                $mode = if ($suffix -eq ':new') { 1 } else { 3 }
+                $writer = [StringSetup.Backup]::CreateFileW(($path + $suffix), 2, 7, [IntPtr]::Zero, $mode, 0, [IntPtr]::Zero)
+                try { $probes.Add($writer.IsInvalid) } finally { $writer.Dispose() }
+            }
+            & $enumerate $path
+        }
+        $retired = Remove-VerifiedFile $source $snapshot
+        Check ($probes.Count -ge 3 -and -not $probes.Contains($false)) 'Verified streams allowed a writer during retirement'
+        Check ($retired -and -not [IO.File]::Exists($source)) 'A complete matching backup did not allow retirement'
+        [IO.File]::WriteAllText($source, 'Read only')
+        $hash = [BitConverter]::ToString($sha.ComputeHash([IO.File]::ReadAllBytes($source))).Replace('-', '')
+        [IO.File]::SetAttributes($source, [IO.FileAttributes]::ReadOnly)
+        Check (Remove-VerifiedFile $source $null -OriginalHash $hash) 'A matching read-only file could not be retired'
     } finally { Close-Backups; $sha.Dispose() }
 }
 CheckBackupFunctions (Join-Path $root 'tools\share\uninstall.ps1') (Join-Path $run 'Backup functions')
+CheckHelperImport
 
 function Build([string]$script, [string[]]$options) {
     & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -File (Join-Path $root "tools\$script") @options
@@ -269,6 +318,7 @@ try {
     $installed = Snapshot $to
     $retired = @($original.Keys | Where-Object { -not $shipped.ContainsKey($_) -and $_ -ne 'setup\installed.txt' })
     foreach ($file in $retired) { Check (-not $installed.ContainsKey($file)) "Retired program file survived: $file" }
+    Check (@(Get-ChildItem -LiteralPath $zone -Directory -Filter 'Player.old-*').Count -eq 0) 'Verified originals remained in the previous installation folder'
     foreach ($dir in 'wwwroot', 'presence', 'runtimes') { Check (-not (Test-Path -LiteralPath (Join-Path $to $dir))) "1.x directory survived: $dir" }
     foreach ($file in $shipped.Keys) { Check ($installed[$file] -ceq $shipped[$file]) "Installed payload differs: $file" }
     $backups = @(Get-ChildItem -LiteralPath "$to edits" -Directory)

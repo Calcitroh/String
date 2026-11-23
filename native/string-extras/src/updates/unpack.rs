@@ -3,7 +3,11 @@ use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek},
-    os::windows::fs::{MetadataExt, OpenOptionsExt},
+    os::windows::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    },
     path::{Path, PathBuf},
 };
 use zip::ZipArchive;
@@ -25,8 +29,31 @@ pub(super) fn open_dir(path: &Path) -> io::Result<File> {
     }
     Ok(f)
 }
+
+// Resolve the guarded directory on its volume. PowerShell 5.1 accepts these
+// paths, and changing a DOS drive mapping cannot redirect them.
+fn volume_path(dir: &File) -> io::Result<PathBuf> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            handle: *mut std::ffi::c_void,
+            path: *mut u16,
+            size: u32,
+            flags: u32,
+        ) -> u32;
+    }
+    let mut name = vec![0u16; 32768];
+    let n = unsafe {
+        GetFinalPathNameByHandleW(dir.as_raw_handle(), name.as_mut_ptr(), name.len() as u32, 1)
+    };
+    if n == 0 || n as usize >= name.len() {
+        return Err(invalid(
+            "Automatic updates need a data folder on a local Windows volume",
+        ));
+    }
+    Ok(std::ffi::OsString::from_wide(&name[..n as usize]).into())
+}
 // Resolve from the root down, opening each component without following links.
-// The paths are also passed to Windows PowerShell without a verbatim prefix.
 pub(super) fn pin_ancestors(path: &Path) -> io::Result<Vec<File>> {
     for part in path.components() {
         match part {
@@ -87,11 +114,17 @@ pub(super) struct UpdateFolder {
 impl UpdateFolder {
     pub fn open(data: &Path) -> io::Result<Self> {
         let absolute = std::path::absolute(data)?;
-        let mut parents = pin_ancestors(&absolute)?;
-        let data =
+        let input =
             powershell_directory(&absolute).ok_or_else(|| invalid("Unsupported update path"))?;
+        let initial_parents = pin_ancestors(&absolute)?;
+        let initial = pin_or_create_dir(&input)?;
+        let data = volume_path(&initial)?;
+        let mut parents = pin_ancestors(&data)?;
+        let guarded = open_dir(&data)?;
+        same_file(&initial, &guarded)?;
+        parents.push(guarded);
+        drop(initial_parents);
         let path = data.join("updates");
-        parents.push(pin_or_create_dir(&data)?);
         parents.push(pin_or_create_dir(&path)?);
         let lock = OpenOptions::new()
             .read(true)
