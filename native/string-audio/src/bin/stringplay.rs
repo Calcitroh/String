@@ -215,7 +215,7 @@ fn play(
         while let Ok(e) = news.try_recv() {
             match e {
                 Event::Started { track } => eprintln!("\r> {}", name(track.key)),
-                Event::Failed { track, error } => eprintln!("\r! {}: {error}", name(track.key)),
+                Event::Failed { track, error, .. } => eprintln!("\r! {}: {error}", name(track.key)),
                 Event::Output { name, rate } => eprintln!("\r~ {name} at {rate} Hz"),
                 Event::Stopped => {
                     eprintln!("\rdone.");

@@ -38,6 +38,8 @@ pub(crate) enum Cmd {
         era: u32,
         out: u32,
         in_: u32,
+        /// Distance from the actual end to the new start on an unarmed loop restart.
+        loop_rewind: f64,
     },
     /// A song chained on after the current one on `deck` was dropped: when the deck gets
     /// there, it skips to era `era`.
@@ -84,8 +86,8 @@ pub(crate) enum Evt {
     Ended { handle: u32 },
     /// `deck` is silent and nothing is armed on it: the engine may load it.
     Freed,
-    /// The current song ran out and nothing followed.
-    Finished { handle: u32 },
+    /// The current song ran out and nothing followed. Its end is in output frames.
+    Finished { handle: u32, end: i64 },
 }
 
 /// What the screens read about the current song: key, flags, position, end, rate, the time the
@@ -511,7 +513,9 @@ impl Mixer {
                     era,
                     out,
                     in_,
+                    loop_rewind,
                 } => {
+                    self.loop_offset += loop_rewind;
                     selecting = false;
                     self.quiet_others(deck, out);
                     self.change(deck, era, out, in_);
@@ -843,10 +847,11 @@ impl Mixer {
         let cd = &self.decks[c];
         if cd.begun && cd.stopped && cd.pending.is_none() && self.armed.is_none() {
             let handle = cd.handle;
+            let end = cd.end_pos().unwrap_or(cd.pos).min(cd.pos);
             self.release(c);
             // Only the engine knows whether the queue ended. Keep transport intent
             // through its decision, including a seek racing this final callback.
-            self.emit(c, Evt::Finished { handle });
+            self.emit(c, Evt::Finished { handle, end });
             return true;
         }
         false

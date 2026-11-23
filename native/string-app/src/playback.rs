@@ -15,6 +15,49 @@ use string_core::{
     stats::{Listening, Track as CountedTrack},
 };
 
+/// Queue controls used by both the live player and the in-memory playback tests.
+pub trait Transport {
+    fn status(&self) -> Status;
+    fn play_track(&self, track: Track, from: f64);
+    fn cue(&self, track: Track, from: f64);
+    fn stop(&self);
+    fn play(&self);
+    fn toggle(&self);
+    fn rewind_paused(&self);
+    fn seek(&self, position: f64);
+    fn seek_track(&self, key: u64, position: f64);
+}
+
+impl<T: std::borrow::Borrow<Player>> Transport for T {
+    fn status(&self) -> Status {
+        Player::status(self.borrow())
+    }
+    fn play_track(&self, track: Track, from: f64) {
+        Player::play_track(self.borrow(), track, from)
+    }
+    fn cue(&self, track: Track, from: f64) {
+        Player::cue(self.borrow(), track, from)
+    }
+    fn stop(&self) {
+        Player::stop(self.borrow())
+    }
+    fn play(&self) {
+        Player::play(self.borrow())
+    }
+    fn toggle(&self) {
+        Player::toggle(self.borrow())
+    }
+    fn rewind_paused(&self) {
+        Player::rewind_paused(self.borrow())
+    }
+    fn seek(&self, position: f64) {
+        Player::seek(self.borrow(), position)
+    }
+    fn seek_track(&self, key: u64, position: f64) {
+        Player::seek_track(self.borrow(), key, position)
+    }
+}
+
 pub type Shared = Arc<Mutex<Session>>;
 pub struct Session {
     pub state: State,
@@ -163,10 +206,18 @@ impl Session {
         let end = b.map(|t| t.clamp(0., limit));
         (end.unwrap_or(limit) - start >= 1.).then_some(LoopRange { start, end })
     }
-    fn opts(&self) -> PlaybackOptions {
+    fn skip_options(&self) -> PlaybackOptions {
+        PlaybackOptions {
+            looping: self.current().and_then(|s| self.loop_for(&s.id)).is_some(),
+            ..self.advance_options()
+        }
+    }
+    fn advance_options(&self) -> PlaybackOptions {
+        // The engine asks for a successor only after ruling out a playable loop.
+        // A cached tag length can still disagree with it before the first UI tick.
         PlaybackOptions {
             autoplay: self.setting("autoplay").as_bool().unwrap_or(true),
-            looping: self.current().and_then(|s| self.loop_for(&s.id)).is_some(),
+            looping: false,
         }
     }
     fn key(&mut self) -> u64 {
@@ -174,9 +225,11 @@ impl Session {
         self.sequence
     }
     fn track(&self, id: &str, key: u64) -> Option<Track> {
-        Some(Track::new(key, &self.models.by_id.get(id)?.path).with_loop(self.loop_for(id)))
+        // Only the decoder knows the playable length, including joined files.
+        let range = self.saved_loop(id, None);
+        Some(Track::new(key, &self.models.by_id.get(id)?.path).with_loop(range))
     }
-    pub fn load_current(&mut self, p: &Player, start: bool, pos: f64) {
+    pub fn load_current(&mut self, p: &impl Transport, start: bool, pos: f64) {
         self.pending = None;
         self.superseded = None;
         self.active = self.key();
@@ -200,7 +253,7 @@ impl Session {
             p.stop()
         }
     }
-    pub fn play_ids(&mut self, p: &Player, ids: &[String], index: isize, ctx: Value) {
+    pub fn play_ids(&mut self, p: &impl Transport, ids: &[String], index: isize, ctx: Value) {
         if self.state.play_ids(
             ids,
             index,
@@ -212,15 +265,14 @@ impl Session {
             self.load_current(p, true, 0.);
         }
     }
-    pub fn toggle(&mut self, p: &Player) {
-        let st = p.status();
-        if st.playing && self.bar_song(st).is_some() {
-            p.pause()
+    pub fn toggle(&mut self, p: &impl Transport) {
+        if self.active != 0 && self.current().is_some() {
+            p.toggle()
         } else {
             self.resume(p)
         }
     }
-    pub fn resume(&mut self, p: &Player) {
+    pub fn resume(&mut self, p: &impl Transport) {
         if self.current().is_some() {
             if p.status().key == Some(self.active) {
                 p.play()
@@ -281,15 +333,19 @@ impl Session {
             self.load_current(p, true, 0.)
         }
     }
-    pub fn next(&mut self, p: &Player) {
-        let opts = self.opts();
+    pub fn next(&mut self, p: &impl Transport) {
+        let st = p.status();
+        if self.bar_song(st).is_some() && st.duration.is_some() {
+            self.active_duration = st.duration;
+        }
+        let opts = self.skip_options();
         let plan = self.state.queue.what_next(true, opts, &self.models.catalog);
         if self.state.queue.items().is_empty() {
             return;
         }
         if plan.action() == NextAction::Stop {
-            p.pause();
-            self.seek(p, 0.);
+            self.record_seek(0.);
+            p.rewind_paused();
         } else if plan.action() == NextAction::Restart {
             self.seek(p, 0.);
             if !p.status().playing {
@@ -315,16 +371,30 @@ impl Session {
         self.state_dirty = true;
         p.queue_changed();
     }
-    pub fn seek(&mut self, p: &Player, pos: f64) {
-        self.seek_revision = self.seek_revision.wrapping_add(1);
+    pub fn seek(&mut self, p: &impl Transport, pos: f64) {
         let pos = pos.max(0.).min(p.status().duration.unwrap_or(f64::MAX));
+        self.record_seek(pos);
+        p.seek(pos);
+    }
+    pub fn seek_from_bar(&mut self, p: &impl Transport, key: u64, pos: f64) {
+        let st = p.status();
+        if self.active == key
+            && !self.active_failed
+            && st.key.is_none_or(|published| published == key)
+        {
+            let pos = pos.max(0.).min(st.duration.unwrap_or(f64::MAX));
+            self.record_seek(pos);
+            p.seek_track(key, pos);
+        }
+    }
+    fn record_seek(&mut self, pos: f64) {
+        self.seek_revision = self.seek_revision.wrapping_add(1);
         self.seek_position = pos;
         self.state.queue.seek(pos);
         self.state_dirty = true;
         self.last_tick = Instant::now();
         self.last_position = pos;
         self.was_playing = false;
-        p.seek(pos);
     }
     pub fn toggle_like(&mut self, ids: &[String]) {
         let likes = self
@@ -397,6 +467,11 @@ impl Session {
         self.queue_changed(p);
     }
     pub fn tick(&mut self, st: Status, force: bool) {
+        // An exhausted deck can disappear for a callback before its loop restarts.
+        // Keep the last confirmed sample so the restart's rewind is counted once.
+        if st.key.is_none() && self.last_key == Some(self.active) && !self.active_failed {
+            return;
+        }
         let dt = self.last_tick.elapsed().as_secs_f64();
         if !force && dt < 0.5 && self.was_playing == st.playing && self.last_key == st.key {
             return;
@@ -544,7 +619,10 @@ impl Host for QueueHost {
         if current.key != s.active && !s.pending.as_ref().is_some_and(|(k, _)| *k == current.key) {
             return None;
         }
-        let plan = s.state.queue.what_next(false, s.opts(), &s.models.catalog);
+        let plan = s
+            .state
+            .queue
+            .what_next(false, s.advance_options(), &s.models.catalog);
         let Some(id) = plan.id().map(str::to_owned) else {
             s.invalidate_plan();
             return None;
@@ -570,7 +648,7 @@ impl Host for QueueHost {
             Event::Started { track } => {
                 if s.pending.as_ref().is_some_and(|(k, _)| *k == track.key) {
                     let (_, plan) = s.pending.take().unwrap();
-                    let opts = s.opts();
+                    let opts = s.advance_options();
                     let s = &mut *s;
                     if !s.state.commit_next(
                         plan,
@@ -594,8 +672,12 @@ impl Host for QueueHost {
                     return;
                 }
             }
-            Event::Failed { track, error } => {
-                if track.key == s.active {
+            Event::Failed {
+                track,
+                error,
+                selection,
+            } => {
+                if selection && track.key == s.active {
                     s.active_failed = true;
                     s.was_playing = false;
                 }
@@ -724,8 +806,8 @@ mod player_tests {
             json!({"a":201,"b":220}),
         ] {
             s.set_field("loops", json!({"a.wav":entry}));
-            assert!(s.track("a.wav", 1).unwrap().loop_range.is_none());
-            assert!(!s.opts().looping);
+            assert!(s.loop_for("a.wav").is_none());
+            assert!(!s.skip_options().looping);
         }
     }
 
@@ -785,12 +867,14 @@ mod player_tests {
         host.event(Event::Failed {
             track: first.clone(),
             error: "missing".into(),
+            selection: true,
         });
         assert!(shared.lock().unwrap().current().is_none());
         let second = host.next_after(&first).unwrap();
         host.event(Event::Failed {
             track: second.clone(),
             error: "missing".into(),
+            selection: true,
         });
         let third = host.next_after(&second).unwrap();
         host.event(Event::Started { track: third });
@@ -840,12 +924,9 @@ mod player_tests {
         assert!(s.current().is_none());
     }
 
-    #[test]
-    fn one_second_loops_count_every_rendered_second_between_infrequent_ticks() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("loop.wav");
+    fn write_song(path: &std::path::Path, seconds: u32) {
         let mut wav = b"RIFF".to_vec();
-        let bytes = 8000_u32 * 4 * 2;
+        let bytes = 8000_u32 * seconds * 2;
         wav.extend((36 + bytes).to_le_bytes());
         wav.extend(b"WAVEfmt \x10\0\0\0\x01\0\x01\0");
         wav.extend(8000_u32.to_le_bytes());
@@ -853,7 +934,266 @@ mod player_tests {
         wav.extend(b"\x02\0\x10\0data");
         wav.extend(bytes.to_le_bytes());
         wav.resize(44 + bytes as usize, 0);
-        std::fs::write(&path, wav).unwrap();
+        std::fs::write(path, wav).unwrap();
+    }
+
+    struct TestTransport(std::cell::RefCell<OfflinePlayer>);
+    impl Transport for TestTransport {
+        fn status(&self) -> Status {
+            self.0.borrow().status()
+        }
+        fn play_track(&self, track: Track, from: f64) {
+            self.0.borrow_mut().play_track(track, from)
+        }
+        fn cue(&self, track: Track, from: f64) {
+            self.0.borrow_mut().cue(track, from)
+        }
+        fn stop(&self) {
+            self.0.borrow_mut().stop()
+        }
+        fn play(&self) {
+            self.0.borrow_mut().play()
+        }
+        fn toggle(&self) {
+            self.0.borrow_mut().toggle()
+        }
+        fn rewind_paused(&self) {
+            self.0.borrow_mut().rewind_paused()
+        }
+        fn seek(&self, position: f64) {
+            self.0.borrow_mut().seek(position)
+        }
+        fn seek_track(&self, key: u64, position: f64) {
+            self.0.borrow_mut().seek_track(key, position)
+        }
+    }
+
+    #[test]
+    fn review_failed_startup_cue_keeps_the_saved_bookmark() {
+        let mut s = session(&["missing.wav"]);
+        select(&mut s, &["missing.wav"], 0);
+        s.state.queue.seek(742.25);
+        let track = s.track("missing.wav", s.active).unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let host = QueueHost {
+            session: shared.clone(),
+            ctx: Context::default(),
+        };
+        let mut p = OfflinePlayer::new(8000, Config::default(), host);
+        p.cue(track, 742.25);
+        p.render(480);
+        let mut s = shared.lock().unwrap();
+        s.tick(p.status(), true);
+        assert!(s.current().is_none());
+        let saved: State = serde_json::from_value(serde_json::to_value(&s.state).unwrap()).unwrap();
+        assert_eq!(saved.queue.current(), Some("missing.wav"));
+        assert_eq!(saved.queue.pos(), 742.25);
+        assert!(!s.state_dirty);
+    }
+
+    #[test]
+    fn review_listening_tick_between_loop_decks_keeps_the_last_heard_frame() {
+        let mut s = session(&["loop.wav"]);
+        select(&mut s, &["loop.wav"], 0);
+        let playing = Status {
+            key: Some(s.active),
+            duration: Some(4.),
+            position: 3.6,
+            playing: true,
+            ..Default::default()
+        };
+        s.tick(playing, true);
+        // The mixer released the exhausted deck before publishing its replacement.
+        s.tick(Status::default(), true);
+        s.last_tick = Instant::now() - Duration::from_secs(1);
+        s.tick(
+            Status {
+                position: 1.1,
+                loop_offset: 3.,
+                ..playing
+            },
+            true,
+        );
+        let heard: f64 = s.listening.days().values().map(|day| day.s).sum();
+        assert!((heard - 0.5).abs() < 0.0001, "heard {heard}");
+    }
+
+    #[test]
+    fn review_active_loop_uses_the_decoded_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("longer.wav");
+        write_song(&path, 8);
+        let name = path.to_str().unwrap();
+        let id = string_core::library::track_id(name);
+        let mut s = session(&[name]);
+        s.models.by_id.get_mut(&id).unwrap().duration = 2.;
+        select(&mut s, &[&id], 0);
+        s.set_field("loops", json!({&id:{"a":4,"b":6}}));
+        let mut p = OfflinePlayer::new(8000, Config::default(), SilentHost);
+        p.play_track(s.track(&id, s.active).unwrap(), 5.);
+        p.render_secs(1.5);
+        assert_eq!(p.status().duration, Some(8.));
+        assert!(
+            (p.status().position - 4.5).abs() < 0.001,
+            "{:?}",
+            p.status()
+        );
+        assert_eq!(s.field("loops")[&id], json!({"a":4,"b":6}));
+        // Next can arrive before the UI tick has copied the decoder's duration.
+        let p = TestTransport(p.into());
+        s.next(&p);
+        p.0.borrow_mut().render_secs(0.5);
+        assert!(
+            !p.status().playing && p.status().position == 0.,
+            "{:?}",
+            p.status()
+        );
+    }
+
+    #[test]
+    fn review_loop_beyond_decoded_eof_allows_autoplay_before_the_first_ui_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("shorter.wav");
+        let next = dir.path().join("next.wav");
+        write_song(&first, 8);
+        write_song(&next, 8);
+        let paths = [first.to_str().unwrap(), next.to_str().unwrap()];
+        let ids = paths.map(string_core::library::track_id);
+        let mut s = session(&paths);
+        select(&mut s, &[&ids[0]], 0);
+        s.set_field("loops", json!({&ids[0]:{"a":7.5,"b":12}}));
+        let track = s.track(&ids[0], s.active).unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let host = QueueHost {
+            session: shared.clone(),
+            ctx: Context::default(),
+        };
+        let mut p = OfflinePlayer::new(8000, Config::default(), host);
+        p.play_track(track, 7.);
+        p.render_secs(1.5);
+        let s = shared.lock().unwrap();
+        assert_eq!(s.state.queue.current(), Some(ids[1].as_str()));
+        assert!(p.status().playing && !s.resync);
+    }
+
+    #[test]
+    fn review_next_stops_on_the_exact_first_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edge.wav");
+        write_song(&path, 5);
+        let name = path.to_str().unwrap();
+        let id = string_core::library::track_id(name);
+        let mut s = session(&[name]);
+        select(&mut s, &[&id], 0);
+        s.set_setting("autoplay", false.into());
+        let p = TestTransport(OfflinePlayer::new(8000, Config::default(), SilentHost).into());
+        s.load_current(&p, true, 1.);
+        p.0.borrow_mut().render_secs(0.5);
+        assert!(p.status().playing);
+        s.next(&p);
+        p.0.borrow_mut().render_secs(0.5);
+        assert!(!p.status().playing);
+        assert_eq!(p.status().key, Some(s.active));
+        assert_eq!(p.status().position, 0.);
+        s.resume(&p);
+        p.0.borrow_mut().render(1);
+        assert_eq!(p.status().position, 1. / 8000.);
+    }
+
+    #[test]
+    fn review_repeat_one_preload_failure_keeps_the_playing_song() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("repeat.wav");
+        write_song(&path, 8);
+        let name = path.to_str().unwrap();
+        let id = string_core::library::track_id(name);
+        let mut s = session(&[name]);
+        select(&mut s, &[&id], 0);
+        s.state.queue.set_repeat(string_core::queue::Repeat::One);
+        let track = s.track(&id, s.active).unwrap();
+        let shared = Arc::new(Mutex::new(s));
+        let host = QueueHost {
+            session: shared.clone(),
+            ctx: Context::default(),
+        };
+        let mut p = OfflinePlayer::new(
+            8000,
+            Config {
+                ask_ahead: 4.,
+                ..Default::default()
+            },
+            host,
+        );
+        p.play_track(track, 0.);
+        p.render_secs(1.);
+        std::fs::rename(&path, dir.path().join("moved.wav")).unwrap();
+        p.render_secs(4.);
+        let mut s = shared.lock().unwrap();
+        assert!(!s.notices.is_empty(), "the repeat failed to open");
+        assert!(p.status().playing);
+        assert_eq!(s.bar_song(p.status()).map(|song| &song.id), Some(&id));
+        s.tick(p.status(), true);
+        drop(s);
+        p.render(1);
+        let mut s = shared.lock().unwrap();
+        s.tick(p.status(), true);
+        assert!(s.listening.days().values().any(|day| day.s > 0.));
+    }
+
+    #[test]
+    fn review_seek_release_during_an_unpublished_selection_cannot_move_the_new_track() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.wav");
+        let second = dir.path().join("second.wav");
+        write_song(&first, 5);
+        write_song(&second, 5);
+        let name = first.to_str().unwrap();
+        let id = string_core::library::track_id(name);
+        let mut s = session(&[name]);
+        select(&mut s, &[&id], 0);
+        let p = TestTransport(OfflinePlayer::new(8000, Config::default(), SilentHost).into());
+        s.load_current(&p, true, 0.);
+        p.0.borrow_mut().render_secs(0.1);
+        let pressed = s.active;
+        // The engine has selected the successor while the UI still sees the previous callback.
+        p.play_track(Track::new(pressed + 1, second), 0.);
+        assert_eq!(p.status().key, Some(pressed));
+        s.seek_from_bar(&p, pressed, 3.);
+        p.0.borrow_mut().render_secs(0.5);
+        assert_eq!(p.status().key, Some(pressed + 1));
+        assert!(p.status().position <= 0.5, "{:?}", p.status());
+    }
+
+    #[test]
+    fn review_toggle_cancels_a_selection_before_output_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.wav");
+        let b = dir.path().join("b.wav");
+        write_song(&a, 5);
+        write_song(&b, 5);
+        let paths = [a.to_str().unwrap(), b.to_str().unwrap()];
+        let ids = paths.map(string_core::library::track_id);
+        let mut s = session(&paths);
+        select(&mut s, &[&ids[0], &ids[1]], 0);
+        let p = TestTransport(OfflinePlayer::new(8000, Config::default(), SilentHost).into());
+        s.load_current(&p, true, 0.);
+        p.0.borrow_mut().render_secs(0.1);
+        let retired = p.status();
+        s.next(&p);
+        let selected = s.active;
+        assert!(retired.playing && s.bar_song(retired).is_none());
+        // No callbacks from the retired device between selecting B and cancelling it.
+        s.toggle(&p);
+        p.0.borrow_mut().render_secs(0.5);
+        assert!(!p.status().playing, "{:?}", p.status());
+        assert_eq!(p.status().key, Some(selected));
+    }
+
+    #[test]
+    fn one_second_loops_count_every_rendered_second_between_infrequent_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("loop.wav");
+        write_song(&path, 4);
         let name = path.to_str().unwrap();
         let id = string_core::library::track_id(name);
         let mut s = session(&[name]);

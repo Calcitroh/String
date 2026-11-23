@@ -105,7 +105,12 @@ pub enum Event {
     /// The end is near: the engine is about to ask what follows (`left` seconds remain).
     NearEnd { track: Track, left: f64 },
     /// This song couldn't be opened, or broke while playing.
-    Failed { track: Track, error: String },
+    Failed {
+        track: Track,
+        error: String,
+        /// Opening the selected song failed and the engine cut the active decks.
+        selection: bool,
+    },
     /// The last song ended and nothing followed.
     Stopped,
     /// Sound goes to this output now (at the start, and after the device changed).
@@ -145,9 +150,15 @@ pub(crate) enum Command {
         start: bool,
     },
     Resume,
+    Toggle,
+    RewindPaused,
     Pause,
     Stop,
     Seek(f64),
+    SeekTrack {
+        key: u64,
+        position: f64,
+    },
     Volume(f32),
     Mute(bool),
     Crossfade(f64),
