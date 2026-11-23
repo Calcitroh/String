@@ -341,6 +341,10 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>, r: Rect) {
         menus::ctx_menu(json!({"kind":"pl","key":id}), at, None);
     }
     if let Some((id, ids)) = dropped {
-        menus::add_to_playlist(v, &id, &ids);
+        drop_songs(v, &id, &ids);
     }
+}
+
+pub(crate) fn drop_songs(v: &mut View<'_>, playlist: &str, ids: &[String]) {
+    menus::add_to_playlist(v, playlist, ids);
 }

@@ -10,6 +10,23 @@ use string_core::{
 };
 use string_extras::edit::Info;
 
+// An ordinary PCM file with readable tags. The first copy has a higher sample rate.
+fn recording(title: &[u8; 4], rate: u32) -> Vec<u8> {
+    let mut body = b"WAVEfmt \x10\0\0\0\x01\0\x01\0".to_vec();
+    body.extend(rate.to_le_bytes());
+    body.extend((rate * 2).to_le_bytes());
+    body.extend(b"\x02\0\x10\0LIST\x20\0\0\0INFOINAM\x06\0\0\0");
+    body.extend(title);
+    body.extend(b"\0\0IART\x06\0\0\0Artist");
+    body.extend(b"data");
+    body.extend((rate * 2).to_le_bytes());
+    body.resize(body.len() + rate as usize * 2, 0);
+    let mut out = b"RIFF".to_vec();
+    out.extend((body.len() as u32).to_le_bytes());
+    out.extend(body);
+    out
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     session: Session,
@@ -18,12 +35,34 @@ struct Fixture {
     ids: Vec<String>,
 }
 impl Fixture {
+    fn with_view(&mut self, action: impl FnOnce(&mut State, &mut View<'_>)) {
+        use string_platform::{errors_log::ErrorLog, instance::{self, Claim, Names}};
+        struct Quiet;
+        impl string_audio::Host for Quiet {
+            fn next_after(&mut self, _: &string_audio::Track) -> Option<string_audio::Track> { None }
+            fn event(&mut self, _: string_audio::Event) {}
+        }
+        let args = crate::Args {
+            root: self._dir.path().into(), explicit: true, smoke: Some(self._dir.path().into()),
+            quit: false, add: None, playlist: None,
+        };
+        let Claim::First(instance) = instance::claim_quietly(&Names::custom(&format!("StringCopiesTest{:x}", rand::random::<u64>()))).unwrap() else { panic!() };
+        let adds = crate::add_work::Adds::new().unwrap();
+        action(&mut self.page, &mut View {
+            adds: &adds.input,
+            platform: &mut crate::platform::Platform::new(instance, &args, std::sync::Arc::new(ErrorLog::new(self._dir.path()))),
+            s: &mut self.session,
+            player: &string_audio::Player::new(string_audio::Config { muted: true, ..Default::default() }, Quiet),
+            st: Default::default(), views: &mut Default::default(), covers: &mut ui::covers::CoverCache::new(&self.ctx),
+            viz: &Default::default(), scan: &mut Default::default(), tint: Tint::Mono, mono: true, force_mute: true,
+        });
+    }
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut library = Library::default();
-        for (i, name) in ["a.flac", "b.mp3", "c.mp3", "d.mp3"].iter().enumerate() {
+        for (i, name) in ["a.wav", "b.wav", "c.wav", "d.wav"].iter().enumerate() {
             let path = dir.path().join(name);
-            fs::write(&path, b"test song").unwrap();
+            fs::write(&path, recording(b"Same", if i == 0 { 16000 } else { 8000 })).unwrap();
             let m = fs::metadata(&path).unwrap();
             let mut t = Track {
                 path: path.to_str().unwrap().to_owned(),
@@ -36,10 +75,8 @@ impl Fixture {
                     .as_millis() as i64,
                 ..Track::default()
             };
-            t.tags.title = "Same".into();
-            t.tags.artist = "Artist".into();
-            t.tags.duration = 20.;
-            t.tags.format = if i == 0 { "flac" } else { "mp3" }.into();
+            t.tags = string_core::tags::read(&path).unwrap().tags;
+            assert_eq!(t.tags.title, "Same");
             library.tracks.push(t);
         }
         let ids: Vec<_> = library.tracks.iter().map(Track::id).collect();
@@ -175,7 +212,7 @@ fn confirmation_rechecks_the_kept_file_and_cancels_all_moves() {
     // Replace the keeper with the same length and last-write time, as a restore tool can do.
     let path = &f.session.library.tracks[0].path;
     let replacement = f._dir.path().join("replacement");
-    fs::write(&replacement, b"different").unwrap();
+    fs::write(&replacement, recording(b"Else", 16000)).unwrap();
     let modified = fs::metadata(path).unwrap().modified().unwrap();
     fs::File::options()
         .write(true)
@@ -315,7 +352,7 @@ fn replacement_with_cached_size_and_time_forces_its_tags_to_be_read_again() {
     let path = &f.session.library.tracks[2].path;
     let stamp = fs::metadata(path).unwrap().modified().unwrap();
     let other = f._dir.path().join("replacement");
-    fs::write(&other, b"different").unwrap();
+    fs::write(&other, recording(b"Else", 8000)).unwrap();
     fs::File::options()
         .write(true)
         .open(&other)
@@ -347,4 +384,108 @@ fn replacement_with_cached_size_and_time_forces_its_tags_to_be_read_again() {
             .any(|g| g.found.ids.contains(&f.ids[1]))
     );
     assert_eq!(f.history(), history);
+}
+
+#[test]
+fn review_replacement_before_look_cannot_inherit_cached_tags() {
+    let mut f = Fixture::new();
+    let history = f.history();
+    let path = f.session.library.tracks[1].path.clone();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let other = f._dir.path().join("restored.wav");
+    fs::write(&other, recording(b"Else", 8000)).unwrap();
+    fs::File::options().write(true).open(&other).unwrap().set_modified(modified).unwrap();
+    fs::rename(other, &path).unwrap();
+    f.page = State::default();
+    f.refresh();
+    f.hide();
+    assert_eq!(f.history(), history);
+    assert!(!f.session.state.hidden(&f.ids[1]));
+    assert!(f.page.reread.contains(&path));
+}
+
+#[test]
+fn review_shell_success_for_a_substituted_file_must_not_authorize_a_merge() {
+    let mut f = Fixture::new();
+    f.page.drop = HashSet::from([f.ids[1].clone()]);
+    let checked = f.act(Intent::Recycle).unwrap();
+    let saved = f._dir.path().join("saved-original.wav");
+    let replacement = f._dir.path().join("other.wav");
+    fs::write(&replacement, recording(b"Else", 8000)).unwrap();
+    let moved = checked.recycle(|path| {
+        fs::rename(path, &saved)?;
+        fs::rename(&replacement, path)?;
+        fs::rename(path, f._dir.path().join("wrong-bin-item.wav"))
+    });
+    assert!(moved.outcomes[0].is_err());
+}
+
+#[test]
+fn review_edit_after_first_move_preserves_the_pending_file() {
+    let mut f = Fixture::new();
+    let checked = f.act(Intent::Recycle).unwrap();
+    let pending = checked.plan[1].clone();
+    let bin = f._dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let mut count = 0;
+    let moved = checked.recycle(|path| {
+        fs::rename(path, bin.join(path.file_name().unwrap()))?;
+        if count == 0 {
+            crate::ui::edit_info::save_info(&mut f.session, &pending.drop_id, &Info { title: "Other song".into(), ..Default::default() });
+        }
+        count += 1;
+        Ok(())
+    });
+    assert!(std::path::Path::new(&pending.path).is_file());
+    assert!(moved.outcomes[1].is_err());
+}
+
+#[test]
+fn review_scan_observing_a_move_preserves_its_history() {
+    let mut f = Fixture::new();
+    let revision = basis(&f.session);
+    let checked = f.act(Intent::Recycle).unwrap();
+    let bin = f._dir.path().join(".bin");
+    fs::create_dir(&bin).unwrap();
+    let moved = checked.recycle(|path| fs::rename(path, bin.join(path.file_name().unwrap())));
+    assert!(moved.outcomes.iter().all(Result::is_ok));
+    let paths: Vec<PathBuf> = f.session.library.tracks.iter().map(|t| PathBuf::from(&t.path)).collect();
+    assert_eq!(f.session.library.scan(&[], &paths).removed, 2);
+    f.session.rebuild();
+    f.with_view(|page, v| page.recycled(revision, moved, v));
+    let keep = &f.ids[0];
+    assert_eq!(f.session.field("plays")[keep][0], 3);
+    assert_eq!(f.session.field("liked")[keep], 2);
+    assert_eq!(f.session.field("loops")[keep]["b"], 7);
+    assert!(!f.history().to_string().contains(&json!(f.ids[1]).to_string()));
+}
+
+#[test]
+fn review_refresh_keeps_the_chosen_keeper_and_unticked_copy() {
+    let mut f = Fixture::new();
+    f.page.keep[0] = f.ids[1].clone();
+    f.page.tick(0);
+    f.page.drop.remove(&f.ids[2]);
+    f.session.plays_revision += 1;
+    f.refresh();
+    assert_eq!(f.page.keep, [f.ids[1].clone()]);
+    assert_eq!(f.page.drop, HashSet::from([f.ids[0].clone()]));
+}
+
+#[test]
+fn review_drop_resolves_dragged_ids_after_a_scan() {
+    let mut f = Fixture::new();
+    let list = f.session.new_playlist("Destination", &[]);
+    let mut selection = ui::songs::Selection::default();
+    selection.bind(&f.ids[..2].to_vec().into(), None);
+    selection.choose(0, false, false);
+    selection.choose(1, true, false);
+    let payload = selection.ids();
+    f.session.library.tracks.remove(1);
+    f.session.rebuild();
+    selection.bind(&f.ids[..1].to_vec().into(), None);
+    f.with_view(|_, v| ui::side_playlists::drop_songs(v, &list, &payload));
+    let dest = f.session.field("playlists").as_array().unwrap().iter().find(|pl| pl["id"] == list).unwrap();
+    assert_eq!(dest["items"].as_array().unwrap().len(), 1);
+    assert_eq!(dest["items"][0]["id"], f.ids[0]);
 }
