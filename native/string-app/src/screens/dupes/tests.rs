@@ -117,6 +117,7 @@ impl Fixture {
         }
         let ids: Vec<_> = library.tracks.iter().map(Track::id).collect();
         let mut session = Session::new(Default::default(), Default::default(), library);
+        session.set_field("roots", json!([dir.path()]));
         session.set_field("hidden", json!({(ids[3].clone()):1}));
         session.set_field("liked", json!({(ids[1].clone()):2}));
         session.set_field("loops", json!({(ids[1].clone()):{"a":2,"b":7}}));
@@ -453,7 +454,7 @@ fn review_replacement_before_look_cannot_inherit_cached_tags() {
 }
 
 #[test]
-fn review_shell_success_for_a_substituted_file_must_not_authorize_a_merge() {
+fn final_shell_success_for_a_substituted_file_must_not_authorize_a_merge() {
     let mut f = Fixture::new();
     let history = f.history();
     f.page.drop = HashSet::from([f.ids[1].clone()]);
@@ -482,6 +483,8 @@ fn review_shell_success_for_a_substituted_file_must_not_authorize_a_merge() {
             v,
         );
         assert_eq!((progress.moved, progress.failed.len()), (0, 1));
+        let warning = &progress.failed[0];
+        assert!(warning.contains("Original Location") && warning.contains("b.wav"), "{warning}");
     });
     assert_eq!(f.history(), history);
 }
@@ -712,7 +715,10 @@ fn review_drop_resolves_dragged_ids_after_a_scan() {
     f.session.library.tracks.remove(1);
     f.session.rebuild();
     selection.bind(&f.ids[..1].to_vec().into(), None);
-    f.with_view(|_, v| ui::side_playlists::drop_songs(v, &list, &payload));
+    f.with_view(|_, v| {
+        v.views.selection = selection;
+        ui::side_playlists::drop_songs(v, &list, &payload);
+    });
     let dest = f
         .session
         .field("playlists")
@@ -723,4 +729,112 @@ fn review_drop_resolves_dragged_ids_after_a_scan() {
         .unwrap();
     assert_eq!(dest["items"].as_array().unwrap().len(), 1);
     assert_eq!(dest["items"][0]["id"], f.ids[0]);
+}
+
+#[test]
+fn final_removed_keeper_location_cancels_pending_moves() {
+    for location in ["roots", "files"] {
+        let mut f = Fixture::new();
+        let tracks = &f.session.library.tracks;
+        let loose: Vec<_> = tracks.iter().skip(usize::from(location == "roots")).map(|t| t.path.clone()).collect();
+        f.session.set_field("files", json!(loose));
+        if location == "files" {
+            f.session.set_field("roots", json!([]));
+        }
+        f.session.rebuild();
+        f.refresh();
+        let checked = f.act(Intent::Recycle).unwrap();
+        let mut progress = Progress::default();
+        assert!(f.page.next_pair(&checked, &mut progress, &f.session).is_some());
+        f.session.set_field(location, json!([]));
+        let before = f.history();
+        assert!(f.page.next_pair(&checked, &mut progress, &f.session).is_none(), "{location}");
+        assert_eq!(progress.failed.len(), 1);
+        assert!(std::path::Path::new(&checked.plan[1].path).is_file());
+        assert_eq!(f.history(), before);
+    }
+}
+
+#[test]
+fn final_drag_skips_song_that_left_its_artist_but_remains_in_library() {
+    let mut f = Fixture::new();
+    let list = f.session.new_playlist("Destination", &[]);
+    let ids = f.ids[..2].to_vec();
+    f.with_view(|_, v| {
+        v.views.selection.bind(&ids.clone().into(), None);
+        v.views.selection.choose(0, false, false);
+        v.views.selection.choose(1, true, false);
+        let payload = v.views.selection.ids();
+        v.s.library.tracks[1].tags.artist = "Other artist".into();
+        v.s.rebuild();
+        v.views.selection.bind(&vec![ids[0].clone()].into(), None);
+        assert!(v.s.models.by_id.contains_key(&ids[1]));
+        ui::side_playlists::drop_songs(v, &list, &payload);
+        let entries = v.s.playlist_entries(&list);
+        assert_eq!(entries.iter().map(|e| &e.1).collect::<Vec<_>>(), [&ids[0]]);
+    });
+}
+
+#[test]
+fn final_mixed_case_path_can_hide_checked_copies() {
+    let mut f = Fixture::new();
+    let dir = f._dir.path().to_str().unwrap().to_uppercase();
+    for t in &mut f.session.library.tracks {
+        t.path = t.path.to_uppercase();
+    }
+    f.session.set_field("roots", json!([dir]));
+    f.session.rebuild();
+    f.page = State::default();
+    f.refresh();
+    f.hide();
+    assert!(f.session.state.hidden(&f.ids[1]));
+    assert!(f.session.state.hidden(&f.ids[2]));
+}
+
+#[test]
+fn final_preserved_filename_can_be_checked_hidden_and_moved() {
+    use std::os::windows::ffi::OsStringExt;
+    let mut f = Fixture::new();
+    let wide = std::ffi::OsString::from_wide(&[0xd800, 46, 119, 97, 118]);
+    let path = f._dir.path().join(wide);
+    let track = &mut f.session.library.tracks[1];
+    fs::rename(&track.path, &path).unwrap();
+    let mut scanned = Library::default();
+    scanned.scan(&[], std::slice::from_ref(&path));
+    track.path = scanned.tracks.pop().unwrap().path;
+    let id = track.id();
+    f.session.rebuild();
+    f.page = State::default();
+    f.refresh();
+    assert!(f.act(Intent::Hide).is_some());
+    f.page.drop = HashSet::from([id]);
+    let mut checked = f.act(Intent::Recycle).unwrap();
+    checked.move_one(0, |p| {
+        assert_eq!(p, path);
+        fs::rename(p, f._dir.path().join("moved.wav"))
+    }, |p| p.ends_with("moved.wav")).unwrap();
+}
+
+#[test]
+fn final_batch_rebuilds_models_once_and_transfers_history_per_move() {
+    let mut f = Fixture::new();
+    let mut checked = f.act(Intent::Recycle).unwrap();
+    let bin = f._dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    f.with_view(|page, v| {
+        let start = v.s.generation;
+        let mut progress = Progress::default();
+        while let Some((at, original)) = page.next_pair(&checked, &mut progress, v.s) {
+            checked.move_one(at, |p| fs::rename(p, bin.join(p.file_name().unwrap())), |p| p.parent().unwrap().ends_with("bin")).unwrap();
+            let copy = &checked.plan[at];
+            page.finish_move(copy, &original, Ok(()), &mut progress, v);
+            assert!(v.s.field("plays")[&copy.drop_id].is_null());
+            assert!(v.s.state_dirty && v.s.listening_dirty);
+        }
+        assert_eq!(progress.moved, 2);
+        page.dispatch(checked, progress, v);
+        assert_eq!(v.s.generation - start, 1);
+        assert_eq!(v.s.library.tracks.len(), 2);
+        assert_eq!(v.s.models.by_id.len(), 2);
+    });
 }
