@@ -193,8 +193,19 @@ impl Follow {
                     let row = row_layout(ui.painter(), i, size);
                     let pos = rect.min + vec2(0., 7.);
                     if sung {
-                        for (radius, alpha) in [(3., 0.025), (1.5, 0.04)] {
-                            for (x, y) in [(1., 0.), (-1., 0.), (0., 1.), (0., -1.)] {
+                        // A soft halo that follows the letters (no box): copies all round, strongest nearest.
+                        const ROUND: [(f32, f32); 8] = [
+                            (1., 0.),
+                            (-1., 0.),
+                            (0., 1.),
+                            (0., -1.),
+                            (0.71, 0.71),
+                            (-0.71, 0.71),
+                            (0.71, -0.71),
+                            (-0.71, -0.71),
+                        ];
+                        for (radius, alpha) in [(5., 0.03), (3., 0.05), (1.5, 0.08)] {
+                            for (x, y) in ROUND {
                                 faded(
                                     ui.painter(),
                                     view,
