@@ -481,7 +481,11 @@ pub mod smoke {
             let (roots, files) = (inputs("roots"), inputs("files"));
             let added = v.platform.added_at_start.iter().all(|p| {
                 let p = p.to_string_lossy().to_lowercase();
-                roots.contains(&p) || files.contains(&p)
+                files.contains(&p)
+                    || v.s.models.by_id.contains_key(&p)
+                    || roots
+                        .iter()
+                        .any(|root| std::path::Path::new(&p).starts_with(root))
             });
             h.smoke_start == Some(true) && drawn && added
         },

@@ -1,7 +1,9 @@
 use super::*;
-use crate::{Args, PlaylistUsage};
+use crate::{Args, PlaylistUsage, add_work::Adds};
+use std::time::Instant;
 use std::{ffi::OsString, fs, path::Path, process::Command};
 use string_core::{library::Library, state::State};
+use string_platform::instance;
 
 fn args(words: &[&str]) -> Result<Args, crate::Error> {
     Args::parse_from(words.iter().map(OsString::from))
@@ -33,6 +35,206 @@ fn id(path: &Path) -> String {
 
 fn visible(s: &Session) -> &[String] {
     &s.models.playlists[0].ids
+}
+
+#[test]
+fn review_folder_reservation_survives_an_incomplete_scan_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let album = dir.path().join("disc");
+    let volume = album.join("volume");
+    fs::create_dir_all(&volume).unwrap();
+    let other = dir.path().join("disc-two");
+    fs::create_dir(&other).unwrap();
+    let unvisited = other.join("offline");
+    fs::create_dir(&unvisited).unwrap();
+    let other_song = file(&other, "song.wav");
+    let tail = file(dir.path(), "last.wav");
+    finish_wav(&tail);
+    finish_wav(&other_song);
+    let mut s = session(State::default());
+    reserve(
+        &mut s,
+        "List",
+        &[
+            album.clone(),
+            other.clone(),
+            tail.clone(),
+            unvisited.clone(),
+        ],
+    );
+    let marker = s.field("playlists")[0]["items"][0].clone();
+    let covered_marker = s.field("playlists")[0]["items"][3].clone();
+    // A separately selected subdirectory becomes unavailable. Its parent is still readable.
+    let roots = [album.clone(), volume.clone(), other];
+    fs::remove_dir(&volume).unwrap();
+    fs::remove_dir(&unvisited).unwrap();
+    let report = s.library.scan(&roots, std::slice::from_ref(&tail));
+    assert_eq!(report.issues[0].path, volume);
+    s.rebuild();
+    resolve_folders(&mut s, &report.complete_folders);
+    assert_eq!(s.field("playlists")[0]["items"][0], marker);
+    assert_eq!(s.field("playlists")[0]["items"][3], covered_marker);
+    assert_eq!(visible(&s), [id(&other_song), id(&tail)]);
+    let mut s = session(s.state);
+    fs::create_dir(&volume).unwrap();
+    fs::create_dir(&unvisited).unwrap();
+    let song = file(&volume, "restored.wav");
+    finish_wav(&song);
+    let recovered = file(&unvisited, "returned.wav");
+    finish_wav(&recovered);
+    let report = s.library.scan(&roots, std::slice::from_ref(&tail));
+    assert!(report.issues.is_empty());
+    s.rebuild();
+    resolve_folders(&mut s, &report.complete_folders);
+    assert_eq!(
+        visible(&s),
+        [id(&song), id(&other_song), id(&tail), id(&recovered)]
+    );
+}
+
+#[test]
+fn review_helpers_share_drop_admission_and_reserve_existing_songs() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("music");
+    let disc = root.join("disc");
+    fs::create_dir_all(&disc).unwrap();
+    let existing = file(&root, "old.wav");
+    finish_wav(&existing);
+    let note = file(dir.path(), "notes.txt");
+    let fresh = file(dir.path(), "new.opus");
+    let mut s = session(State::default());
+    s.set_field("roots", json!([root]));
+    s.library.scan(&[root.clone()], &[]);
+    s.rebuild();
+    let paths = [note, existing.clone(), disc.clone(), fresh.clone()];
+    let mut adds = Adds::new().unwrap();
+    assert!(adds.input.submit(Some("Mix".into()), paths.to_vec(), 256));
+    let mut scan = crate::scan::Scanner::default();
+    adds.next_at_exit(Instant::now() + Duration::from_secs(5))
+        .unwrap()
+        .apply(&mut s, &mut scan);
+    assert_eq!(s.field("roots"), &json!([root]));
+    assert_eq!(s.field("files"), &json!([fresh]));
+    let items = s.field("playlists")[0]["items"].as_array().unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [id(&existing), format!("{}\\", id(&disc)), id(&fresh)]
+    );
+    assert!(scan.requested);
+}
+
+#[test]
+fn review_missing_spelling_does_not_hide_an_existing_song() {
+    let dir = tempfile::tempdir().unwrap();
+    // These Unicode spellings fold to the same String ID, even on case-insensitive NTFS.
+    let missing = dir.path().join("\u{130}.wav");
+    let existing = file(dir.path(), "i\u{307}.wav");
+    assert!(!missing.exists());
+    assert_eq!(id(&missing), id(&existing));
+    let found = crate::add_work::classify(vec![missing, existing.clone(), existing.clone()]);
+    assert_eq!(
+        found,
+        [Location {
+            path: existing,
+            directory: false
+        }]
+    );
+}
+
+#[test]
+fn review_startup_and_incoming_requests_share_capacity() {
+    use std::os::windows::ffi::OsStrExt;
+    use string_platform::instance::Instance;
+    let dir = tempfile::tempdir().unwrap();
+    let path = file(dir.path(), "startup.wav");
+    let args = Args::options([
+        OsString::from("--add"),
+        "--playlist".into(),
+        "Mix".into(),
+        path.clone().into(),
+    ])
+    .unwrap();
+    let names = Names::custom(&format!("StartupCapacity.{}", std::process::id()));
+    let (resume, gate) = std::sync::mpsc::channel();
+    let mut adds = Adds::with_classifier(move |paths| {
+        let _ = gate.recv();
+        crate::add_work::classify(paths)
+    })
+    .unwrap();
+    let Start::Run(_first) = claim(
+        &names,
+        args.playlist.as_deref(),
+        args.add.as_ref().unwrap(),
+        Duration::ZERO,
+        || Ok(adds.input.clone()),
+    )
+    .unwrap() else {
+        panic!("expected isolated instance");
+    };
+    let path_bytes = (path.as_os_str().encode_wide().count() + 1) * 2;
+    // The remaining bytes must account for the playlist name as well as the path.
+    assert!(!adds.input.submit(
+        None,
+        vec![path.clone()],
+        Instance::MAX_ADD_BYTES - path_bytes
+    ));
+    assert!(!names.send_paths(
+        &vec![PathBuf::from(r"C:\a.wav"); Instance::MAX_ADD_PATHS],
+        Duration::ZERO
+    ));
+    resume.send(()).unwrap();
+    assert_eq!(adds.finish_startup().unwrap(), [path.clone()]);
+    assert!(!adds.input.submit(
+        None,
+        vec![path.clone()],
+        Instance::MAX_ADD_BYTES - path_bytes
+    ));
+    assert!(names.send_paths(&[path], Duration::ZERO));
+}
+
+#[test]
+fn review_bulk_playlist_append_finishes_in_one_ui_operation() {
+    // Exclude time when the test runner was descheduled by other builds or tests.
+    fn thread_cpu() -> Duration {
+        use windows::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentThread, GetThreadTimes},
+        };
+        let [mut created, mut exited, mut kernel, mut user] = [FILETIME::default(); 4];
+        unsafe {
+            GetThreadTimes(
+                GetCurrentThread(),
+                &mut created,
+                &mut exited,
+                &mut kernel,
+                &mut user,
+            )
+        }
+        .unwrap();
+        let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+        Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+    }
+    let mut s = session(State::default());
+    let old: Vec<_> = (0..50_000).map(|i| format!("old-{i}")).collect();
+    s.add_playlist("Mix".into(), &old);
+    let key = s.models.playlists[0].id.clone();
+    let mut add: Vec<_> = (0..2_000).map(|i| format!("new-{i}")).collect();
+    add.extend(["old-49999".into(), "new-1999".into()]);
+    let start = thread_cpu();
+    s.add_to_playlist(&key, add.into());
+    let elapsed = thread_cpu() - start;
+    eprintln!("Bulk append on the session thread: {elapsed:?}");
+    assert_eq!(
+        s.field("playlists")[0]["items"].as_array().unwrap().len(),
+        52_000
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "bulk playlist append took {elapsed:?}"
+    );
 }
 
 #[test]
@@ -153,13 +355,14 @@ fn scanned_folders_expand_at_their_argument_positions() {
         &[first.clone(), root.clone(), last.clone(), a.clone()],
     );
     let mut s = session(s.state);
-    s.library
+    let report = s
+        .library
         .scan(&[root.clone(), sibling], &[first.clone(), last.clone()]);
     s.rebuild();
-    resolve_folders(&mut s);
+    resolve_folders(&mut s, &report.complete_folders);
     assert_eq!(visible(&s), [id(&first), id(&a), id(&b), id(&last)]);
     reserve(&mut s, "Mix", &[root]);
-    resolve_folders(&mut s);
+    resolve_folders(&mut s, &report.complete_folders);
     assert_eq!(visible(&s), [id(&first), id(&a), id(&b), id(&last)]);
     assert_eq!(
         s.field("playlists")[0]["items"].as_array().unwrap().len(),
@@ -199,13 +402,15 @@ fn playlist_sender() {
         ..names.clone()
     };
     assert!(!mismatched.send_paths(paths, Duration::ZERO));
+    assert!(!instance::send_add(&mismatched, paths, Duration::ZERO));
     assert!(!mismatched.send_playlist_add("Wrong owner", paths, Duration::ZERO));
     assert!(matches!(
         claim(
             &names,
             args.playlist.as_deref(),
             paths,
-            Duration::from_secs(5)
+            Duration::from_secs(5),
+            || panic!("a forwarding process should not create an add worker"),
         )
         .unwrap(),
         Start::Done(0)
@@ -219,18 +424,20 @@ fn named_add_crosses_processes() {
     let two = file(dir.path(), "two.flac");
     let prefix = format!("PlaylistAddTest.{}", std::process::id());
     let names = Names::custom(&prefix);
-    let mut args = Args::parse_from([
+    let args = Args::options([
         OsString::from("--add"),
         "--playlist".into(),
         "Startup".into(),
         one.clone().into(),
     ])
     .unwrap();
-    let Start::Run(mut first) = claim(
+    let mut adds = Adds::new().unwrap();
+    let Start::Run(first) = claim(
         &names,
         Some("Startup"),
         args.add.as_ref().unwrap(),
         Duration::ZERO,
+        || Ok(adds.input.clone()),
     )
     .unwrap() else {
         panic!("expected an isolated first instance")
@@ -253,13 +460,7 @@ fn named_add_crosses_processes() {
     );
 
     // The early request and the one accepted immediately before close must reach the saved profile.
-    let mut adds = crate::add_work::Adds::new().unwrap();
-    let input = adds.input.clone();
-    first.route_adds(move |n, p, b| input.submit(n, p, b));
-    adds.startup = Some(crate::add_work::Batch::startup(
-        args.playlist.take(),
-        args.classify_startup().unwrap(),
-    ));
+    assert_eq!(adds.finish_startup().unwrap(), [one.clone()]);
     let three = file(dir.path(), "three.flac");
     assert!(names.send_paths(std::slice::from_ref(&three), Duration::ZERO));
     adds.set_closed(true);
@@ -269,7 +470,8 @@ fn named_add_crosses_processes() {
     let (mut store, mut s) =
         crate::storage::Storage::open(&folder, &egui::Context::default()).unwrap();
     let mut scan = crate::scan::Scanner::default();
-    while let Some(batch) = adds.next_at_exit() {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while let Some(batch) = adds.next_at_exit(deadline) {
         batch.apply(&mut s, &mut scan);
     }
     assert!(scan.requested);

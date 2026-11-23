@@ -62,6 +62,9 @@ impl Scanner {
                             s.library_dirty = true;
                             s.rebuild();
                         }
+                        if !self.requested {
+                            crate::playlist_add::resolve_folders(s, &report.complete_folders);
+                        }
                         errors.extend(
                             report
                                 .issues

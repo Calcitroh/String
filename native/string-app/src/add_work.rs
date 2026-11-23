@@ -2,9 +2,11 @@ use crate::{playback::Session, playlist_add, scan::Scanner};
 use std::{
     collections::HashSet,
     fs, io,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::Instant,
 };
 use string_platform::instance::Instance;
 
@@ -18,12 +20,19 @@ pub(crate) fn classify(paths: Vec<PathBuf>) -> Vec<Location> {
     let mut seen = HashSet::new();
     paths
         .into_iter()
-        .filter(|p| p.is_absolute() && seen.insert(p.to_string_lossy().to_lowercase()))
+        .filter(|p| p.is_absolute())
         .filter_map(|path| {
+            let key = path.to_string_lossy().to_lowercase();
+            if seen.contains(&key) {
+                return None;
+            }
             let m = fs::metadata(&path).ok()?;
-            (m.is_dir() || m.is_file()).then(|| Location {
-                path,
-                directory: m.is_dir(),
+            (m.is_dir() || m.is_file()).then(|| {
+                seen.insert(key);
+                Location {
+                    path,
+                    directory: m.is_dir(),
+                }
             })
         })
         .collect()
@@ -54,12 +63,12 @@ impl Drop for Charge {
 enum Source {
     Helper(Option<String>),
     Picker,
-    Drop,
+    Drop { skipped: usize },
 }
 type Job = (Source, Vec<PathBuf>, Charge);
 
 fn path_charge(path: &Path) -> usize {
-    (path.as_os_str().len() + 1) * 2
+    (path.as_os_str().encode_wide().count() + 1) * 2
 }
 
 #[derive(Clone)]
@@ -69,6 +78,15 @@ pub(crate) struct Input {
 }
 
 impl Input {
+    pub fn startup(&self, name: Option<&str>, paths: &[PathBuf]) -> io::Result<()> {
+        let name_bytes = name.map_or(0, |n| (n.encode_utf16().count() + 1) * 2);
+        let bytes = name_bytes + paths.iter().map(|p| path_charge(p)).sum::<usize>();
+        if self.submit(name.map(str::to_owned), paths.to_vec(), bytes) {
+            Ok(())
+        } else {
+            Err(io::Error::other("String could not take the startup add"))
+        }
+    }
     pub(crate) fn submit(&self, name: Option<String>, paths: Vec<PathBuf>, bytes: usize) -> bool {
         self.enqueue(Source::Helper(name), paths, bytes)
     }
@@ -79,11 +97,11 @@ impl Input {
         let bytes = path_charge(&path);
         self.enqueue(Source::Picker, vec![path], bytes)
     }
-    pub(crate) fn dropped_paths(&self, paths: Vec<PathBuf>) -> bool {
+    pub(crate) fn queue_drop(&self, paths: Vec<PathBuf>) -> bool {
         let bytes = paths.iter().map(|p| path_charge(p)).sum();
-        self.enqueue(Source::Drop, paths, bytes)
+        self.enqueue(Source::Drop { skipped: 0 }, paths, bytes)
     }
-    fn enqueue(&self, source: Source, mut paths: Vec<PathBuf>, mut bytes: usize) -> bool {
+    fn enqueue(&self, mut source: Source, mut paths: Vec<PathBuf>, mut bytes: usize) -> bool {
         let mut p = self.state.lock().unwrap();
         if p.closed || paths.is_empty() {
             return false;
@@ -92,10 +110,14 @@ impl Input {
         let free_bytes = Instance::MAX_ADD_BYTES - p.bytes;
         let fits = paths.len() <= free_paths && bytes <= free_bytes;
         if !fits {
-            if !matches!(source, Source::Drop) || free_paths == 0 {
+            let Source::Drop { skipped } = &mut source else {
+                return false;
+            };
+            if free_paths == 0 {
                 return false;
             }
             // Drops used to admit each path separately. Keep what fits, in the same order.
+            let total = paths.len();
             let mut count = 0;
             bytes = 0;
             paths.retain(|path| {
@@ -110,6 +132,7 @@ impl Input {
             if paths.is_empty() {
                 return false;
             }
+            *skipped = total - paths.len();
         }
         p.paths += paths.len();
         p.bytes += bytes;
@@ -121,7 +144,7 @@ impl Input {
         // Serialize submissions to preserve admission order. Release the lock before dropping a failed send.
         let sent = self.jobs.send((source, paths, charge));
         drop(p);
-        sent.is_ok() && fits
+        sent.is_ok()
     }
 }
 
@@ -131,66 +154,50 @@ pub(crate) struct Batch {
     _charge: Option<Charge>,
 }
 impl Batch {
-    pub fn startup(name: Option<String>, locations: Vec<Location>) -> Self {
+    fn new(source: Source, mut locations: Vec<Location>, charge: Option<Charge>) -> Self {
+        if !matches!(source, Source::Picker) {
+            locations.retain(|l| l.directory || crate::screens::settings::is_song_path(&l.path));
+        }
         Self {
-            source: Source::Helper(name),
+            source,
             locations,
-            _charge: None,
+            _charge: charge,
         }
     }
     /// Adds the checked paths; for drops, returns what to tell the person.
-    pub fn apply(mut self, s: &mut Session, scan: &mut Scanner) -> Option<String> {
-        if matches!(self.source, Source::Drop) {
-            self.locations
-                .retain(|l| l.directory || crate::screens::settings::is_song_path(&l.path));
-        }
-        if self.locations.is_empty() {
-            return matches!(self.source, Source::Drop)
-                .then(|| "Those aren't songs String can play".into());
-        }
-        if matches!(self.source, Source::Drop | Source::Picker) {
-            // Drops follow the pickers' rules: a folder inside a listed one isn't added again, only songs are taken.
-            let (folders, songs): (Vec<_>, Vec<_>) =
-                self.locations.into_iter().partition(|l| l.directory);
-            let folders: Vec<PathBuf> = folders.into_iter().map(|l| l.path).collect();
-            let songs: Vec<PathBuf> = songs.into_iter().map(|l| l.path).collect();
-            let a = crate::screens::settings::add_roots_to(s, scan, &folders);
-            let b = crate::screens::settings::add_songs_to(s, scan, &songs);
-            return match (a, b) {
-                (Some(a), Some(b)) => Some(format!("{a} · {b}")),
-                (a, b) => a.or(b),
-            };
-        }
+    pub fn apply(self, s: &mut Session, scan: &mut Scanner) -> Option<String> {
         if let Source::Helper(Some(name)) = &self.source {
+            // A song already in the library still gets its requested playlist position.
             playlist_add::reserve(s, name, &self.locations);
         }
-        for (directory, key) in [(true, "roots"), (false, "files")] {
-            let mut additions = self
-                .locations
-                .iter()
-                .filter(|p| p.directory == directory)
-                .peekable();
-            if additions.peek().is_none() {
-                continue;
-            }
-            let mut values = s.field(key).as_array().cloned().unwrap_or_default();
-            let mut seen: HashSet<_> = values
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_lowercase))
-                .collect();
-            let count = values.len();
-            for loc in additions {
-                let path = loc.path.to_string_lossy();
-                if seen.insert(path.to_lowercase()) {
-                    values.push(path.into_owned().into());
-                }
-            }
-            if values.len() != count {
-                s.set_field(key, values.into());
+        let mut folders = Vec::new();
+        let mut songs = Vec::new();
+        for loc in self.locations {
+            if loc.directory {
+                folders.push(loc.path);
+            } else {
+                songs.push(loc.path);
             }
         }
-        scan.requested = true;
-        None
+        let a = crate::screens::settings::add_roots_to(s, scan, &folders);
+        let b = crate::screens::settings::add_songs_to(s, scan, &songs);
+        if matches!(self.source, Source::Helper(_)) {
+            scan.requested |= !folders.is_empty() || !songs.is_empty();
+            return None;
+        }
+        let message = match (a, b) {
+            (Some(a), Some(b)) => Some(format!("{a} · {b}")),
+            (a, b) => a.or(b),
+        };
+        if let Source::Drop { skipped } = self.source {
+            let message = message.unwrap_or_else(|| "Those aren't songs String can play".into());
+            return Some(if skipped == 0 {
+                message
+            } else {
+                format!("{message} · {skipped} skipped")
+            });
+        }
+        message
     }
 }
 
@@ -200,18 +207,13 @@ pub(crate) fn add_dropped_now(
     scan: &mut Scanner,
     paths: Vec<PathBuf>,
 ) -> Option<String> {
-    Batch {
-        source: Source::Drop,
-        locations: classify(paths),
-        _charge: None,
-    }
-    .apply(s, scan)
+    Batch::new(Source::Drop { skipped: 0 }, classify(paths), None).apply(s, scan)
 }
 
 pub(crate) struct Adds {
     pub input: Input,
     ready: mpsc::Receiver<Batch>,
-    pub startup: Option<Batch>,
+    startup: Option<Batch>,
 }
 
 impl Adds {
@@ -230,11 +232,7 @@ impl Adds {
                     let locations = inspect(paths);
                     let state = charge.state.clone();
                     if finished
-                        .send(Batch {
-                            source,
-                            locations,
-                            _charge: Some(charge),
-                        })
+                        .send(Batch::new(source, locations, Some(charge)))
                         .is_err()
                     {
                         break;
@@ -256,6 +254,18 @@ impl Adds {
     pub fn attach(&self, ctx: &egui::Context) {
         self.input.state.lock().unwrap().wake = Some(ctx.clone());
     }
+    /// Startup was queued before opening the receiver, so its result always arrives first.
+    pub fn finish_startup(&mut self) -> io::Result<Vec<PathBuf>> {
+        let batch = self
+            .ready
+            .recv()
+            .map_err(|_| io::Error::other("Path worker stopped"))?;
+        let paths = batch.locations.iter().map(|l| l.path.clone()).collect();
+        if !batch.locations.is_empty() {
+            self.startup = Some(batch);
+        }
+        Ok(paths)
+    }
     pub fn set_closed(&self, closed: bool) {
         self.input.state.lock().unwrap().closed = closed;
     }
@@ -268,7 +278,7 @@ impl Adds {
         true
     }
     pub fn pending(&self) -> bool {
-        self.startup.is_some() || self.input.state.lock().unwrap().paths != 0
+        self.input.state.lock().unwrap().paths != 0
     }
     pub fn poll(&mut self, s: &mut Session, scan: &mut Scanner, toast: &mut crate::ui::Toast) {
         // Picker results arrive as separate paths. Each drag-and-drop already arrives in one batch.
@@ -302,11 +312,15 @@ impl Adds {
             toast.set(message);
         }
     }
-    // Normal closes poll until ready. A forced event-loop exit also waits for accepted work, outside the session lock.
-    pub fn next_at_exit(&mut self) -> Option<Batch> {
-        self.startup
-            .take()
-            .or_else(|| self.pending().then(|| self.ready.recv().ok()).flatten())
+    pub fn next_at_exit(&mut self, deadline: Instant) -> Option<Batch> {
+        self.startup.take().or_else(|| {
+            if !self.pending() {
+                return None;
+            }
+            self.ready
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()
+        })
     }
 }
 
@@ -334,11 +348,11 @@ mod tests {
             vec![large.clone()],
             Instance::MAX_ADD_BYTES - path_charge(&small)
         ));
-        assert!(!adds.input.dropped_paths(vec![large, small.clone()]));
+        assert!(adds.input.queue_drop(vec![large, small.clone()]));
         let wait = || adds.ready.recv_timeout(Duration::from_secs(2)).unwrap();
         let _helper = wait();
         let drop = wait();
-        assert!(matches!(drop.source, Source::Drop));
+        assert!(matches!(drop.source, Source::Drop { skipped: 1 }));
         assert_eq!(
             drop.locations,
             [Location {

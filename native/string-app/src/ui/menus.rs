@@ -1365,7 +1365,7 @@ fn drops(ctx: &Context, hi: Tint, adds: &crate::add_work::Input, toast: &mut ui:
             hi.ink(1.),
         );
     }
-    if !dropped.is_empty() && !adds.dropped_paths(dropped) {
+    if !dropped.is_empty() && !adds.queue_drop(dropped) {
         toast.set("String could not take more songs.");
     }
 }
