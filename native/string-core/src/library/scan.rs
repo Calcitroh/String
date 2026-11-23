@@ -1,10 +1,13 @@
 //! Discover music and folder art, then refresh changed rows in parallel.
 
+#[cfg(windows)]
+use super::native_path;
 use super::{Issue, Library, ScanReport, Track, track_id};
 use crate::tags;
 use rayon::prelude::*;
 use serde_json::json;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
@@ -58,16 +61,38 @@ fn millis(t: SystemTime) -> i64 {
         |d| d.as_millis() as i64,
     )
 }
-fn path_string(p: &Path) -> io::Result<String> {
-    p.to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "path is not Unicode"))
+fn path_string(path: &Path) -> io::Result<Cow<'_, str>> {
+    if let Some(s) = path.to_str() {
+        return Ok(Cow::Borrowed(s));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let units: Vec<_> = path.as_os_str().encode_wide().collect();
+        Ok(Cow::Owned(crate::data::text::from_units(&units)))
+    }
+    #[cfg(not(windows))]
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "path is not Unicode",
+    ))
+}
+fn key_text(path: &Path) -> Cow<'_, str> {
+    path_string(path).unwrap_or_else(|_| path.to_string_lossy())
+}
+// Folder and loose-file selections can come from either the profile or the OS.
+fn scan_input(path: &Path) -> Cow<'_, Path> {
+    #[cfg(windows)]
+    if let Some(saved) = path.to_str().filter(|s| s.contains('\0')) {
+        return Cow::Owned(native_path(saved));
+    }
+    Cow::Borrowed(path)
 }
 #[cfg(windows)]
 fn child(path: &Path, name: &str) -> PathBuf {
-    PathBuf::from(format!(
+    native_path(&format!(
         "{}\\{}",
-        path.to_string_lossy().trim_end_matches(['\\', '/']),
+        key_text(path).trim_end_matches(['\\', '/']),
         name
     ))
 }
@@ -100,7 +125,7 @@ impl Listing {
     fn file(&mut self, path: &Path, m: &fs::Metadata) -> io::Result<()> {
         if m.is_file() && m.len() > 0 {
             self.files.push(Found {
-                path: path_string(path)?,
+                path: path_string(path)?.into_owned(),
                 size: m.len(),
                 mtime: millis(m.modified()?),
             });
@@ -129,7 +154,7 @@ impl Listing {
                     .iter()
                     .any(|s| name.starts_with(s))
             {
-                self.cover = path_string(path)?;
+                self.cover = path_string(path)?.into_owned();
             }
         } else if audio(name) {
             self.file(path, &m)?;
@@ -137,7 +162,7 @@ impl Listing {
         Ok(())
     }
     fn inaccessible(&mut self, path: &Path, error: io::Error) {
-        self.unread.push(track_id(&path.to_string_lossy()));
+        self.unread.push(track_id(&key_text(path)));
         self.issues.push(Issue {
             path: path.into(),
             error,
@@ -146,6 +171,8 @@ impl Listing {
 }
 fn list(root: &Path, depth: u8) -> Listing {
     let mut out = Listing::default();
+    let root = scan_input(root);
+    let root = root.as_ref();
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(error) => {
@@ -162,7 +189,8 @@ fn list(root: &Path, depth: u8) -> Listing {
                 continue;
             }
         };
-        let Ok(name) = entry.file_name().into_string() else {
+        let name = entry.file_name();
+        let Ok(name) = path_string(Path::new(&name)) else {
             continue;
         };
         let path = child(root, &name);
@@ -185,7 +213,7 @@ impl Library {
         let mut seen = HashSet::new();
         let mut dirs = roots.to_vec();
         for depth in 0..=14 {
-            dirs.retain(|p| seen.insert(track_id(&p.to_string_lossy())));
+            dirs.retain(|p| seen.insert(track_id(&key_text(p))));
             if dirs.is_empty() {
                 break;
             }
@@ -193,7 +221,7 @@ impl Library {
             let mut next = vec![];
             for (root, l) in dirs.iter().zip(batch) {
                 covers.insert(
-                    track_id(root.to_string_lossy().trim_end_matches(['\\', '/'])),
+                    track_id(key_text(root).trim_end_matches(['\\', '/'])),
                     l.cover,
                 );
                 next.extend(l.dirs);
@@ -206,6 +234,8 @@ impl Library {
             dirs = next;
         }
         for path in loose {
+            let path = scan_input(path);
+            let path = path.as_ref();
             let mut l = Listing::default();
             match fs::metadata(path).and_then(|m| l.file(path, &m)) {
                 Ok(()) => {
@@ -215,9 +245,9 @@ impl Library {
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    keep.insert(track_id(&path.to_string_lossy()));
+                    keep.insert(track_id(&key_text(path)));
                     report.issues.push(Issue {
-                        path: path.clone(),
+                        path: path.to_owned(),
                         error,
                     });
                 }
@@ -241,8 +271,10 @@ impl Library {
                 } else {
                     todo.push((f, cover, t.added, Some(retained.len())));
                 }
-            } else if !keep.contains(&id) && !unread.iter().any(|r| id == *r || below(&id, r))
-                && !t.selected_wide_path_exists(roots, loose) {
+            } else if !keep.contains(&id)
+                && !unread.iter().any(|r| id == *r || below(&id, r))
+                && !t.selected_wide_path_exists(roots, loose)
+            {
                 report.removed += 1;
                 continue;
             }
@@ -271,7 +303,8 @@ impl Library {
                     ..Default::default()
                 };
                 let mut issue = None;
-                match tags::read(Path::new(&t.path)) {
+                let path = scan_input(Path::new(&t.path));
+                match tags::read(&path) {
                     Ok(meta) => {
                         t.tags = meta.tags;
                         if meta.cover_mime.is_some() {
@@ -281,7 +314,7 @@ impl Library {
                     Err(error) => {
                         t.read_error = 1;
                         issue = Some(Issue {
-                            path: PathBuf::from(&t.path),
+                            path: path.into_owned(),
                             error,
                         });
                     }
@@ -312,4 +345,44 @@ impl Library {
         }
         report
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn distinct_wide_folders_keep_their_tracks_and_covers() {
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let wide = root.join(OsString::from_wide(&[0xd800]));
+    let replacement = root.join("\u{fffd}");
+    for folder in [&wide, &replacement] {
+        fs::create_dir(folder).unwrap();
+        fs::write(folder.join("song.webm"), [0x1a, 0x45, 0xdf, 0xa3]).unwrap();
+        fs::write(folder.join("cover.png"), []).unwrap();
+    }
+    let mut library = Library::default();
+    let cold = library.scan(std::slice::from_ref(&root), &[]);
+    assert_eq!(cold.read, 2);
+    assert!(cold.issues.is_empty());
+    for track in &library.tracks {
+        let song = native_path(&track.path);
+        assert_eq!(native_path(&track.cover), song.with_file_name("cover.png"));
+    }
+    let saved_wide = root.join("\0\u{e000}");
+    let warm = library.scan(std::slice::from_ref(&saved_wide), &[]);
+    assert!(warm.issues.is_empty());
+    assert_eq!((warm.read, warm.reused, warm.removed), (0, 1, 1));
+    let id = library.tracks[0].id();
+    let song = wide.join("song.webm");
+    assert_eq!(native_path(&library.tracks[0].path), song);
+    fs::write(
+        song,
+        include_bytes!("../../tests/fixtures/tag-scan/tone.flac"),
+    )
+    .unwrap();
+    let changed = library.scan(&[], &[saved_wide.join("song.webm")]);
+    assert_eq!(changed.read, 1);
+    assert!(changed.issues.is_empty());
+    assert_eq!(library.tracks[0].id(), id);
+    assert_eq!(library.tracks[0].tags.year, 2009);
 }
