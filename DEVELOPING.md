@@ -261,7 +261,9 @@ at a time.
 - `string-core`: the library scan and tag reading (lofty), the saved documents (state.json, listening.json,
   library.json: guarded reads, atomic writes, the daily backup and, the first time a profile opens each day, a copy as
   it was found in `<backup>\opened\<date>\`), the queue and the listening model. `stringctl` inspects, round-trips or
-  scans a data folder.
+  scans a data folder. Unlike 1.x, Next pressed on a list's last song goes on to the next list even with Repeat One or
+  a seek-bar loop on (those repeat a song that ends by itself); only Repeat All wraps, and with "keep playing" off it
+  stops at 0:00.
 - `string-audio`: decoding (Symphonia), the two decks, gapless and crossfade, loops, the output device.
 - `string-lyrics`: lyrics (.lrc, the song's own, LRCLIB) and translation through Ollama.
 - `string-extras`: duplicates, Edit info (writing tags), phone listening from Navidrome, and updates (the same feed and

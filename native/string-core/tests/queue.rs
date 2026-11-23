@@ -222,10 +222,11 @@ fn mode_and_queue_edits_invalidate_preload() {
         looping: true,
         ..opts()
     };
-    for opt in [disabled, looping] {
+    // A skip at the album's end: autoplay off stops there; a seek-bar loop doesn't hold it back (the next album).
+    for (opt, skip) in [(disabled, NextAction::Stop), (looping, NextAction::Start)] {
         let p = q.what_next(false, opts(), &lib);
         assert!(!q.commit_next(p, opt, &lib));
-        assert_eq!(q.next(true, opt, &lib), NextAction::Stop);
+        assert_eq!(q.what_next(true, opt, &lib).action(), skip);
     }
     let p = q.what_next(false, opts(), &lib);
     q.cycle_repeat();

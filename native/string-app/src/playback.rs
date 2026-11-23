@@ -855,6 +855,51 @@ mod player_tests {
         }
     }
 
+    /// The owner's call (live try): Repeat One and a seek-bar loop repeat a song that ends by itself, but pressing
+    /// Next on an album's last song goes on to the next album, as it does with Repeat off. (1.x stopped at 0:00.)
+    #[test]
+    fn next_on_an_albums_last_song_goes_on_to_the_next_album_with_a_loop_on() {
+        for mode in ["repeat one", "seek-bar loop"] {
+            let mut library = Library::default();
+            for (path, album, n) in [("a1.wav", "Alpha", 1), ("a2.wav", "Alpha", 2), ("b1.wav", "Beta", 1), ("b2.wav", "Beta", 2)] {
+                library.tracks.push(
+                    serde_json::from_value(json!({
+                        "path": path, "duration": 200, "title": path, "artist": "Band", "album": album, "track": n
+                    }))
+                    .unwrap(),
+                );
+            }
+            let mut s = Session::new(Default::default(), Default::default(), library);
+            let alpha = s
+                .models
+                .catalog
+                .albums
+                .iter()
+                .find(|g| g.ids.iter().any(|id| id == "a1.wav"))
+                .unwrap()
+                .key
+                .clone();
+            let ctx = json!({"kind":"album","key":alpha});
+            let ids = s.models.context_ids(&ctx);
+            assert_eq!(&ids[..], ["a1.wav", "a2.wav"]);
+            assert!(s.state.queue.play_ids(&ids, 1, ctx, &s.models.catalog));
+            match mode {
+                "repeat one" => s.state.queue.set_repeat(string_core::queue::Repeat::One),
+                _ => s.set_field("loops", json!({"a2.wav":{"a":2,"b":40}})),
+            }
+            let p = muted_player();
+            s.next(&p);
+            assert_eq!(s.state.queue.current(), Some("b1.wav"), "{mode}: Next on Alpha's last song");
+            assert_eq!(s.state.queue.context(None)["kind"], "album", "{mode}");
+            if mode == "repeat one" {
+                // a song that ends by itself still repeats
+                assert_eq!(s.state.queue.repeat(), string_core::queue::Repeat::One);
+                let natural = s.state.queue.what_next(false, s.advance_options(), &s.models.catalog);
+                assert_eq!(natural.action(), NextAction::Restart);
+            }
+        }
+    }
+
     #[test]
     fn failed_selection_stops_showing_a_title_and_recovery_shows_the_confirmed_song() {
         let mut s = session(&["a.wav", "b.wav", "c.wav"]);
@@ -1041,12 +1086,13 @@ mod player_tests {
             p.status()
         );
         assert_eq!(s.field("loops")[&id], json!({"a":4,"b":6}));
-        // Next can arrive before the UI tick has copied the decoder's duration.
+        // Next can arrive before the UI tick has copied the decoder's duration. A loop doesn't hold a skip back:
+        // with nothing else to go on to, Next starts the song again, as with Repeat off.
         let p = TestTransport(p.into());
         s.next(&p);
         p.0.borrow_mut().render_secs(0.5);
         assert!(
-            !p.status().playing && p.status().position == 0.,
+            p.status().playing && p.status().position < 1.,
             "{:?}",
             p.status()
         );
@@ -1105,7 +1151,184 @@ mod player_tests {
     /// Next inside an album moves one song on, whatever loop is on (reported live: it went back into the album).
     #[test]
     fn next_in_an_album_moves_one_song_with_any_loop_on() {
+        for (mode, shuffle) in ["repeat one", "repeat all", "seek-bar loop"]
+            .into_iter()
+            .flat_map(|m| [(m, false), (m, true)])
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let paths: Vec<_> = (1..=3)
+                .map(|n| {
+                    let path = dir.path().join(format!("0{n} song.wav"));
+                    write_song(&path, 8);
+                    path.to_str().unwrap().to_owned()
+                })
+                .collect();
+            let names: Vec<&str> = paths.iter().map(String::as_str).collect();
+            let ids: Vec<String> = names.iter().map(|p| string_core::library::track_id(p)).collect();
+            let mut s = session(&names);
+            let album = s.models.catalog.albums.first().map(|g| g.key.clone()).unwrap_or_default();
+            assert!(s.state.queue.play_ids(
+                &ids,
+                0,
+                json!({"kind":"album","key":album}),
+                &s.models.catalog
+            ));
+            if shuffle {
+                s.state.queue.set_shuffle(true, &s.models.catalog);
+            }
+            let first = s.state.queue.current().unwrap().to_owned();
+            match mode {
+                "repeat one" => s.state.queue.set_repeat(string_core::queue::Repeat::One),
+                "repeat all" => s.state.queue.set_repeat(string_core::queue::Repeat::All),
+                _ => s.set_field("loops", json!({&first:{"a":1,"b":3}})),
+            }
+            let p = TestTransport(OfflinePlayer::new(8000, Config::default(), SilentHost).into());
+            s.load_current(&p, true, 0.);
+            p.0.borrow_mut().render_secs(1.5);
+            let mut heard = vec![first];
+            for press in 1..=2 {
+                s.next(&p);
+                p.0.borrow_mut().render_secs(0.5);
+                let now = s.state.queue.current().unwrap().to_owned();
+                assert!(
+                    !heard.contains(&now),
+                    "{mode}, shuffle {shuffle}: Next #{press} went back to a song already heard ({heard:?} then {now})"
+                );
+                assert!(p.status().playing, "{mode}, shuffle {shuffle}: Next #{press} paused");
+                heard.push(now);
+            }
+            assert_eq!(heard.len(), ids.len());
+        }
+    }
+
+    /// Commands queued like the real player's channel, run on the engine once the session lock is released.
+    struct Deferred<'a> {
+        player: &'a std::cell::RefCell<OfflinePlayer>,
+        cmds: std::cell::RefCell<Vec<Box<dyn FnOnce(&mut OfflinePlayer) + 'a>>>,
+    }
+    impl<'a> Deferred<'a> {
+        fn push(&self, f: impl FnOnce(&mut OfflinePlayer) + 'a) {
+            self.cmds.borrow_mut().push(Box::new(f));
+        }
+        fn apply(&self) {
+            for f in self.cmds.take() {
+                f(&mut self.player.borrow_mut());
+            }
+        }
+    }
+    impl Transport for Deferred<'_> {
+        fn status(&self) -> Status {
+            self.player.borrow().status()
+        }
+        fn play_track(&self, track: Track, from: f64) {
+            self.push(move |p| p.play_track(track, from))
+        }
+        fn cue(&self, track: Track, from: f64) {
+            self.push(move |p| p.cue(track, from))
+        }
+        fn stop(&self) {
+            self.push(|p| p.stop())
+        }
+        fn play(&self) {
+            self.push(|p| p.play())
+        }
+        fn toggle(&self) {
+            self.push(|p| p.toggle())
+        }
+        fn rewind_paused(&self) {
+            self.push(|p| p.rewind_paused())
+        }
+        fn seek(&self, position: f64) {
+            self.push(move |p| p.seek(position))
+        }
+        fn seek_track(&self, key: u64, position: f64) {
+            self.push(move |p| p.seek_track(key, position))
+        }
+    }
+
+    /// The live report: in an album with a loop on, Next restarted or paused the same song. This drives the real
+    /// engine host, which has already prepared the loop's "same song again" when Next arrives.
+    #[test]
+    fn next_with_a_prepared_repeat_moves_on_in_an_album() {
         for mode in ["repeat one", "repeat all", "seek-bar loop"] {
+            for shuffle in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let paths: Vec<_> = (1..=3)
+                    .map(|n| {
+                        let path = dir.path().join(format!("0{n} song.wav"));
+                        write_song(&path, 8);
+                        path.to_str().unwrap().to_owned()
+                    })
+                    .collect();
+                let names: Vec<&str> = paths.iter().map(String::as_str).collect();
+                let ids: Vec<String> =
+                    names.iter().map(|p| string_core::library::track_id(p)).collect();
+                let mut s = session(&names);
+                let album = s.models.catalog.albums.first().map(|g| g.key.clone()).unwrap_or_default();
+                assert!(s.state.queue.play_ids(
+                    &ids,
+                    0,
+                    json!({"kind":"album","key":album}),
+                    &s.models.catalog
+                ));
+                if shuffle {
+                    s.state.queue.set_shuffle(true, &s.models.catalog);
+                }
+                let first = s.state.queue.current().unwrap().to_owned();
+                match mode {
+                    "repeat one" => s.state.queue.set_repeat(string_core::queue::Repeat::One),
+                    "repeat all" => s.state.queue.set_repeat(string_core::queue::Repeat::All),
+                    _ => s.set_field("loops", json!({&first:{"a":1,"b":7}})),
+                }
+                let shared = Arc::new(Mutex::new(s));
+                let host = QueueHost {
+                    session: shared.clone(),
+                    ctx: Context::default(),
+                };
+                let player = std::cell::RefCell::new(OfflinePlayer::new(
+                    8000,
+                    Config {
+                        muted: true,
+                        ..Default::default()
+                    },
+                    host,
+                ));
+                let t = Deferred {
+                    player: &player,
+                    cmds: Default::default(),
+                };
+                shared.lock().unwrap().load_current(&t, true, 0.);
+                t.apply();
+                // Long enough for the engine to have asked for and prepared what follows.
+                player.borrow_mut().render_secs(5.);
+                let mut heard = vec![first];
+                for press in 1..=2 {
+                    shared.lock().unwrap().next(&t);
+                    t.apply();
+                    player.borrow_mut().render_secs(1.);
+                    let s = shared.lock().unwrap();
+                    let now = s.state.queue.current().unwrap().to_owned();
+                    let st = player.borrow().status();
+                    let label = format!("{mode}, shuffle {shuffle}, Next #{press}");
+                    assert!(!heard.contains(&now), "{label}: the queue went back to {now} ({heard:?})");
+                    assert!(st.playing, "{label}: paused ({st:?})");
+                    assert_eq!(st.key, Some(s.active), "{label}: the engine plays another track ({st:?})");
+                    assert!(st.position < 1.5, "{label}: not from the start ({st:?})");
+                    heard.push(now);
+                }
+            }
+        }
+    }
+
+    /// The same with the real-time, muted player and its threads: the skip button mid-song and near the end.
+    #[test]
+    fn next_button_in_an_album_moves_on_in_real_time() {
+        for (mode, press_at) in [
+            ("repeat one", 1.5),
+            ("repeat one", 6.5),
+            ("seek-bar loop", 3.),
+            ("repeat all", 6.5),
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let paths: Vec<_> = (1..=3)
                 .map(|n| {
@@ -1127,26 +1350,42 @@ mod player_tests {
             match mode {
                 "repeat one" => s.state.queue.set_repeat(string_core::queue::Repeat::One),
                 "repeat all" => s.state.queue.set_repeat(string_core::queue::Repeat::All),
-                _ => s.set_field("loops", json!({&ids[0]:{"a":1,"b":3}})),
+                _ => s.set_field("loops", json!({&ids[0]:{"a":1,"b":7}})),
             }
-            let p = TestTransport(OfflinePlayer::new(8000, Config::default(), SilentHost).into());
-            s.load_current(&p, true, 0.);
-            p.0.borrow_mut().render_secs(1.5);
-            s.next(&p);
-            p.0.borrow_mut().render_secs(0.5);
-            assert_eq!(
-                s.state.queue.current(),
-                Some(ids[1].as_str()),
-                "{mode}: Next from the first song"
+            let shared = Arc::new(Mutex::new(s));
+            let host = QueueHost {
+                session: shared.clone(),
+                ctx: Context::default(),
+            };
+            let p = Player::new(
+                Config {
+                    muted: true,
+                    ..Default::default()
+                },
+                host,
             );
-            s.next(&p);
-            p.0.borrow_mut().render_secs(0.5);
-            assert_eq!(
-                s.state.queue.current(),
-                Some(ids[2].as_str()),
-                "{mode}: Next from the second song"
+            shared.lock().unwrap().load_current(&p, true, 0.);
+            let wait_for = |what: &dyn Fn(&Status) -> bool, secs: f64| {
+                let end = Instant::now() + Duration::from_secs_f64(secs);
+                while Instant::now() < end && !what(&p.status()) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                what(&p.status())
+            };
+            assert!(
+                wait_for(&|st| st.playing && st.position >= press_at, press_at + 4.),
+                "{mode}: never reached {press_at} s ({:?})",
+                p.status()
             );
-            assert!(p.status().playing, "{mode}: still playing");
+            shared.lock().unwrap().next(&p);
+            std::thread::sleep(Duration::from_millis(700));
+            let st = p.status();
+            let s = shared.lock().unwrap();
+            let label = format!("{mode}, Next at {press_at} s");
+            assert_eq!(s.state.queue.current(), Some(ids[1].as_str()), "{label}: the queue ({st:?})");
+            assert!(st.playing, "{label}: paused ({st:?})");
+            assert_eq!(st.key, Some(s.active), "{label}: the engine plays another track ({st:?})");
+            assert!(st.position < 1.5, "{label}: not from the start of the next song ({st:?})");
         }
     }
 

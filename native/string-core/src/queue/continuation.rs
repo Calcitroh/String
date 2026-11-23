@@ -252,7 +252,11 @@ impl Queue {
             p.action = NextAction::Start;
             p.id = Some(self.items[i].id.clone());
             p.index = Some(i);
-        } else if options.autoplay && !options.looping && self.repeat() == Repeat::Off {
+        } else if options.autoplay
+            && self.repeat() != Repeat::All
+            // Repeat One and a seek-bar loop repeat a song that ends by itself; pressing Next still goes on.
+            && (user_skip || (!options.looping && self.repeat() == Repeat::Off))
+        {
             if let Some(list) = self.pick_continuation(lib) {
                 p.action = NextAction::Start;
                 p.id = list.ids.first().cloned();
