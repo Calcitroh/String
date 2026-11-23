@@ -1,5 +1,7 @@
-//! The sidebar's playlists: the + button, each playlist with its cover, and songs dropped onto one.
+//! The sidebar's playlists: the + button, the helpers' buttons left of it, each playlist with its cover, and songs
+//! dropped onto one.
 use crate::{
+    integration::helpers::Started,
     model::{CoverSource, Ids, Models},
     route::Route,
     theme::*,
@@ -83,6 +85,97 @@ fn fade_right(p: &Painter, r: Rect, color: Color32) {
     mesh.add_triangle(0, 2, 3);
     p.add(mesh);
 }
+/// The helper programs' small round buttons, left of `+`: as many as fit before the heading, the rest in a menu under
+/// "more". A helper String started that still runs shows lit.
+fn helper_buttons(ui: &mut Ui, v: &mut View<'_>, r: Rect, cy: f32, hi: Tint) {
+    v.platform.helpers_focus(ui.input(|i| i.focused));
+    let h = &v.platform.helpers;
+    let helpers: Vec<(String, String, String, String, bool)> = h
+        .list()
+        .iter()
+        .map(|x| {
+            let open = h.is_open(&x.id);
+            (
+                x.id.clone(),
+                x.name.clone(),
+                x.title.clone(),
+                x.glyph.clone(),
+                open,
+            )
+        })
+        .collect();
+    v.platform.helpers.drawn.clear();
+    if helpers.is_empty() {
+        return;
+    }
+    const STEP: f32 = 28.;
+    let plus = r.right() - 48.;
+    let slots = (((plus - (r.left() + 100.)) / STEP).floor() as usize).max(1);
+    let (shown, more) = if helpers.len() > slots {
+        (slots - 1, true)
+    } else {
+        (helpers.len(), false)
+    };
+    let count = shown + usize::from(more);
+    let mut clicked = None;
+    for (i, (id, _, title, glyph, open)) in helpers.iter().take(shown).enumerate() {
+        let at = area(plus - STEP * (count - i) as f32, cy - 13., 26., 26.);
+        // a faint ring at rest, so it reads as a button of its own and not as the heading's
+        ui.painter()
+            .circle_stroke(at.center(), at.width() / 2. - 0.5, (1., HAIR2));
+        let res = ui
+            .push_id(("helper", id), |ui| {
+                ui::round_btn(ui, at, glyph, title, *open, false, hi)
+            })
+            .inner;
+        v.platform.helpers.drawn.push(id.clone());
+        if res.clicked() {
+            clicked = Some(id.clone());
+        }
+    }
+    if more {
+        let at = area(plus - STEP, cy - 13., 26., 26.);
+        ui.painter()
+            .circle_stroke(at.center(), at.width() / 2. - 0.5, (1., HAIR2));
+        let res = ui::round_btn(ui, at, "more", "More helpers", false, false, hi);
+        egui::Popup::menu(&res).show(|ui| {
+            for (id, name, title, _, open) in &helpers[shown..] {
+                let label = if *open {
+                    format!("{name} (open)")
+                } else {
+                    name.clone()
+                };
+                if ui.button(label).on_hover_text(title).clicked() {
+                    clicked = Some(id.clone());
+                }
+            }
+        });
+        let rest = helpers[shown..].iter().map(|x| x.0.clone());
+        v.platform.helpers.drawn.extend(rest);
+    }
+    if let Some(id) = clicked {
+        start_helper(v, &id);
+    }
+}
+fn start_helper(v: &mut View<'_>, id: &str) {
+    let name = v
+        .platform
+        .helpers
+        .list()
+        .iter()
+        .find(|h| h.id == id)
+        .map_or_else(|| id.to_owned(), |h| h.name.clone());
+    match v.platform.helpers.start(id) {
+        Ok(Started::Started) => v.views.toast.set(format!("Starting {name}…")),
+        Ok(Started::AlreadyOpen(true)) => {}
+        Ok(Started::AlreadyOpen(false)) => v.views.toast.set(format!("{name} is already open.")),
+        Ok(Started::SelfTest) => v.views.toast.set("Helpers don’t start in a self-test."),
+        Err(e) => {
+            v.platform.log.write("add-ons", format!("{id}: {e}"));
+            v.views.toast.set(format!("{name} couldn’t start: {e}"));
+        }
+    }
+}
 /// `r` runs from the "Playlists" heading down to the sidebar's foot.
 pub fn show(ui: &mut Ui, v: &mut View<'_>, r: Rect) {
     let hi = v.tint;
@@ -98,6 +191,7 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>, r: Rect) {
         0.2,
         FAINT,
     );
+    helper_buttons(ui, v, r, cy, hi);
     if ui::icon_btn(
         ui,
         area(r.right() - 48., cy - 13., 26., 26.),

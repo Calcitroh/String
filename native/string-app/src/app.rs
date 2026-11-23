@@ -190,8 +190,11 @@ impl eframe::App for App {
         }
         s.tick(st, false);
         // Songs moved to the Recycle Bin are merged into the copies kept here, which runs while String is minimised
-        // too; a close that waited for them goes on once they are.
-        if crate::screens::dupes::recycling() {
+        // too; a close that waited for them goes on once they are. Paths from `--add` are added here too, so a
+        // helper's songs come in while String is minimised.
+        let added = self.platform.take_added();
+        let recycling = crate::screens::dupes::recycling();
+        if recycling || !added.is_empty() {
             let tint = Tint::parse(s.setting("tint").as_str());
             let mono = s.setting("artMono").as_bool().unwrap_or(true);
             let mut v = View {
@@ -207,7 +210,12 @@ impl eframe::App for App {
                 mono,
                 force_mute: self.smoke.is_some(),
             };
-            crate::screens::dupes::settle(&mut v);
+            if !added.is_empty() {
+                crate::integration::helpers::add(&mut v, added);
+            }
+            if recycling {
+                crate::screens::dupes::settle(&mut v);
+            }
         }
         if self.close_after_recycle {
             if crate::screens::dupes::recycling() {
