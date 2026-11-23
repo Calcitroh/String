@@ -115,6 +115,9 @@ pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Queue, D::Error> {
     }
     let count = |i: usize| counts[i.min(counts.len() - 1)];
     pos.at = count(at.saturating_add(1).max(0) as usize) as isize - 1;
+    if at >= 0 && count(at as usize) == count((at as usize) + 1) {
+        pos.pos = 0.;
+    }
     pos.list_start = count(list_start);
     let mut previous = 0;
     for value in past {

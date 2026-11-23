@@ -227,7 +227,9 @@ impl Session {
     fn track(&self, id: &str, key: u64) -> Option<Track> {
         // Only the decoder knows the playable length, including joined files.
         let range = self.saved_loop(id, None);
-        Some(Track::new(key, &self.models.by_id.get(id)?.path).with_loop(range))
+        // The saved path back to the file's real name (a name holding a lone UTF-16 unit is stored encoded).
+        let path = string_core::library::native_path(&self.models.by_id.get(id)?.path);
+        Some(Track::new(key, path).with_loop(range))
     }
     pub fn load_current(&mut self, p: &impl Transport, start: bool, pos: f64) {
         self.pending = None;

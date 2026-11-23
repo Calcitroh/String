@@ -8,12 +8,30 @@ use crate::{
     data::{array, object, take},
 };
 use chrono::{NaiveDate, NaiveDateTime, Timelike};
-use serde::{Deserialize, Deserializer, Serialize, de::Error};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error, ser::SerializeSeq};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Track(pub String, pub String, pub String);
+
+#[derive(Debug, Clone)]
+struct SavedTrack {
+    names: Track,
+    extra: Vec<Value>,
+}
+impl Serialize for SavedTrack {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut seq = serializer.serialize_seq(Some(3 + self.extra.len()))?;
+        for name in [&self.names.0, &self.names.1, &self.names.2] {
+            seq.serialize_element(name)?;
+        }
+        for cell in &self.extra {
+            seq.serialize_element(cell)?;
+        }
+        seq.end()
+    }
+}
 
 #[derive(Default, Debug, Clone, Serialize, Deserialize)]
 pub struct Day {
@@ -49,7 +67,7 @@ struct Days {
 #[derive(Debug, Clone, Serialize)]
 struct Document {
     v: u32,
-    tracks: Vec<Track>,
+    tracks: Vec<SavedTrack>,
     artists: Vec<String>,
     days: Days,
     #[serde(
@@ -57,7 +75,7 @@ struct Document {
         default,
         skip_serializing_if = "Option::is_none"
     )]
-    phone_import: Option<PhoneImport>,
+    phone_import: Option<Value>,
     #[serde(flatten)]
     extra: Fields,
 }
@@ -66,6 +84,8 @@ struct Document {
 #[serde(transparent)]
 pub struct Listening {
     doc: Document,
+    #[serde(skip)]
+    phone: Option<PhoneImport>,
     #[serde(skip)]
     tracks: HashMap<String, usize>,
     #[serde(skip)]
@@ -84,6 +104,7 @@ impl Default for Listening {
             },
             tracks: HashMap::new(),
             artists: HashMap::new(),
+            phone: None,
         }
     }
 }
@@ -101,12 +122,12 @@ impl<'de> Deserialize<'de> for Listening {
         let saved_tracks: Vec<_> = array(take(&mut fields, "tracks"))
             .into_iter()
             .map(|row| {
-                let mut cells = array(row).into_iter().map(string);
-                Track(
-                    cells.next().unwrap_or_default(),
-                    cells.next().unwrap_or_default(),
-                    cells.next().unwrap_or_default(),
-                )
+                let mut cells = array(row).into_iter();
+                let mut name = || cells.next().map(string).unwrap_or_default();
+                SavedTrack {
+                    names: Track(name(), name(), name()),
+                    extra: cells.collect(),
+                }
             })
             .collect();
         let mut days = Days::default();
@@ -131,18 +152,11 @@ impl<'de> Deserialize<'de> for Listening {
             day.extra = row;
             days.dated.insert(date, day);
         }
-        let phone_import = match take(&mut fields, "phoneImport") {
-            Value::Object(mut row) => Some(PhoneImport {
-                legacy_after: take(&mut row, "legacyAfter").as_i64().unwrap_or_default(),
-                plays: take(&mut row, "plays").as_u64().unwrap_or_default(),
-                after: object(take(&mut row, "after"))
-                    .into_iter()
-                    .map(|(user, v)| (user, v.as_i64().unwrap_or_default()))
-                    .collect(),
-                extra: row,
-            }),
-            _ => None,
-        };
+        let phone_import = fields.remove("phoneImport");
+        let phone = phone_import
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .map(import_history);
         let doc = Document {
             v: 1,
             tracks: saved_tracks,
@@ -155,7 +169,7 @@ impl<'de> Deserialize<'de> for Listening {
             .tracks
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.0.clone(), i))
+            .map(|(i, t)| (t.names.0.clone(), i))
             .collect();
         let artists = doc
             .artists
@@ -165,9 +179,39 @@ impl<'de> Deserialize<'de> for Listening {
             .collect();
         Ok(Self {
             doc,
+            phone,
             tracks,
             artists,
         })
+    }
+}
+
+// The importer selects SQLite row IDs strictly greater than the cursor. An unresolved
+// cursor therefore has no eligible rows. Keep that bound in memory and its raw value on disk.
+fn cursor(value: &Value) -> i64 {
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse().ok())
+        .filter(|n| *n >= 0)
+        .unwrap_or(i64::MAX)
+}
+fn import_history(value: &Value) -> PhoneImport {
+    let mut row = object(value.clone());
+    let legacy = row.remove("legacyAfter");
+    let after = row.remove("after");
+    let legacy_after = if !value.is_object() || after.as_ref().is_some_and(|v| !v.is_object()) {
+        i64::MAX
+    } else {
+        legacy.as_ref().map(cursor).unwrap_or(0)
+    };
+    PhoneImport {
+        legacy_after,
+        plays: take(&mut row, "plays").as_u64().unwrap_or_default(),
+        after: object(after.unwrap_or(Value::Null))
+            .into_iter()
+            .map(|(user, value)| (user, cursor(&value)))
+            .collect(),
+        extra: row,
     }
 }
 
@@ -200,11 +244,47 @@ pub(super) fn round1(s: f64) -> f64 {
 }
 
 impl Listening {
+    pub(crate) fn recover_legacy_cursor(&mut self, status: &Value) {
+        // Older profiles kept the only cursor in state.json. A malformed one needs the
+        // same protection as a per-account cursor before the importer first migrates it.
+        if self.phone.is_none()
+            && let Some(after) = status.get("after")
+            && !after.as_i64().is_some_and(|n| n >= 0)
+        {
+            let raw = serde_json::json!({"legacyAfter":after,"after":{},"plays":status["plays"].as_u64().unwrap_or(0)});
+            self.phone = Some(import_history(&raw));
+            self.doc.phone_import = Some(raw);
+        }
+    }
     pub fn phone_import(&self) -> Option<&PhoneImport> {
-        self.doc.phone_import.as_ref()
+        self.phone.as_ref()
     }
     pub fn set_phone_import(&mut self, history: PhoneImport) {
-        self.doc.phone_import = Some(history);
+        let mut saved = serde_json::to_value(&history).expect("phone history is JSON");
+        if let (Some(original), Some(previous)) = (&self.doc.phone_import, &self.phone) {
+            if original.is_object() {
+                if history.legacy_after == previous.legacy_after
+                    && let Some(raw) = original.get("legacyAfter")
+                {
+                    saved["legacyAfter"] = raw.clone();
+                }
+                if let Some(after) = original.get("after") {
+                    if history.after == previous.after {
+                        saved["after"] = after.clone();
+                    } else if let Some(raw) = after.as_object() {
+                        for (user, value) in raw {
+                            if history.after.get(user) == previous.after.get(user) {
+                                saved["after"][user] = value.clone();
+                            }
+                        }
+                    }
+                }
+            } else {
+                saved = original.clone();
+            }
+        }
+        self.doc.phone_import = Some(saved);
+        self.phone = Some(history);
     }
     pub fn days(&self) -> &BTreeMap<NaiveDate, Day> {
         &self.doc.days.dated
@@ -227,10 +307,13 @@ impl Listening {
             return false;
         }
         let ti = *self.tracks.entry(t.0.clone()).or_insert_with(|| {
-            self.doc.tracks.push(t.clone());
+            self.doc.tracks.push(SavedTrack {
+                names: t.clone(),
+                extra: vec![],
+            });
             self.doc.tracks.len() - 1
         });
-        let row = &mut self.doc.tracks[ti];
+        let row = &mut self.doc.tracks[ti].names;
         if !t.1.is_empty() && t.1 != row.1 {
             row.1.clone_from(&t.1);
         }
@@ -265,7 +348,7 @@ impl Listening {
                 }
             }
         } else {
-            self.doc.tracks[fi].0 = to.into();
+            self.doc.tracks[fi].names.0 = to.into();
             self.tracks.remove(from);
             self.tracks.insert(to.into(), fi);
         }
@@ -308,8 +391,8 @@ impl Listening {
         Range {
             total: round1(total),
             phone: round1(phone),
-            artists: artists.sorted(&self.doc.artists),
-            tracks: tracks.sorted(&self.doc.tracks),
+            artists: artists.sorted(|i| self.doc.artists[i].clone()),
+            tracks: tracks.sorted(|i| self.doc.tracks[i].names.clone()),
         }
     }
 }
@@ -328,11 +411,11 @@ impl Ranking {
             self.rows[k].1 += s;
         }
     }
-    fn sorted<T: Clone>(mut self, names: &[T]) -> Vec<(T, f64)> {
+    fn sorted<T>(mut self, name: impl Fn(usize) -> T) -> Vec<(T, f64)> {
         self.rows.sort_by(|x, y| y.1.total_cmp(&x.1));
         self.rows
             .into_iter()
-            .map(|(i, s)| (names[i].clone(), round1(s)))
+            .map(|(i, s)| (name(i), round1(s)))
             .collect()
     }
 }
