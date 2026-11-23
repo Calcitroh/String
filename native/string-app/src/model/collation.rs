@@ -5,22 +5,22 @@ use windows::{Win32::Globalization::*, core::PCSTR};
 struct Collator(NonNull<UCollator>);
 
 impl Collator {
-    fn new() -> Self {
+    /// None when Windows' collator can't be opened or set up; the lists then sort plainly instead of String closing.
+    fn new() -> Option<Self> {
         let mut status = U_ZERO_ERROR;
         // A null locale selects ICU's default for the current user.
         let raw = unsafe { ucol_open(PCSTR::null(), &mut status) };
-        let collator = Self(NonNull::new(raw).expect("open the system Unicode collator"));
+        let collator = Self(NonNull::new(raw)?);
+        if status.0 > 0 {
+            return None;
+        }
         unsafe {
             ucol_setStrength(raw, UCOL_PRIMARY);
             ucol_setAttribute(raw, UCOL_CASE_LEVEL, UCOL_OFF, &mut status);
             ucol_setAttribute(raw, UCOL_NUMERIC_COLLATION, UCOL_ON, &mut status);
             ucol_setAttribute(raw, UCOL_NORMALIZATION_MODE, UCOL_ON, &mut status);
         }
-        assert!(
-            status.0 <= 0,
-            "configure the system Unicode collator: {status:?}"
-        );
-        collator
+        (status.0 <= 0).then_some(collator)
     }
 
     fn key(&self, text: &str) -> Box<[u8]> {
@@ -57,7 +57,11 @@ pub(super) fn keys<'a>(values: impl Iterator<Item = &'a str>) -> HashMap<String,
     let mut keys = HashMap::new();
     for value in values {
         if !keys.contains_key(value) {
-            keys.insert(value.to_owned(), collator.key(value));
+            let key = match &collator {
+                Some(c) => c.key(value),
+                None => value.to_lowercase().into_bytes().into_boxed_slice(),
+            };
+            keys.insert(value.to_owned(), key);
         }
     }
     keys
