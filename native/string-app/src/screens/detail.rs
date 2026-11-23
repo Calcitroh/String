@@ -1,7 +1,10 @@
 use super::{
     cards::{self, Art},
     library::{self, clip_label},
+    motion::Motion,
 };
+#[path = "../ui/hero_backdrop.rs"]
+mod hero_backdrop;
 use crate::{
     model::Ids,
     route::Route,
@@ -9,7 +12,7 @@ use crate::{
     ui::{self, area, covers::Size},
     view::View,
 };
-use egui::{Color32, Id, Mesh, Rect, Ui, Vec2, pos2, vec2};
+use egui::{Color32, Id, Rect, Ui, Vec2, pos2, vec2};
 
 pub fn filter(ui: &mut Ui, v: &mut View<'_>, field: Rect, hint: &str) {
     let clear = !v.views.filter.is_empty();
@@ -61,53 +64,67 @@ pub struct Hero<'a> {
     pub art: &'a Art,
     pub round: bool,
 }
+#[derive(Clone, Copy)]
+struct Backdrop {
+    body: Rect,
+    layer: egui::LayerId,
+    shape: egui::layers::ShapeIdx,
+    shadow: egui::layers::ShapeIdx,
+    pass: u64,
+}
 pub(crate) fn backdrop(ui: &Ui, v: &mut View<'_>, body: Rect) {
-    let route = &v.views.history.current;
-    if !matches!(route, Route::Album(_) | Route::Artist(_)) {
-        return;
+    if matches!(v.views.history.current, Route::Album(_) | Route::Artist(_)) {
+        // Reserve the paint order below the top bar. The scroll area supplies this frame's
+        // actual header position (including a restored scroll offset) when it lays out the hero.
+        let slot = Backdrop {
+            body: body.intersect(ui.clip_rect()),
+            layer: ui.layer_id(),
+            shape: ui.painter().add(egui::Shape::Noop),
+            shadow: ui.painter().add(egui::Shape::Noop),
+            pass: ui.ctx().cumulative_pass_nr(),
+        };
+        ui.data_mut(|d| d.insert_temp(Id::unique("hero underlay"), slot));
     }
-    let index = library::Index::get(ui, v);
-    let Some(card) = index.page(route) else {
+}
+fn paint_backdrop(ui: &Ui, v: &View<'_>, hero: Rect, sleeve: Rect, h: &Hero<'_>, motion: Motion) {
+    let Some(slot) = ui.data(|d| d.get_temp::<Backdrop>(Id::unique("hero underlay"))) else {
         return;
     };
-    let Art::Cover(c) = &card.art else {
+    if slot.pass != ui.ctx().cumulative_pass_nr() {
+        return;
+    }
+    let r = Rect::from_min_max(
+        pos2(slot.body.left(), hero.top() - 72.),
+        pos2(slot.body.right(), hero.bottom()),
+    );
+    if !slot.body.intersects(r) {
+        return;
+    }
+    let mut underlay = ui
+        .ctx()
+        .layer_painter(slot.layer)
+        .with_clip_rect(slot.body.intersect(r));
+    underlay.set_opacity(ui.opacity());
+    let radius = if h.round { sleeve.width() / 2. } else { 0. };
+    underlay.set(
+        slot.shadow,
+        ui::glow_shape(
+            sleeve.translate(vec2(0., 30.)),
+            radius,
+            70.,
+            Color32::from_black_alpha(179),
+        ),
+    );
+    let Art::Cover(c) = h.art else {
         return;
     };
     if c.file.is_empty() && c.embedded.is_empty() && c.fallback.is_empty() {
         return;
     }
-    let Some(img) = v
-        .covers
-        .get(c, Size::Large, v.mono.then_some(v.tint))
-        .and_then(|a| a.ambient)
-    else {
-        return;
-    };
-    let scroll = ui
-        .data(|d| d.get_temp::<f32>(Id::unique(("hero offset", route.path()))))
-        .unwrap_or_default();
-    let height = if body.width() - 58. < 680. {
-        270.
-    } else {
-        336.
-    };
-    let r = area(body.left(), body.top() - scroll, body.width(), height);
-    let p = ui.painter().with_clip_rect(body.intersect(ui.clip_rect()));
-    ui::image(&p, r, &img);
-    let uv = Rect::from_min_max(pos2(0., 0.), pos2(1., 1.));
-    p.image(img.id(), r, uv, Color32::from_rgb_additive(240, 240, 240));
-    let mut mesh = Mesh::default();
-    for (pt, color) in [
-        (r.left_top(), Color32::TRANSPARENT),
-        (r.right_top(), Color32::TRANSPARENT),
-        (r.left_bottom(), BG),
-        (r.right_bottom(), BG),
-    ] {
-        mesh.colored_vertex(pt, color);
+    if let Some(img) = hero_backdrop::texture(ui.ctx(), c, r.size(), v.mono) {
+        let glow = motion.reveal(ui.ctx(), img.id(), 0.6);
+        underlay.set(slot.shape, hero_backdrop::mesh(r, &img, glow));
     }
-    mesh.add_triangle(0, 1, 2);
-    mesh.add_triangle(1, 3, 2);
-    p.add(mesh);
 }
 pub fn hero(ui: &mut Ui, v: &mut View<'_>, h: Hero<'_>) {
     let side = if ui.available_width() < 680. {
@@ -117,15 +134,21 @@ pub fn hero(ui: &mut Ui, v: &mut View<'_>, h: Hero<'_>) {
     };
     let (_, r) = ui.allocate_space(vec2(ui.available_width(), side + 46.));
     let p = ui.painter().clone();
-    let offset = (ui.clip_rect().top() - r.top()).max(0.);
-    ui.data_mut(|d| {
-        d.insert_temp(
-            Id::unique(("hero offset", v.views.history.current.path())),
-            offset,
-        )
-    });
+    let motion = Motion::for_page(ui.ctx(), &v.views.history.current);
     let cover = Rect::from_min_size(r.min + vec2(0., 20.), Vec2::splat(side));
-    cards::art(&p, cover, h.art, h.round, Size::Medium, v);
+    paint_backdrop(ui, v, r, cover, &h, motion);
+    cards::art(
+        &p,
+        cover,
+        h.art,
+        cards::Sleeve {
+            round: h.round,
+            size: Size::Medium,
+            zoom: 1.,
+        },
+        motion,
+        v,
+    );
     let x = cover.right() + 28.;
     let width = (r.right() - x).max(1.);
     let size = if side < 200. { 42. } else { 64. };

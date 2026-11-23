@@ -9,6 +9,8 @@ pub mod home;
 pub(crate) mod library;
 pub(crate) mod library_input;
 pub(crate) mod library_smoke;
+#[path = "../ui/library_motion.rs"]
+mod motion;
 pub mod liked;
 pub mod lyrics;
 pub mod now_playing;
@@ -44,6 +46,10 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
         Route::Settings => settings::show,
         Route::Dupes => dupes::show,
     };
+    // A fade keeps the destination controls in place for the very next click.
+    // Cards have their own rise, including when the album order changes.
+    let motion = motion::Motion::for_page(ui.ctx(), &v.views.history.current);
+    ui.multiply_opacity(motion.page_progress(ui.ctx()));
     draw(ui, v);
 }
 pub fn heading(ui: &mut Ui, title: &str, detail: &str) {

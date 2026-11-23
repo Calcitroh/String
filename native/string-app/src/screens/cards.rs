@@ -1,4 +1,5 @@
 use super::library::{clip_label, is_now, page_context, play, section};
+use super::motion::Motion;
 use crate::{
     model::{CoverSource, Ids, Song},
     route::Route,
@@ -6,7 +7,7 @@ use crate::{
     ui::{self, area, covers::Size},
     view::View,
 };
-use egui::{Color32, Mesh, Painter, Rect, Shape, StrokeKind, Ui, Vec2, pos2, vec2};
+use egui::{Color32, Id, Mesh, Painter, Rect, Shape, StrokeKind, Ui, Vec2, pos2, vec2};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -50,20 +51,20 @@ impl Card {
     }
 }
 
-fn circle_image(p: &Painter, r: Rect, texture: egui::TextureId) {
+fn circle_image(p: &Painter, r: Rect, texture: egui::TextureId, zoom: f32, color: Color32) {
     let mut mesh = Mesh::with_texture(texture);
     let uv_center = pos2(0.5, 0.5);
     mesh.vertices.push(egui::epaint::Vertex {
         pos: r.center(),
         uv: uv_center,
-        color: Color32::WHITE,
+        color,
     });
     for i in 0..=96 {
         let dir = Vec2::angled(i as f32 * std::f32::consts::TAU / 96.);
         mesh.vertices.push(egui::epaint::Vertex {
             pos: r.center() + dir * r.width() * 0.5,
-            uv: uv_center + dir * 0.5,
-            color: Color32::WHITE,
+            uv: uv_center + dir * (0.5 / zoom),
+            color,
         });
         if i > 0 {
             mesh.add_triangle(0, i, i + 1);
@@ -86,30 +87,54 @@ pub fn heart(p: &Painter, r: Rect, t: Tint) {
     }
     p.add(mesh);
 }
-pub fn art(p: &Painter, r: Rect, art: &Art, round: bool, size: Size, v: &mut View<'_>) {
-    match art {
-        Art::Cover(c) => {
-            let img = v.covers.get(c, size, v.mono.then_some(v.tint));
-            if round {
-                p.circle_filled(r.center(), r.width() / 2., PANEL);
-                if let Some(img) = img {
-                    circle_image(p, r, img.cover.id());
-                    p.circle_filled(
-                        r.center(),
-                        r.width() / 2.,
-                        Color32::from_black_alpha(if v.mono { 55 } else { 25 }),
-                    );
-                }
-                p.circle_stroke(r.center(), r.width() / 2., (1., HAIR));
+pub struct Sleeve {
+    pub round: bool,
+    pub size: Size,
+    pub zoom: f32,
+}
+pub fn art(
+    p: &Painter,
+    r: Rect,
+    art: &Art,
+    sleeve_style: Sleeve,
+    motion: Motion,
+    v: &mut View<'_>,
+) {
+    let Sleeve { round, size, zoom } = sleeve_style;
+    let mut sleeve = |r: Rect, c: &Arc<CoverSource>, size, round| {
+        if round {
+            p.circle_filled(r.center(), r.width() / 2., PANEL);
+        } else {
+            p.rect_filled(r, 1, PANEL2);
+        }
+        if let Some(img) = v.covers.get(c, size, v.mono.then_some(v.tint)) {
+            let opacity = if c.file.is_empty() && c.embedded.is_empty() && c.fallback.is_empty() {
+                1.
             } else {
-                ui::sleeve(p, r, img);
-                p.rect_filled(
-                    r,
-                    0,
-                    Color32::from_black_alpha(if v.mono { 55 } else { 25 }),
-                );
+                motion.reveal(p.ctx(), img.cover.id(), 0.45)
+            };
+            let shade = if v.mono { 200 } else { 230 };
+            let color = Color32::from_rgba_unmultiplied(
+                shade,
+                shade,
+                shade,
+                (255. * opacity).round() as u8,
+            );
+            if round {
+                circle_image(p, r, img.cover.id(), zoom, color);
+            } else {
+                let uv = Rect::from_center_size(pos2(0.5, 0.5), Vec2::splat(1. / zoom));
+                p.image(img.cover.id(), r, uv, color);
             }
         }
+        if round {
+            p.circle_stroke(r.center(), r.width() / 2., (1., HAIR));
+        } else {
+            p.rect_stroke(r, 1, (1., HAIR), StrokeKind::Inside);
+        }
+    };
+    match art {
+        Art::Cover(c) => sleeve(r, c, size, round),
         Art::Mosaic(cs) => {
             for (i, c) in cs.iter().enumerate() {
                 let side = r.width() / 2.;
@@ -119,11 +144,7 @@ pub fn art(p: &Painter, r: Rect, art: &Art, round: bool, size: Size, v: &mut Vie
                     side,
                     side,
                 );
-                ui::sleeve(
-                    p,
-                    tile,
-                    v.covers.get(c, Size::Small, v.mono.then_some(v.tint)),
-                );
+                sleeve(tile, c, Size::Small, false);
             }
         }
         Art::Heart => {
@@ -169,12 +190,46 @@ pub fn art(p: &Painter, r: Rect, art: &Art, round: bool, size: Size, v: &mut Vie
 }
 type RowList<'a> = Option<(&'a Ids, &'a Value)>;
 
-fn draw(ui: &mut Ui, v: &mut View<'_>, r: Rect, card: &Card, tile: bool, list: RowList<'_>) {
-    if !ui.is_rect_visible(r) {
+struct Entrance {
+    motion: Motion,
+    age: f64,
+    group: Id,
+    tile: bool,
+}
+impl Entrance {
+    fn new(ui: &Ui, v: &View<'_>, group: Id, tile: bool) -> Self {
+        let motion = Motion::for_page(ui.ctx(), &v.views.history.current);
+        let revision = group.with((
+            v.s.generation,
+            &v.views.query,
+            v.s.field("albumSort").as_str(),
+        ));
+        Self {
+            motion,
+            age: motion.age(ui.ctx(), revision),
+            group,
+            tile,
+        }
+    }
+}
+
+fn draw(
+    ui: &mut Ui,
+    v: &mut View<'_>,
+    r: Rect,
+    card: &Card,
+    entry: &Entrance,
+    i: usize,
+    list: RowList<'_>,
+) {
+    if !ui.is_rect_visible(r.expand2(vec2(0., 14.))) {
         return;
     }
-    let mut u = ui::child(ui, r.with_min_y(r.top() - 3.), ui.next_auto_id());
-    ui.skip_ahead_auto_ids(1);
+    let tile = entry.tile;
+    let appear = entry.motion.card(ui.ctx(), entry.age, i, tile);
+    let r = r.translate(vec2(0., 14. * (1. - appear)));
+    let mut u = ui::child(ui, r.with_min_y(r.top() - 3.), entry.group.with(i));
+    u.multiply_opacity(appear);
     let ctx = match &card.target {
         Target::Page(route) => Some(page_context(route, &card.title)),
         _ => None,
@@ -187,20 +242,26 @@ fn draw(ui: &mut Ui, v: &mut View<'_>, r: Rect, card: &Card, tile: bool, list: R
         ui::hit(&mut u, r, "open", &card.title).on_hover_cursor(egui::CursorIcon::PointingHand);
     let hover = u.rect_contains_pointer(r) || response.has_focus();
     // a card lifts 3 px under the pointer, as in the web version
-    let lift = if tile {
-        0.
+    let [highlight, rise, enlarge] = entry.motion.hover(u.ctx(), response.id, hover, tile);
+    let (lift, zoom) = if tile {
+        (0., 1.)
     } else {
-        3. * u.ctx().animate_bool_with_time(response.id, hover, 0.3)
+        (3. * rise, 1. + 0.045 * enlarge)
     };
     let r = r.translate(vec2(0., -lift));
     let p = u.painter().clone();
     // the web version's colours: cards white at 1.8 % (5 % under the pointer), home tiles at 3 % with a hairline,
     // lit by the tint under the pointer
-    let (fill, line) = match (tile, hover) {
-        (true, true) => (v.tint.ink(0.07), v.tint.ink(0.25)),
-        (true, false) => (white(0.03), HAIR),
-        (false, true) => (white(0.05), HAIR2),
-        (false, false) => (white(0.018), Color32::TRANSPARENT),
+    let (fill, line) = if tile {
+        (
+            white(0.03).lerp_to_gamma(v.tint.ink(0.07), highlight),
+            HAIR.lerp_to_gamma(v.tint.ink(0.25), highlight),
+        )
+    } else {
+        (
+            white(egui::lerp(0.018..=0.05, highlight)),
+            Color32::TRANSPARENT.lerp_to_gamma(HAIR2, highlight),
+        )
     };
     p.rect(
         r,
@@ -222,8 +283,12 @@ fn draw(ui: &mut Ui, v: &mut View<'_>, r: Rect, card: &Card, tile: bool, list: R
         &p,
         cover,
         &card.art,
-        !tile && matches!(card.target, Target::Page(Route::Artist(_))),
-        if tile { Size::Small } else { Size::Medium },
+        Sleeve {
+            round: !tile && matches!(card.target, Target::Page(Route::Artist(_))),
+            size: if tile { Size::Small } else { Size::Medium },
+            zoom,
+        },
+        entry.motion,
         v,
     );
     if !tile
@@ -340,6 +405,7 @@ pub fn grid<'a>(
     let w = (width - gap * (cols - 1) as f32) / cols as f32;
     let h = if tile { 62. } else { w + 48. };
     let mut row = Rect::NOTHING;
+    let entry = Entrance::new(ui, v, ui.next_auto_id().with("card grid"), tile);
     for (i, card) in cards.into_iter().enumerate() {
         if i % cols == 0 {
             if i > 0 {
@@ -348,7 +414,7 @@ pub fn grid<'a>(
             row = ui.allocate_space(vec2(width, h)).1;
         }
         let rect = area(row.left() + (i % cols) as f32 * (w + gap), row.top(), w, h);
-        draw(ui, v, rect, card, tile, None);
+        draw(ui, v, rect, card, &entry, i, None);
     }
 }
 pub fn row<'a>(
@@ -372,9 +438,10 @@ pub fn row<'a>(
             ui.add_space(4.);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 18.;
-                for card in cards {
+                let entry = Entrance::new(ui, v, ui.scope_id().with(title), false);
+                for (i, card) in cards.enumerate() {
                     let (_, r) = ui.allocate_space(vec2(168., 216.));
-                    draw(ui, v, r, card, false, list);
+                    draw(ui, v, r, card, &entry, i, list);
                 }
             });
         });

@@ -51,13 +51,11 @@ pub fn heading(ui: &mut Ui, title: &str, detail: &str) {
         // The title sits at the very top of the scrolling page, whose edge would cut the haze into a flat-topped
         // band that reads as a highlight; like the web version's, it spreads past it (not into the sidebar, which
         // is 29 px to the left; the player bar and queue are drawn over it).
-        // (A painter only ever narrows its clip, so this is a fresh one for the same layer.)
         let clip = ui.clip_rect();
         let room = egui::Rect::from_min_max(clip.min - vec2(29., 44.), clip.max + vec2(44., 44.));
-        ui.ctx()
-            .layer_painter(ui.layer_id())
-            .with_clip_rect(room)
-            .add(ui::text_glow(ink, 22., 0.35, ui::tint(ui.ctx())));
+        let mut halo = ui.painter().clone();
+        halo.set_clip_rect(room);
+        halo.add(ui::text_glow(ink, 22., 0.35, ui::tint(ui.ctx())));
         ui.painter().galley(at, galley, TEXT);
         ui.label(
             mono(&detail.to_uppercase(), 11.)
