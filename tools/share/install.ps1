@@ -34,7 +34,7 @@ $old = "$To.old-$tag"
 $unzipAgain = 'String.zip did not unzip completely. Unzip it again (right-click it, Extract All) and run "Install String" from the new folder.'
 
 function Say([string]$text) { Write-Host "  $text" }
-function Fail([string]$text) { Close-Backups; Write-Host ''; Write-Host "  $text" -ForegroundColor Yellow; Write-Host ''; exit 1 }
+function Fail([string]$text) { if ($backupDirs) { Close-Backups }; Write-Host ''; Write-Host "  $text" -ForegroundColor Yellow; Write-Host ''; exit 1 }
 function Has([string]$path) { Test-Path -LiteralPath $path }
 function Under([string]$path, [string]$dir) { $path -and $path.StartsWith($dir + '\', [StringComparison]::OrdinalIgnoreCase) }
 function IsLink([string]$path) { (Has $path) -and ([IO.File]::GetAttributes($path) -band [IO.FileAttributes]::ReparsePoint) -ne 0 }
@@ -59,46 +59,6 @@ function Check-BackupPath([string]$path) {
         } catch [IO.FileNotFoundException] { } catch [IO.DirectoryNotFoundException] { }
         $path = [IO.Path]::GetDirectoryName($path)
     }
-}
-$backupDirs = [Collections.Generic.Dictionary[string,IDisposable]]::new([StringComparer]::Ordinal)
-$backupFiles = [Collections.Generic.List[IDisposable]]::new()
-$savedHashes = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
-function Close-Backups {
-    foreach ($file in $backupFiles) { $file.Dispose() }
-    $backupFiles.Clear()
-    foreach ($dir in $backupDirs.Values) { $dir.Dispose() }
-    $backupDirs.Clear()
-}
-# Pin from the root down. OPEN_REPARSE_POINT opens the directory itself;
-# denying write/delete sharing keeps it from being redirected after the check.
-function Pin-BackupDir([string]$dir) {
-    if ($backupDirs.ContainsKey($dir)) { return }
-    $parent = [IO.Path]::GetDirectoryName($dir)
-    if ($parent) {
-        Pin-BackupDir $parent
-        [void][IO.Directory]::CreateDirectory($dir)
-    }
-    $handle = [StringSetup.Backup]::CreateFileW($dir, 0x80, 1, [IntPtr]::Zero, 3, 0x02200000, [IntPtr]::Zero)
-    if ($handle.IsInvalid) { $handle.Dispose(); throw "Cannot secure the backup folder $dir." }
-    $backupDirs.Add($dir, $handle)
-    if ([IO.File]::GetAttributes($dir) -band [IO.FileAttributes]::ReparsePoint) { throw "$dir is a folder link." }
-}
-function Save-Backup([string]$source, [string]$dest) {
-    Pin-BackupDir ([IO.Path]::GetDirectoryName($dest))
-    $inputFile = [IO.File]::OpenRead($source)
-    try {
-        $copy = [IO.File]::Open($dest, 'CreateNew', 'ReadWrite', 'Read')
-        $backupFiles.Add($copy)
-        $inputFile.CopyTo($copy)
-        $copy.Flush($true)
-        $copy.Position = 0
-        $inputFile.Position = 0
-        $digest = [BitConverter]::ToString($sha.ComputeHash($copy)) -replace '-', ''
-        if ($digest -cne ([BitConverter]::ToString($sha.ComputeHash($inputFile)) -replace '-', '')) {
-            throw "Backup verification failed for $source."
-        }
-        return $digest
-    } finally { $inputFile.Dispose() }
 }
 # The entries of a folder's setup\files.txt: hash, size, relative path (cleaned up), full path; only paths inside the
 # folder. With -Strict (the unzipped copy), any odd line, an entry outside the folder, or a missing or wrong "#end"
@@ -220,6 +180,13 @@ try {
 }
 catch { Fail "$unzipAgain ($($_.Exception.Message))" }
 
+# Load the backup functions from the incoming, manifest-checked setup scripts.
+# Reject an incomplete or mixed package before closing the old player.
+$backupScript = Join-Path $from 'setup\uninstall.ps1'
+if (-not (Get-Command -Name $backupScript).Parameters.ContainsKey('BackupFunctionsOnly')) { Fail $unzipAgain }
+. $backupScript -BackupFunctionsOnly -To $To -Menu $Menu -Desktop $Desktop -AppsKey $AppsKey -Data $env:LOCALAPPDATA -DataChoice keep
+Initialize-Backup
+
 if (-not $needsWebView) {
     if ($files.Rel -notcontains 'setup\imports.txt') { Fail $unzipAgain }
     if (-not [Environment]::Is64BitProcess) {
@@ -270,6 +237,8 @@ foreach ($f in Get-ChildItem -LiteralPath $new -Recurse -File -Force) {
 }
 if ($stillMarked) { Say "Note: the downloaded-file mark stayed on $stillMarked file(s), so Windows may ask before String starts. That's harmless." }
 
+$savedHashes = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+
 # The person's own changes to the installed copy: every file that isn't String's, unchanged, is theirs. All of them
 # are copied out first; any failure stops here, with nothing changed.
 $keptMine = @(); $tookNew = @(); $edits = $null; $theirs = $null; $cur = @{}
@@ -285,7 +254,7 @@ if ((Has $To) -and (Has (Join-Path $To 'setup\files.txt'))) {
             if ($k -eq 'setup\files.txt' -or $k -eq 'setup\installed.txt' -or (Split-Path $k -Leaf) -in 'desktop.ini', 'thumbs.db') { continue }
             $was = $cur[$k]
             $path = Join-Path $To $rel
-            if ($was -and (New-Object IO.FileInfo $path).Length -eq $was.Size -and (Sha256 $path) -eq $was.Hash) { continue }   # String's own, unchanged
+            if ($was -and (New-Object IO.FileInfo $path).Length -eq $was.Size -and (Sha256 $path) -eq $was.Hash -and -not @(Named-Streams $path).Count) { continue }   # String's own, unchanged
             $mine += $rel
         }
     }
@@ -298,13 +267,6 @@ if ((Has $To) -and (Has (Join-Path $To 'setup\files.txt'))) {
         for ($n = 2; (Has $edits) -or (Has "$edits (the update's versions)"); $n++) { $edits = Join-Path "$To edits" "$stamp ($n)" }
         $theirs = "$edits (the update's versions)"
         try {
-            if (-not ('StringSetup.Backup' -as [type])) {
-                Add-Type -Namespace StringSetup -Name Backup -MemberDefinition @'
-[DllImport("kernel32.dll", CharSet=CharSet.Unicode, ExactSpelling=true)]
-public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(string path, uint access, uint share,
-    IntPtr security, uint disposition, uint flags, IntPtr template);
-'@
-            }
             foreach ($rel in $mine) {
                 $dst = Join-Path $edits $rel
                 $savedHashes.Add($rel, (Save-Backup (Join-Path $To $rel) $dst))
@@ -331,12 +293,12 @@ public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFileW(stri
 
 # swap the new copy in; the old one comes back if that fails
 if (Has $To) {
-    try { [IO.Directory]::Move($To, $old) }
+    try { [StringSetup.Backup]::RenameSibling($To, $old) }
     catch { try { Remove-Tree $new } catch { }; Fail 'Windows is still using String''s files (a String window, or one of its folders open somewhere). Close it and run "Install String" again. Nothing was changed.' }
 }
-try { [IO.Directory]::Move($new, $To) }
+try { [StringSetup.Backup]::RenameSibling($new, $To) }
 catch {
-    if (Has $old) { [IO.Directory]::Move($old, $To) }
+    if (Has $old) { [StringSetup.Backup]::RenameSibling($old, $To) }
     try { Remove-Tree $new } catch { }
     Fail 'Installing String failed, so the copy you had stays as it was. Try again in a moment.'
 }
@@ -351,8 +313,9 @@ if (Has $old) {
             $was = $cur[$k]
             $go = $k -eq 'setup\files.txt' -or $k -eq 'setup\installed.txt' -or (Split-Path $k -Leaf) -in 'desktop.ini', 'thumbs.db'
             if (-not $go -and $was -and $len -eq $was.Size) { $go = (Sha256 $p) -eq $was.Hash }
+            if ($go -and @(Named-Streams $p).Count) { $go = $false }
             # The verified backup and its parent directories are still held open.
-            if (-not $go -and $savedHashes.ContainsKey($rel)) { $go = (Sha256 $p) -ceq $savedHashes[$rel] }
+            if (-not $go -and $savedHashes.ContainsKey($rel)) { $go = Matches-Backup $p $savedHashes[$rel] }
             if ($go) { [IO.File]::SetAttributes($p, [IO.FileAttributes]::Normal); [IO.File]::Delete($p) }
         }
         catch { }

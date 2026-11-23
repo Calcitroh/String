@@ -100,22 +100,48 @@ impl Updates {
             .ready
             .try_lock()
             .map_err(|_| io::Error::other("An update is in progress"))?;
-        let plan = ready
-            .as_ref()
-            .filter(|p| p.version == version)
-            .ok_or_else(|| io::Error::other("Prepare the update first"))?;
-        if self.smoke || !updater()?.installed() {
-            return Err(io::Error::other("Only an installed String updates itself"));
-        }
-        plan.spawn()?;
-        *ready = None;
-        Ok(())
+        launch_ready(
+            &mut ready,
+            |p| p.version == version,
+            |plan| {
+                if self.smoke || !updater()?.installed() {
+                    return Err(io::Error::other("Only an installed String updates itself"));
+                }
+                plan.spawn().map(|_| ())
+            },
+        )
     }
+}
+
+fn launch_ready<T>(
+    ready: &mut Option<T>,
+    matches: impl FnOnce(&T) -> bool,
+    launch: impl FnOnce(&T) -> io::Result<()>,
+) -> io::Result<()> {
+    let plan = ready
+        .take_if(|plan| matches(plan))
+        .ok_or_else(|| io::Error::other("Prepare the update first"))?;
+    launch(&plan)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_launch_releases_only_the_matching_plan() {
+        let mut ready = Some(10);
+        assert!(launch_ready(&mut ready, |p| *p == 9, |_| panic!()).is_err());
+        assert_eq!(ready, Some(10));
+        let error = launch_ready(
+            &mut ready,
+            |p| *p == 10,
+            |_| Err(io::Error::other("launch failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "launch failed");
+        assert!(ready.is_none());
+    }
+
     #[test]
     fn smoke_cannot_prepare_or_start_an_installer() {
         let u = Updates::new(Path::new("."), true);

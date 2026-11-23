@@ -156,7 +156,7 @@ impl Shared {
     fn json(&self, url: &str) -> Option<Value> {
         let mut response = string_http::HTTP
             .get(url, Duration::from_secs(6), 10, |r| {
-                r.config().user_agent("String/1.0").build()
+                r.header("User-Agent", "String/1.0")
             })
             .ok()?;
         serde_json::from_str(&response.body_mut().read_to_string().ok()?).ok()
@@ -322,6 +322,43 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cover_requests_reuse_the_origin_connection() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/cover", listener.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            let mut reader = BufReader::new(listener.accept().unwrap().0);
+            drop(listener);
+            reader
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            for _ in 0..2 {
+                let mut headers = String::new();
+                while !headers.ends_with("\r\n\r\n") {
+                    if reader.read_line(&mut headers).unwrap() == 0 {
+                        return false;
+                    }
+                }
+                assert!(
+                    headers
+                        .to_ascii_lowercase()
+                        .contains("user-agent: string/1.0\r\n")
+                );
+                reader
+                    .get_mut()
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                    .unwrap();
+            }
+            true
+        });
+        let covers = Covers::load(Path::new(""), &url, &url);
+        assert!(covers.shared.json(&url).is_some());
+        let second = covers.shared.json(&url);
+        assert!(worker.join().unwrap() && second.is_some());
+    }
 
     #[test]
     fn keys_are_string_1x_keys() {
