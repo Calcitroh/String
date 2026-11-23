@@ -14,11 +14,12 @@ use crossbeam_channel::{Receiver, unbounded};
 use egui::{Align, Context, Frame, Label, Layout, Margin, RichText, Sense, Ui, vec2};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{LazyLock, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
+use string_core::library::Library;
 
 const SONGS: &str =
     "Songs|*.mp3;*.flac;*.m4a;*.m4b;*.aac;*.ogg;*.oga;*.opus;*.wav;*.weba;*.webm|All files|*.*";
@@ -128,25 +129,39 @@ pub(crate) fn add_roots_to(
         return None;
     }
     let mut roots = strings(s.field("roots"));
+    let existing = roots.len();
+    roots.extend(list.iter().map(|p| p.to_string_lossy().into_owned()));
+    // Consider parents first. A parent that is itself covered cannot cover a deeper
+    // request beyond the scanner's depth limit. Keep the original order in the profile.
+    let mut by_path: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.trim_end_matches(['\\', '/']).to_lowercase(), i))
+        .collect();
+    by_path.sort_unstable();
+    let mut selected = HashMap::new();
+    let mut keep = vec![false; roots.len()];
     let mut added = 0;
-    for p in list {
-        let p = p.to_string_lossy().into_owned();
-        let key = p.to_lowercase();
-        if roots
-            .iter()
-            .any(|r| r.to_lowercase() == key || key.starts_with(&folder_prefix(r)))
+    for (key, i) in &by_path {
+        let new = *i >= existing;
+        // Only a newly selected parent replaces an existing selection.
+        if !Library::scan_ancestors(key)
+            .any(|p| selected.get(p).is_some_and(|&parent_new| new || parent_new))
         {
-            continue;
+            selected.insert(key.as_str(), new);
+            keep[*i] = true;
+            added += usize::from(new);
         }
-        let inside = folder_prefix(&p);
-        roots.retain(|r| !r.to_lowercase().starts_with(&inside));
-        roots.push(p);
-        added += 1;
     }
     if added == 0 {
         return Some("Already in your library".to_owned());
     }
-    s.set_field("roots", roots.into());
+    let retained: Vec<_> = roots
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(root, keep)| keep.then_some(root))
+        .collect();
+    s.set_field("roots", retained.into());
     scan.requested = true;
     Some(if added == 1 {
         "Folder added: reading its songs".to_owned()
@@ -165,11 +180,19 @@ pub(crate) fn add_songs_to(
     }
     let mut files = strings(s.field("files"));
     let before = files.len();
-    let mut seen: std::collections::HashSet<_> = files.iter().map(|f| f.to_lowercase()).collect();
+    let mut seen: HashSet<_> = files.iter().map(|f| f.to_lowercase()).collect();
+    let roots: HashSet<_> = strings(s.field("roots"))
+        .iter()
+        .map(|p| p.trim_end_matches(['\\', '/']).to_lowercase())
+        .collect();
     for p in list.iter().filter(|p| is_song_path(p)) {
         let p = p.to_string_lossy().into_owned();
         let id = p.to_lowercase();
-        if !s.models.by_id.contains_key(&id) && seen.insert(id) {
+        let indexed_under_root = s.models.by_id.contains_key(&id)
+            && id.rsplit_once('\\').is_some_and(|(folder, name)| {
+                !name.contains('/') && Library::scan_ancestors(folder).any(|p| roots.contains(p))
+            });
+        if !indexed_under_root && seen.insert(id) {
             files.push(p);
         }
     }

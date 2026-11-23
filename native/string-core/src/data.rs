@@ -17,6 +17,31 @@ use serde_json::{Value, json};
 #[cfg(test)]
 mod profile_tests;
 
+#[cfg(test)]
+#[test]
+fn final_inherited_daily_matching_live_must_survive_the_next_save() {
+    let temp = tempfile::tempdir().unwrap();
+    let backup = temp.path().join("backup");
+    let folder = DataFolder::new(temp.path(), &backup);
+    let live = folder.path::<State>();
+    let date = Local::now().date_naive();
+    let daily = backup.join(format!("state-{date}.json"));
+    fs::write(&live, br#"{"route":"morning"}"#).unwrap();
+    folder.keep_opening_copy_for(date).unwrap();
+    let inherited = br#"{ "route": "afternoon" }"#;
+    fs::write(&live, inherited).unwrap();
+    fs::write(&daily, inherited).unwrap();
+    let mut state = folder.read::<State>().unwrap();
+    state.value.fields.insert("route".into(), "evening".into());
+    assert!(state.save().unwrap().backup_error.is_none());
+    assert_eq!(fs::read(&live).unwrap(), fs::read(&daily).unwrap());
+    let kept = fs::read_dir(backup.join("opened").join(date.to_string())).unwrap();
+    assert!(
+        kept.into_iter()
+            .any(|e| fs::read(e.unwrap().path()).unwrap() == inherited)
+    );
+}
+
 pub(crate) fn object(value: Value) -> crate::Fields {
     match value {
         Value::Object(fields) => fields,
@@ -103,7 +128,10 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
 fn invalid(message: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
-fn decode<T: Model>(bytes: &[u8]) -> io::Result<T> {
+fn decode<T: Model>(
+    bytes: &[u8],
+    check: impl FnOnce(&crate::Fields) -> io::Result<()>,
+) -> io::Result<T> {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let json = text::read_json(bytes);
     let parsed = match serde_json::from_slice::<Value>(&json) {
@@ -127,6 +155,7 @@ fn decode<T: Model>(bytes: &[u8]) -> io::Result<T> {
     {
         return Err(invalid("unsupported document version"));
     }
+    check(&fields)?;
     fields.insert("v".into(), json!(1));
     let value: T = serde_json::from_value(Value::Object(fields)).map_err(invalid)?;
     if !value.valid() {
@@ -158,11 +187,17 @@ impl DataFolder {
     }
     /// An I/O failure blocks every model. Only the rebuildable song cache may have broken JSON.
     pub fn read<T: Model>(&self) -> io::Result<Document<T>> {
+        self.read_checked(|_| Ok(()))
+    }
+    fn read_checked<T: Model>(
+        &self,
+        check: impl FnOnce(&crate::Fields) -> io::Result<()>,
+    ) -> io::Result<Document<T>> {
         let path = self.path::<T>();
         let result = (|| {
             let bytes = read_existing(&path)?;
             let value = match bytes.as_deref() {
-                Some(b) => decode(b)?,
+                Some(b) => decode(b, check)?,
                 None => T::default(),
             };
             Ok(Document {
@@ -232,7 +267,31 @@ impl DataFolder {
     }
     /// Load the whole profile before enabling saves in the application.
     pub fn open(&self) -> io::Result<Profile> {
-        let state = self.read::<State>()?;
+        self.load_profile(self.read()?, self.read()?)
+    }
+    /// A desktop scan uses the saved selections to prune cached rows. Inspect the original
+    /// fields before State substitutes defaults or drops damaged list entries.
+    pub fn open_for_scan(&self) -> io::Result<Profile> {
+        let library = self.read::<Library>()?;
+        let state = if library.value.tracks.is_empty() {
+            self.read()?
+        } else {
+            let state = self.read_checked(validate_locations)?;
+            if !state.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "state.json is missing. Restore it from backup before opening this saved library.",
+                ));
+            }
+            state
+        };
+        self.load_profile(state, library)
+    }
+    fn load_profile(
+        &self,
+        state: Document<State>,
+        library: Document<Library>,
+    ) -> io::Result<Profile> {
         let mut listening = self.read::<Listening>()?;
         if let Some(status) = state.value.fields.get("phone") {
             listening.value.recover_legacy_cursor(status);
@@ -240,9 +299,30 @@ impl DataFolder {
         Ok(Profile {
             state,
             listening,
-            library: self.read()?,
+            library,
         })
     }
+}
+
+fn validate_locations(fields: &crate::Fields) -> io::Result<()> {
+    if !fields.contains_key("roots") && !fields.contains_key("files") {
+        return Err(invalid(
+            "The library locations are missing. Restore state.json from backup before scanning.",
+        ));
+    }
+    let valid_path = |v: &Value| v.as_str().is_some_and(|p| !p.is_empty());
+    for key in ["roots", "files"] {
+        if let Some(list) = fields.get(key)
+            && !list
+                .as_array()
+                .is_some_and(|paths| paths.iter().all(valid_path))
+        {
+            return Err(invalid(format!(
+                "The '{key}' list is damaged. Restore state.json from backup before scanning."
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn stage(dir: &Path, bytes: &[u8]) -> io::Result<NamedTempFile> {
@@ -291,15 +371,14 @@ impl<T: Model> Document<T> {
         };
         self.folder.keep_opening_copy_for(date)?;
         let opened = self.folder.backup.join("opened").join(date.to_string());
-        let digest = hash(&bytes);
-        if self.previous == Some(digest)
-            || read_existing(&opened.join(name))?.as_deref() == Some(&bytes)
+        if read_existing(&opened.join(name))?.as_deref() == Some(&bytes)
+            || read_existing(&opened.join(format!("{}.json", T::NAME)))?.as_deref() == Some(&bytes)
         {
             return Ok(());
         }
         // Another writer may have made a different daily backup since the morning's
-        // snapshot. With a missing or different live file this could be its only copy.
-        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        // snapshot. Both the live file and today's backup are about to be replaced.
+        let hex: String = hash(&bytes).iter().map(|b| format!("{b:02x}")).collect();
         let kept = opened.join(format!("{}-daily-{hex}.json", T::NAME));
         match stage(&opened, &bytes)?.persist_noclobber(&kept) {
             Ok(_) => Ok(()),

@@ -108,6 +108,16 @@ fn below(id: &str, root: &str) -> bool {
         .is_some_and(|s| s.starts_with(['\\', '/']))
 }
 
+const MAX_DEPTH: u8 = 14;
+
+fn traversable(name: &str) -> bool {
+    !name.starts_with(['.', '$'])
+        && !matches!(
+            name,
+            "node_modules" | "system volume information" | "__macosx"
+        )
+}
+
 struct Found {
     path: String,
     size: u64,
@@ -133,19 +143,28 @@ impl Listing {
         Ok(())
     }
     fn entry(&mut self, entry: fs::DirEntry, path: &Path, name: &str, depth: u8) -> io::Result<()> {
-        let m = if entry.file_type()?.is_symlink() {
-            fs::metadata(path)?
+        let kind = entry.file_type()?;
+        let visit = depth < MAX_DEPTH && traversable(name);
+        let m = if kind.is_symlink() {
+            match fs::metadata(path) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    // A missing directory target leaves this part of the scan unfinished.
+                    #[cfg(windows)]
+                    let could_be_dir = std::os::windows::fs::FileTypeExt::is_symlink_dir(&kind);
+                    #[cfg(not(windows))]
+                    let could_be_dir = true; // The link itself does not record its target's type.
+                    if could_be_dir && visit {
+                        self.inaccessible(path, error);
+                    }
+                    return Ok(());
+                }
+                result => result?,
+            }
         } else {
             entry.metadata()?
         };
         if m.is_dir() {
-            if depth < 14
-                && !name.starts_with(['.', '$'])
-                && !matches!(
-                    name,
-                    "node_modules" | "system volume information" | "__macosx"
-                )
-            {
+            if visit {
                 self.dirs.push(path.to_owned());
             }
         } else if cover(name) {
@@ -204,6 +223,17 @@ fn list(root: &Path, depth: u8) -> Listing {
 }
 
 impl Library {
+    /// This folded folder ID and the parent root IDs from which a scan can enumerate it.
+    /// Keep the spelling used by the scanner when it constructs a child's song ID.
+    pub fn scan_ancestors(folder: &str) -> impl Iterator<Item = &str> {
+        std::iter::successors(Some(folder.trim_end_matches(['\\', '/'])), |&p| {
+            let (parent, name) = p.rsplit_once(std::path::MAIN_SEPARATOR)?;
+            (!name.is_empty() && !(cfg!(windows) && name.contains('/')) && traversable(name))
+                .then_some(parent)
+        })
+        .take(usize::from(MAX_DEPTH) + 1)
+    }
+
     pub fn scan(&mut self, roots: &[PathBuf], loose: &[PathBuf]) -> ScanReport {
         let mut report = ScanReport::default();
         let mut found = HashMap::new();
@@ -212,7 +242,7 @@ impl Library {
         let mut keep = HashSet::new();
         let mut seen = HashSet::new();
         let mut dirs = roots.to_vec();
-        for depth in 0..=14 {
+        for depth in 0..=MAX_DEPTH {
             dirs.retain(|p| seen.insert(track_id(&key_text(p))));
             if dirs.is_empty() {
                 break;

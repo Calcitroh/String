@@ -103,13 +103,7 @@ pub struct Storage {
 }
 impl Storage {
     pub fn open(folder: &DataFolder, ctx: &Context) -> io::Result<(Self, Session)> {
-        let mut profile: Profile = folder.open()?;
-        if !profile.state.exists() && !profile.library.value.tracks.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "state.json is missing. Restore it from backup before opening this saved library.",
-            ));
-        }
+        let mut profile: Profile = folder.open_for_scan()?;
         // Copy the original bytes after a good load and before handing any caller a writer.
         let mut feedback = Feedback::default();
         if let Err(e) = folder.keep_opening_copy() {
@@ -344,6 +338,35 @@ mod tests {
     }
 
     #[test]
+    fn final_damaged_location_lists_cannot_prune_a_populated_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = folder(dir.path(), true);
+        let cache = br#"{"tracks":[{"path":"offline.wav","added":22,"extension":3}]}"#;
+        let library = dir.path().join("library.json");
+        let state = dir.path().join("state.json");
+        fs::write(&library, cache).unwrap();
+        for damaged in [
+            r#"{"v":1,"roots":false,"files":false}"#,
+            r#"{"roots":[],"files":[null]}"#,
+            r#"{"roots":["music",17],"files":[]}"#,
+            r#"{"roots":null,"files":["loose.wav"]}"#,
+            r#"{"v":1,"queue":{}}"#,
+            r#"{"roots":[""],"files":[]}"#,
+        ] {
+            fs::write(&state, damaged).unwrap();
+            assert!(
+                Storage::open(&folder, &Context::default()).is_err(),
+                "{damaged}"
+            );
+            assert_eq!(fs::read(&library).unwrap(), cache);
+            assert_eq!(fs::read_to_string(&state).unwrap(), damaged);
+        }
+        fs::write(&state, br#"{"v":1,"roots":[],"files":[]}"#).unwrap();
+        let (_, mut session) = Storage::open(&folder, &Context::default()).unwrap();
+        assert_eq!(session.library.scan(&[], &[]).removed, 1);
+    }
+
+    #[test]
     fn missing_state_with_cached_tracks_cannot_start_a_pruning_session() {
         let dir = tempfile::tempdir().unwrap();
         let folder = folder(dir.path(), true);
@@ -351,7 +374,7 @@ mod tests {
         fs::write(dir.path().join("library.json"), cache).unwrap();
         assert!(Storage::open(&folder, &Context::default()).is_err());
         assert_eq!(fs::read(dir.path().join("library.json")).unwrap(), cache);
-        fs::write(dir.path().join("state.json"), b"{}").unwrap();
+        fs::write(dir.path().join("state.json"), br#"{"roots":[],"files":[]}"#).unwrap();
         assert!(Storage::open(&folder, &Context::default()).is_ok());
     }
 
@@ -385,7 +408,7 @@ mod tests {
         fs::write(
             dir.path().join("state.json"),
             format!(
-                r#"{{"queue":{{"items":[{}],"at":0}}}}"#,
+                r#"{{"files":[{path}],"queue":{{"items":[{}],"at":0}}}}"#,
                 path.to_lowercase()
             ),
         )
