@@ -107,54 +107,70 @@ impl Listing {
         }
         Ok(())
     }
+    fn entry(&mut self, entry: fs::DirEntry, path: &Path, name: &str, depth: u8) -> io::Result<()> {
+        let m = if entry.file_type()?.is_symlink() {
+            fs::metadata(path)?
+        } else {
+            entry.metadata()?
+        };
+        if m.is_dir() {
+            if depth < 14
+                && !name.starts_with(['.', '$'])
+                && !matches!(
+                    name,
+                    "node_modules" | "system volume information" | "__macosx"
+                )
+            {
+                self.dirs.push(path.to_owned());
+            }
+        } else if cover(name) {
+            if self.cover.is_empty()
+                || ["cover.", "folder.", "front."]
+                    .iter()
+                    .any(|s| name.starts_with(s))
+            {
+                self.cover = path_string(path)?;
+            }
+        } else if audio(name) {
+            self.file(path, &m)?;
+        }
+        Ok(())
+    }
+    fn inaccessible(&mut self, path: &Path, error: io::Error) {
+        self.unread.push(track_id(&path.to_string_lossy()));
+        self.issues.push(Issue {
+            path: path.into(),
+            error,
+        });
+    }
 }
 fn list(root: &Path, depth: u8) -> Listing {
     let mut out = Listing::default();
-    let result = (|| -> io::Result<()> {
-        for entry in fs::read_dir(root)? {
-            let e = entry?;
-            let name = e
-                .file_name()
-                .into_string()
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid filename"))?;
-            let lower = name.to_lowercase();
-            let path = child(root, &name);
-            // A missed entry might be a directory. Keep cached descendants on a partial listing.
-            let m = if e.file_type()?.is_symlink() {
-                fs::metadata(&path)?
-            } else {
-                e.metadata()?
-            };
-            if m.is_dir() {
-                if depth < 14
-                    && !lower.starts_with(['.', '$'])
-                    && !matches!(
-                        lower.as_str(),
-                        "node_modules" | "system volume information" | "__macosx"
-                    )
-                {
-                    out.dirs.push(path);
-                }
-            } else if cover(&lower) {
-                if out.cover.is_empty()
-                    || ["cover.", "folder.", "front."]
-                        .iter()
-                        .any(|s| lower.starts_with(s))
-                {
-                    out.cover = path_string(&path)?;
-                }
-            } else if audio(&lower) {
-                out.file(&path, &m)?;
-            }
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            out.inaccessible(root, error);
+            return out;
         }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        out.unread.push(track_id(&root.to_string_lossy()));
-        out.issues.push(Issue {
-            path: root.into(),
-            error,
-        });
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(error) => {
+                // The missed name is unknown, so keep cached descendants of this folder.
+                out.inaccessible(root, error);
+                continue;
+            }
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let path = child(root, &name);
+        if let Err(error) = out.entry(entry, &path, &name.to_lowercase(), depth)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            out.inaccessible(&path, error);
+        }
     }
     out
 }
