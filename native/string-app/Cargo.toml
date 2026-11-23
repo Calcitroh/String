@@ -29,3 +29,6 @@ chrono = "0.4"
 rand = "0"
 crossbeam-channel = "0"
 fast_image_resize = "*"
+
+[dev-dependencies]
+string-extras = { path = "../string-extras", features = ["test-feed"] }

@@ -31,7 +31,8 @@ pub struct Updates {
     pub info: Option<UpdateInfo>,
     pub msg: String,
     pub busy: bool,
-    checking: Option<Answer<UpdateInfo>>,
+    pub(crate) checking: Option<Answer<UpdateInfo>>,
+    pub(crate) daily: crate::integration::update_check::Daily,
     install: Option<(Answer<bool>, Receiver<UpdateProgress>)>,
     started: Option<Instant>,
     ask: bool,
@@ -247,27 +248,6 @@ impl State {
         // Until a check has answered, what is known can still change (the app may connect its updater late).
         if u.checking.is_none() && !u.busy && u.info.as_ref().is_none_or(|i| i.latest.is_empty()) {
             u.info = Some(services::get().update_info());
-        }
-        if let Some(answer) = u.checking.as_ref().and_then(Task::poll) {
-            u.checking = None;
-            match answer {
-                Ok(info) => {
-                    let mut seen = v.s.field("update").clone();
-                    if !seen.is_object() {
-                        seen = json!({});
-                    }
-                    seen["at"] = chrono::Local::now().timestamp_millis().into();
-                    v.s.set_field("update", seen);
-                    if info.installed && info.published && !info.newer {
-                        v.views.toast.set("String is up to date");
-                    }
-                    u.info = Some(info);
-                }
-                Err(e) => {
-                    u.msg = format!("Couldn’t check: {e}");
-                    v.views.toast.set(u.msg.clone());
-                }
-            }
         }
         if let Some((task, progress)) = &u.install {
             for step in progress.try_iter() {

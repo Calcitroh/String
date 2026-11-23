@@ -266,6 +266,15 @@ at a time.
 - `string-lyrics`: lyrics (.lrc, the song's own, LRCLIB) and translation through Ollama.
 - `string-extras`: duplicates, Edit info (writing tags), phone listening from Navidrome, and updates (the same feed and
   key as the web version).
+- Installed copies check for a release one minute after startup and every six hours thereafter when the daily switch
+  is on and the last successful check was at least 24 hours ago. Manual and automatic checks share the worker.
+  Both save `update.at` in epoch milliseconds. A quiet check announces each new version once using `update.told`.
+  Smoke runs skip automatic checks.
+- Updates, LRCLIB and Discord cover lookups share one HTTP client. It verifies TLS with Windows and reads the
+  user's manual Internet Settings proxy on first use, including protocol-specific proxies, wildcards and `<local>`.
+  With the manual proxy off, it retains environment proxy support. Loopback stays direct. The 1.x Windows HTTP
+  client also supports automatic proxy discovery and configuration scripts (WPAD/PAC). On a PAC-only network,
+  the native client connects directly unless an environment proxy is configured.
 - `string-platform`: Windows: one instance, media keys and taskbar buttons, Discord, files and the Recycle Bin,
   backups, the error log.
 - `string-app`: the window and every screen (egui and wgpu), and `String.exe`. `native\string-app\SCREENS.md` says how
@@ -290,8 +299,8 @@ folder (its backups stay inside it), and it shares the single-instance names, so
 `release\native-build` with the source paths renamed (the libraries' to `/cargo`, String's to `/string`), runs the same
 privacy check as `tools\release.ps1`, and `-Publish` makes a GitHub pre-release on the pushed commit it was built from.
 Installed copies never update to a pre-release; the script checks that the newest full release is still the same
-afterwards. For an installable build, use `-Full` as described in Releases. The full executable links the Visual C++
-runtime statically, so a fresh PC can run it without installing the redistributable.
+afterwards. For an installable build, use `-Full` as described in Releases. Both formats link the Visual C++ runtime
+statically and check the executable's PE imports before packaging.
 
 Your own look in 2.0 (`string-app\src\theme\look.rs`) uses the same `<data>\look\look.css`, Open folder and
 `set.look` as 1.x. egui can't run CSS, so it reads what it can draw, with 1.x's meaning: `--hi` (a custom `Tint`;

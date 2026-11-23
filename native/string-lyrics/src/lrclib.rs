@@ -2,7 +2,6 @@ use crate::{Song, space, unicode};
 use serde::Deserialize;
 use serde_json::Value;
 use std::{fmt::Write, io, time::Duration};
-use ureq::Agent;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -113,7 +112,6 @@ pub fn pick_best<'a>(
 
 pub(crate) struct Lrclib {
     base: String,
-    http: Agent,
 }
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
@@ -147,16 +145,8 @@ fn query(fields: &[(&str, &str)]) -> String {
 
 impl Lrclib {
     pub(crate) fn new(base: &str) -> Self {
-        let mut config = Agent::config_builder()
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(10)));
-        if base.parse().is_ok_and(|uri| crate::loopback(&uri)) {
-            config = config.proxy(None);
-        }
         Self {
             base: base.trim_end_matches('/').into(),
-            http: config.build().into(),
         }
     }
     fn get(&self, path: &str) -> Result<Option<Value>, Error> {
@@ -168,12 +158,18 @@ impl Lrclib {
         {
             return Err(io::Error::other("Not an LRCLIB address").into());
         }
-        let mut res = self
-            .http
-            .get(format!("{}{path}", self.base))
-            .header("User-Agent", "String v1.0 (personal music player)")
-            .header("Lrclib-Client", "String v1.0")
-            .call()?;
+        let mut res = string_http::HTTP.get(
+            &format!("{}{path}", self.base),
+            Duration::from_secs(10),
+            0,
+            |r| {
+                r.header("User-Agent", "String v1.0 (personal music player)")
+                    .header("Lrclib-Client", "String v1.0")
+                    .config()
+                    .http_status_as_error(false)
+                    .build()
+            },
+        )?;
         match res.status().as_u16() {
             200 => Ok(Some(res.body_mut().read_json()?)),
             404 => Ok(None),

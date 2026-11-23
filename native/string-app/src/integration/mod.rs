@@ -4,6 +4,7 @@ pub mod media;
 pub mod phone;
 pub mod screens;
 pub mod smoke;
+pub mod update_check;
 pub mod updates;
 
 #[cfg(test)]
