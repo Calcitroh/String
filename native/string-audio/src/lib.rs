@@ -8,7 +8,8 @@
 //!
 //! # How it works
 //!
-//! - **Three threads.** The app's calls post a command and return. The engine thread decodes
+//! - **Audio threads.** The app's calls post a command and return. A worker opens the next
+//!   source while the engine continues to handle transport commands. The engine thread decodes
 //!   (symphonia), resamples to the device's rate (rubato) and fills each deck's lock-free ring
 //!   about 1.5 s ahead; it asks the host what's next and arms hand-overs. The sound device's
 //!   thread runs the mixer: it reads the rings, applies fades and hand-overs on the exact frame,

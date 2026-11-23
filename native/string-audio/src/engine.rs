@@ -13,6 +13,9 @@ use crate::mixer::{Cmd, Evt, FLAG_NO_OUTPUT, FLAG_PLAYING, FLAG_SONG, Handover, 
 use crate::source::Source;
 use crate::types::{Command, Config, Event, Host, LoopRange, Status, Track};
 
+mod preload;
+use preload::Preload;
+
 /// Songs that fail in a row before the engine stops trying the next one.
 const MAX_FAILURES: u32 = 5;
 /// A crossfade happens only between songs longer than twice it plus this (as the JS player).
@@ -35,6 +38,13 @@ struct RequestedPosition {
     seconds: f64,
 }
 
+struct Selecting {
+    track: Track,
+    from: f64,
+    /// On natural advance the old song still owns the queue until its successor starts.
+    after_end: Option<i64>,
+}
+
 impl Song {
     fn secs(&self) -> Option<f64> {
         self.frames.map(|f| f as f64 / self.rate as f64)
@@ -52,6 +62,9 @@ enum Next {
 }
 
 pub(crate) struct Engine {
+    preload: Preload,
+    /// Next was explicitly selected (or the old deck ended) before its open returned.
+    selecting: Option<Selecting>,
     host: Box<dyn Host>,
     config: Config,
     feeders: [Feeder; 2],
@@ -86,6 +99,8 @@ impl Engine {
     ) -> Engine {
         let rate = feeders[0].rate();
         let mut e = Engine {
+            preload: Preload::new(Source::open),
+            selecting: None,
             host,
             config,
             feeders,
@@ -136,6 +151,18 @@ impl Engine {
         self.playing
     }
 
+    #[cfg(test)]
+    pub fn set_preload_opener(
+        &mut self,
+        open: impl Fn(&std::path::Path) -> Result<Source, crate::Error> + Send + 'static,
+    ) {
+        self.preload = Preload::new(open);
+    }
+
+    pub fn offline(&mut self) {
+        self.preload.wait = true;
+    }
+
     /// Frames wait for room in a ring (the mixer drops stale ones soon): pump again soon.
     pub fn busy(&self) -> bool {
         self.playing && self.busy
@@ -151,12 +178,18 @@ impl Engine {
         match cmd {
             Command::Play { track, from, start } => {
                 self.failures = 0;
+                if self.preload.is_for(&track.path)
+                    || self.next_track().is_some_and(|t| t.path == track.path)
+                {
+                    self.select_preload(track, from, start);
+                    return;
+                }
                 self.send(Cmd::Selecting);
                 let fade = if from > 0.0 { self.frames(f.play) } else { 0 };
                 self.play(track, from, start.then_some(fade), None);
             }
             Command::Resume => {
-                if self.current.is_some() && !self.playing {
+                if (self.current.is_some() || self.selecting.is_some()) && !self.playing {
                     let fade = self.frames(f.play);
                     self.send(Cmd::Transport { play: true, fade });
                     self.playing = true;
@@ -185,6 +218,7 @@ impl Engine {
                 }
             }
             Command::Stop => {
+                self.preload.clear();
                 self.stop(self.frames(f.pause));
             }
             Command::Seek(secs) => self.seek(secs),
@@ -239,6 +273,7 @@ impl Engine {
         self.playing = false;
         self.cur = None;
         self.current = None;
+        self.selecting = None;
         self.next = None;
         self.loop_deck = None;
         self.songs.clear();
@@ -251,6 +286,8 @@ impl Engine {
 
     /// Plays from the requested position with the given fade-in, or cues paused.
     fn play(&mut self, track: Track, from: f64, fade_in: Option<u32>, loop_end: Option<i64>) {
+        self.preload.clear();
+        self.selecting = None;
         let source = match Source::open(&track.path) {
             Ok(source) => source,
             Err(error) => {
@@ -258,6 +295,34 @@ impl Engine {
                 return;
             }
         };
+        self.load_source(source, track, from, fade_in, loop_end);
+    }
+
+    fn select_preload(&mut self, track: Track, from: f64, start: bool) {
+        // A manual skip can refer to the open in flight, or a source already
+        // decoded into a deck. Its worker also owns the warm MP3 index.
+        self.stop(if self.playing {
+            self.frames(self.config.fades.seek_out)
+        } else {
+            0
+        });
+        self.preload.request(&track.path);
+        self.selecting = Some(Selecting {
+            track,
+            from,
+            after_end: None,
+        });
+        self.playing = start;
+    }
+
+    fn load_source(
+        &mut self,
+        source: Source,
+        track: Track,
+        from: f64,
+        fade_in: Option<u32>,
+        loop_end: Option<i64>,
+    ) {
         let info = source.info();
         let deck = self
             .cur
@@ -341,6 +406,15 @@ impl Engine {
         self.songs.get(&self.current?)
     }
 
+    fn next_track(&self) -> Option<&Track> {
+        match self.next.as_ref()? {
+            Next::Want(track) => Some(track),
+            Next::Chained { handle } | Next::Armed { handle } => {
+                self.songs.get(handle).map(|s| &s.track)
+            }
+        }
+    }
+
     fn active_loop(&self) -> Option<(f64, f64)> {
         let song = self.song()?;
         let lp = song.track.loop_range?;
@@ -356,6 +430,19 @@ impl Engine {
     }
 
     fn seek(&mut self, secs: f64) {
+        if let Some(pending) = &mut self.selecting {
+            if pending.after_end.is_none() {
+                pending.from = secs;
+            } else if let Some(song) = self.song() {
+                self.play(
+                    song.track.clone(),
+                    secs,
+                    self.playing.then(|| self.frames(self.config.fades.seek_in)),
+                    None,
+                );
+            }
+            return;
+        }
         let (Some(deck), Some(h), Some(song)) = (self.cur, self.current, self.song()) else {
             return;
         };
@@ -409,9 +496,26 @@ impl Engine {
     }
 
     fn set_loop(&mut self, range: Option<LoopRange>) {
+        if let Some(pending) = &mut self.selecting
+            && pending.after_end.is_none()
+        {
+            pending.track.loop_range = range;
+            return;
+        }
         let Some(h) = self.current else { return };
         if let Some(song) = self.songs.get_mut(&h) {
             song.track.loop_range = range;
+        }
+        if let Some(end) = self.selecting.as_ref().and_then(|p| p.after_end) {
+            if let Some((start, _)) = self.active_loop() {
+                self.play(
+                    self.songs[&h].track.clone(),
+                    start,
+                    self.playing.then(|| self.frames(self.config.fades.loop_in)),
+                    Some(end),
+                );
+            }
+            return;
         }
         // whatever waits (a next song, the old loop's start) is made ready again
         self.drop_next();
@@ -449,6 +553,7 @@ impl Engine {
             _ => {}
         }
         self.next = None;
+        self.preload.clear();
         true
     }
 
@@ -458,22 +563,33 @@ impl Engine {
         let Some(track) = self.song().map(|s| s.track.clone()) else {
             return;
         };
+        if let Some(pending) = &mut self.selecting {
+            // The mixer drained the old deck while the speculative open was blocked.
+            if let Some(next) = self.host.next_after(&track) {
+                self.preload.request(&next.path);
+                pending.track = next;
+            } else {
+                self.play(track, 0., None, None);
+                self.host.event(Event::Stopped);
+            }
+            return;
+        }
         if self.active_loop().is_some() {
             return;
         }
-        let made = match &self.next {
-            Some(Next::Armed { handle } | Next::Chained { handle }) => self
-                .songs
-                .get(handle)
-                .map(|s| (s.track.key, s.track.path.clone())),
-            Some(Next::Want(_)) | None => None,
-        };
         if !self.asked && self.next.is_none() {
             return;
         }
         let want = self.host.next_after(&track);
-        let same = made.is_some() && want.as_ref().map(|t| (t.key, t.path.clone())) == made;
+        let same = self
+            .next_track()
+            .zip(want.as_ref())
+            .is_some_and(|(a, b)| a.key == b.key && a.path == b.path);
         if same && !redo {
+            if matches!(self.next, Some(Next::Want(_))) {
+                // The same open still serves the queue, with its latest loop settings.
+                self.next = want.map(Next::Want);
+            }
             return;
         }
         if self.drop_next() {
@@ -489,6 +605,23 @@ impl Engine {
                 matches!(e, Evt::Started { handle } if self.current == Some(handle));
             if self.assignments[deck] == assignment || heard_current {
                 self.on_mixer(deck, e);
+            }
+        }
+        if self.selecting.is_some()
+            && let Some(result) = self.preload.poll()
+        {
+            let Selecting { track, from, .. } = self.selecting.take().unwrap();
+            self.preload.clear();
+            match result {
+                Ok(source) => {
+                    let fade = if from > 0. {
+                        self.frames(self.config.fades.play)
+                    } else {
+                        0
+                    };
+                    self.load_source(source, track, from, self.playing.then_some(fade), None);
+                }
+                Err(error) => self.failed_selection(&track, self.playing, error),
             }
         }
         self.fill();
@@ -605,7 +738,12 @@ impl Engine {
                     None => None,
                 };
                 if let Some(next) = next {
-                    self.play(next, 0.0, self.playing.then_some(0), None);
+                    self.preload.request(&next.path);
+                    self.selecting = Some(Selecting {
+                        track: next,
+                        from: 0.,
+                        after_end: Some(end),
+                    });
                 } else {
                     self.play(track, 0.0, None, None);
                     self.host.event(Event::Stopped);
@@ -660,7 +798,12 @@ impl Engine {
             self.make_ready(c, t);
         }
         if held {
-            if self.feeders[c].chained().is_none() {
+            // Keep the resampler open for an exact join while there is audio in reserve.
+            // If the next file is late, flush the current song's tail before the ring drains.
+            let waiting = matches!(self.next, Some(Next::Want(_)));
+            if self.feeders[c].chained().is_none()
+                && (!waiting || self.feeders[c].buffered_frames() <= self.rate as usize / 20)
+            {
                 self.feeders[c].finish();
             }
             self.fill();
@@ -676,12 +819,17 @@ impl Engine {
         // a crossfade needs the other deck free; a chain needs nothing
         let other = 1 - c;
         let wants_crossfade = x > 0.0 && track.key != cur_key && long(cur_len);
+        self.preload.request(&track.path);
         if wants_crossfade && !self.free[other] {
             return;
         }
-        let source = match Source::open(&track.path) {
+        let Some(result) = self.preload.poll() else {
+            return;
+        };
+        let source = match result {
             Ok(source) => source,
             Err(error) => {
+                self.preload.clear();
                 self.host.event(Event::Failed {
                     track: track.clone(),
                     error: error.to_string(),
@@ -711,6 +859,7 @@ impl Engine {
         } else {
             match self.feeders[c].chain(source, handle, track.key) {
                 Ok(()) => {
+                    self.preload.clear();
                     self.songs.insert(handle, song);
                     self.next = Some(Next::Chained { handle });
                     return;
@@ -720,8 +869,10 @@ impl Engine {
         };
         // another rate, or a crossfade: the other deck
         if !self.free[other] {
+            self.preload.keep(source);
             return;
         }
+        self.preload.clear();
         let era = match self.feeders[other].load(source, handle, track.key, 0, !crossfade) {
             Ok(g) => g,
             Err(e) => {
@@ -800,7 +951,9 @@ impl Engine {
         self.next = None;
         self.loop_deck = None;
         self.asked = false;
-        if let Some(song) = self.song() {
+        if self.selecting.is_none()
+            && let Some(song) = self.song()
+        {
             let position = song
                 .request
                 .as_ref()

@@ -30,7 +30,8 @@ impl OfflinePlayer {
         let (fa, ra) = deck::rings(rate);
         let (fb, rb) = deck::rings(rate);
         let (mixer, link) = Mixer::new(rate, [ra, rb], spectrum.shared.clone(), position.clone());
-        let engine = Engine::new(Box::new(host), config, [fa, fb], link, position.clone());
+        let mut engine = Engine::new(Box::new(host), config, [fa, fb], link, position.clone());
+        engine.offline();
         OfflinePlayer {
             engine,
             mixer,

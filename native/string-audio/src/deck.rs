@@ -332,6 +332,11 @@ impl Feeder {
         self.job.as_ref().is_some_and(|j| j.held)
     }
 
+    /// Already rendered into the ring and still available to the sound device.
+    pub fn buffered_frames(&self) -> usize {
+        (self.samples.buffer().capacity() - self.samples.slots()) / 2
+    }
+
     /// Nothing is chained on: the song ends with its resampler's last frames.
     pub fn finish(&mut self) {
         if let Some(j) = self.job.as_mut() {
