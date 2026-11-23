@@ -2,6 +2,7 @@ pub mod covers;
 pub mod credit;
 pub mod edit_info;
 pub mod glyph;
+pub mod logo_disc;
 pub mod menus;
 pub mod panel;
 pub mod queue_drawer;
