@@ -72,25 +72,35 @@ fn route_keys_and_range_selection_survive_navigation() {
     assert_eq!(s.indices.into_iter().collect::<Vec<_>>(), [1, 4, 6]);
 }
 #[test]
-fn no_opening_copy_means_no_saves_and_a_damaged_open_keeps_no_copy() {
+fn missing_opening_copy_allows_saves_and_a_damaged_profile_keeps_no_copy() {
     let today = chrono::Local::now().date_naive().to_string();
-    // the copy can't be made (a file where its folder goes): the profile doesn't open, so nothing is saved
+    // A file occupies the opening-copy directory, but the live profile can still be saved.
     let dir = fixture();
     let folder = storage::folder(&dir, true);
     fs::write(dir.join("state.json"), br#"{"v":1}"#).unwrap();
     fs::create_dir_all(dir.join("backup")).unwrap();
     fs::write(dir.join("backup").join("opened"), b"in the way").unwrap();
     let ctx = egui::Context::default();
-    assert!(Storage::open(&folder, &ctx).is_err());
+    let (mut store, mut session) = Storage::open(&folder, &ctx).unwrap();
+    session.set_field("route", "songs".into());
+    assert!(!store.flush(&mut session).failed());
+    assert_eq!(folder.open().unwrap().state.value.fields["route"], "songs");
     // a damaged file: no copy is kept for the day, so the retry after it's fixed keeps the good one
     let dir = fixture();
     let folder = storage::folder(&dir, true);
     fs::write(dir.join("state.json"), br#"{"v":1,"mine":true}"#).unwrap();
-    fs::write(dir.join("library.json"), b"broken").unwrap();
+    fs::write(dir.join("listening.json"), b"broken").unwrap();
     assert!(Storage::open(&folder, &ctx).is_err());
     assert!(!dir.join("backup").join("opened").join(&today).exists());
-    fs::write(dir.join("library.json"), br#"{"v":1,"tracks":[]}"#).unwrap();
+    fs::write(
+        dir.join("listening.json"),
+        br#"{"v":1,"artists":[],"tracks":[],"days":{}}"#,
+    )
+    .unwrap();
     assert!(Storage::open(&folder, &ctx).is_ok());
     let kept = dir.join("backup").join("opened").join(&today);
-    assert_eq!(fs::read(kept.join("library.json")).unwrap(), br#"{"v":1,"tracks":[]}"#);
+    assert_eq!(
+        fs::read(kept.join("listening.json")).unwrap(),
+        fs::read(dir.join("listening.json")).unwrap()
+    );
 }

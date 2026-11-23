@@ -35,7 +35,7 @@ fn corrupt_file_aborts_roundtrip_before_writes_and_inspect_reports_all() {
     let r = ctl("inspect", dir, &[]);
     let err = String::from_utf8(r.stderr).unwrap();
     assert!(!r.status.success());
-    assert!(err.contains("listening.json") && err.contains("library.json"));
+    assert!(err.contains("listening.json"));
     assert!(
         String::from_utf8(r.stdout)
             .unwrap()
@@ -55,6 +55,19 @@ fn absent_models_stay_absent_on_roundtrip() {
         3
     );
     assert_eq!(fs::read_dir(t.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn roundtrip_keeps_the_original_before_replacing_a_defaulted_field() {
+    let dir = tempdir().unwrap();
+    let before = br#"{"v":1,"queue":{"repeat":false},"custom":"keep"}"#;
+    fs::write(dir.path().join("state.json"), before).unwrap();
+    assert!(ctl("roundtrip", dir.path(), &[]).status.success());
+    let kept = dir
+        .path()
+        .join("backup/opened")
+        .join(Local::now().date_naive().to_string());
+    assert_eq!(fs::read(kept.join("state.json")).unwrap(), before);
 }
 
 #[test]
@@ -159,7 +172,7 @@ fn daily_retention_is_per_name_and_preserves_other_files() {
     );
 }
 #[test]
-fn invalid_compression_and_listening_indices_are_errors() {
+fn invalid_queue_entries_and_listening_indices_are_local_to_the_entry() {
     let t = tempdir().unwrap();
     let f = DataFolder::new(t.path(), t.path().join("copy"));
     for queue in [
@@ -172,7 +185,7 @@ fn invalid_compression_and_listening_indices_are_errors() {
             json!({"v":1,"queue":queue}).to_string(),
         )
         .unwrap();
-        assert!(f.read::<State>().is_err());
+        assert!(f.read::<State>().unwrap().value.queue.items().is_empty());
     }
     let day = json!({"s":1,"h":vec![0;24],"a":{},"t":{"3":1}});
     fs::write(
@@ -180,8 +193,186 @@ fn invalid_compression_and_listening_indices_are_errors() {
         json!({"v":1,"days":{"2026-02-01":day},"tracks":[],"artists":[]}).to_string(),
     )
     .unwrap();
-    assert!(f.read::<Listening>().is_err());
+    let listening = f.read::<Listening>().unwrap();
+    let day = listening.value.days().values().next().unwrap();
+    assert_eq!(day.s, 1.);
+    assert!(day.t.is_empty());
 }
+
+#[test]
+fn wrong_fields_keep_their_siblings_and_dictionary_slots() {
+    let t = tempdir().unwrap();
+    let dir = t.path();
+    fs::write(
+        dir.join("state.json"),
+        br#"{
+        "v":1, "roots":false, "route":"liked", "set":{"fade":false,"custom":"yes"},
+        "queue":{"items":["one",null,"two"],"at":2,"repeat":false,"pos":null,"extension":[1]}
+    }"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("listening.json"),
+        br#"{
+        "v":1, "artists":[null,"second"], "tracks":[["a",false,"artist"],["b","B"]],
+        "days":{"2026-01-01":{"s":20,"h":[null,3],"a":{"0":null,"1":8},"t":{"1":5},"note":"kept"}},
+        "phoneImport":{"after":{"bad":"oops","good":12},"plays":4}
+    }"#,
+    )
+    .unwrap();
+    let p = DataFolder::new(dir, dir.join("copies")).open().unwrap();
+    assert_eq!(p.state.value.fields["roots"], json!([]));
+    assert_eq!(p.state.value.fields["set"]["fade"], 0);
+    assert_eq!(p.state.value.fields["set"]["custom"], "yes");
+    assert_eq!(p.state.value.fields["route"], "liked");
+    let queue = &p.state.value.queue;
+    assert_eq!(queue.items().len(), 2);
+    assert_eq!(queue.current(), Some("two"));
+    assert_eq!(queue.pos(), 0.);
+    let state: serde_json::Value = serde_json::from_slice(&p.state.json().unwrap()).unwrap();
+    assert_eq!(state["queue"]["extension"], json!([1]));
+    let stats = serde_json::to_value(p.listening.value).unwrap();
+    let day = &stats["days"]["2026-01-01"];
+    assert_eq!(day["h"][1], 3.);
+    assert_eq!(day["a"]["1"], 8.);
+    assert_eq!(day["t"]["1"], 5.);
+    assert_eq!(day["note"], "kept");
+    assert_eq!(stats["artists"][1], "second");
+    assert_eq!(stats["tracks"][1], json!(["b", "B", ""]));
+    assert_eq!(stats["phoneImport"]["after"]["good"], 12);
+}
+
+#[test]
+fn an_unrecognized_day_key_survives_a_listening_edit() {
+    let tmp = tempdir().unwrap();
+    let path = tmp.path().join("listening.json");
+    fs::write(
+        &path,
+        br#"{"v":1,"days":{"NaN-NaN-NaN":{"s":3,"extension":true}}}"#,
+    )
+    .unwrap();
+    let mut doc = DataFolder::new(tmp.path(), tmp.path().join("copies"))
+        .read::<Listening>()
+        .unwrap();
+    doc.value.add(
+        &string_core::stats::Track("a".into(), "A".into(), "Artist".into()),
+        2.,
+        "2026-11-22T10:00:00".parse().unwrap(),
+    );
+    doc.save().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(json["days"]["NaN-NaN-NaN"], json!({"s":3,"extension":true}));
+    assert_eq!(json["days"]["2026-11-22"]["s"], 2);
+}
+
+#[test]
+fn a_bad_playlist_items_value_and_optional_setting_keep_the_rest_of_the_playlist() {
+    let tmp = tempdir().unwrap();
+    fs::write(tmp.path().join("state.json"),br#"{"v":1,"playlists":[{"id":"p","name":"Mix","items":false,"cover":"image"}],"set":{"phoneStats":{},"custom":12},"files":["keep.wav",false]}"#).unwrap();
+    let state = DataFolder::new(tmp.path(), tmp.path().join("backup"))
+        .read::<State>()
+        .unwrap()
+        .value;
+    assert_eq!(
+        state.fields["playlists"],
+        json!([{"id":"p","name":"Mix","items":[],"cover":"image"}])
+    );
+    assert!(
+        state.fields["set"]["phoneStats"].is_null() || state.fields["set"]["phoneStats"] == true
+    );
+    assert_eq!(state.fields["set"]["custom"], 12);
+    assert_eq!(state.fields["files"], json!(["keep.wav"]));
+}
+
+#[test]
+fn broken_cache_rebuilds_and_good_neighbors_survive_a_bad_row() {
+    let t = tempdir().unwrap();
+    let dir = t.path();
+    let path = dir.join("library.json");
+    let folder = DataFolder::new(dir, dir.join("copies"));
+    fs::write(&path, b"broken").unwrap();
+    assert!(folder.open().unwrap().library.value.tracks.is_empty());
+    fs::write(&path,br#"{"v":1,"extension":17,"tracks":[null,{"path":"good","title":"kept","custom":3},{"path":"bad","title":12}]}"#).unwrap();
+    let library = folder.open().unwrap().library.value;
+    assert_eq!(library.extra["extension"], 17);
+    assert_eq!(library.tracks[0].tags.title, "kept");
+    assert_eq!(library.tracks[0].extra["custom"], 3);
+    assert!(
+        !library
+            .tracks
+            .iter()
+            .any(|t| t.path == "bad" && t.read_error == 0)
+    );
+    let song = dir.join("reread.webm");
+    fs::write(&song,[0x1a,0x45,0xdf,0xa3]).unwrap();
+    fs::write(&path,json!({"v":1,"tracks":[{"path":song,"title":12,"extension":9}]}).to_string()).unwrap();
+    let mut cache = folder.open().unwrap().library;
+    assert_eq!(cache.value.scan(&[], &[song]).read,1);
+    assert_eq!(cache.value.tracks[0].extra["extension"],9);
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    assert!(
+        folder.open().is_err(),
+        "an I/O error must still block every writer"
+    );
+}
+
+#[test]
+fn lone_utf16_units_survive_in_paths_names_and_unknown_keys() {
+    let t = tempdir().unwrap();
+    let dir = t.path();
+    fs::write(dir.join("state.json"),br#"{"v":1,"queue":{"paths":[[0,"a\ud800x",0],[2,"\udc00y",0]],"items":[0,1],"orig":null},"playlists":[{"name":"hi\udfff","items":[]}],"extension":{"\udfff":"\\udfff","\u0000\ue7ff":true}}"#).unwrap();
+    fs::write(
+        dir.join("library.json"),
+        br#"{"v":1,"tracks":[{"path":"a\ud800x"}]}"#,
+    )
+    .unwrap();
+    let folder = DataFolder::new(dir, dir.join("copies"));
+    let mut p = folder.open().unwrap();
+    assert_eq!(
+        p.state.value.queue.items()[0].id,
+        p.library.value.tracks[0].path
+    );
+    assert_eq!(p.state.value.queue.items()[1].id, "a\u{10000}y");
+    p.state.save().unwrap();
+    p.library.save().unwrap();
+    let saved = fs::read_to_string(dir.join("state.json")).unwrap();
+    assert!(saved.contains("\"\\u0000\u{e7ff}\":true"));
+    assert!(saved.contains(r#""hi\udfff""#) && saved.contains(r#""\udfff":"\\udfff""#));
+    assert_eq!(
+        folder.open().unwrap().state.value.queue.items(),
+        p.state.value.queue.items()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn scan_keeps_a_cached_loose_filename_with_an_isolated_utf16_unit() {
+    use std::os::windows::ffi::OsStringExt;
+    let t = tempdir().unwrap();
+    let name = std::ffi::OsString::from_wide(&[0xd800, 46, 119, 97, 118]);
+    let song = t.path().join(name);
+    fs::write(&song, b"song").unwrap();
+    let prefix = serde_json::to_string(t.path().to_str().unwrap()).unwrap();
+    let path_json = format!(r#"{}\\\ud800.wav""#, &prefix[..prefix.len() - 1]);
+    fs::write(
+        t.path().join("library.json"),
+        format!(r#"{{"v":1,"tracks":[{{"path":{path_json},"title":"Keep"}}]}}"#),
+    )
+    .unwrap();
+    let mut p = DataFolder::new(t.path(), t.path().join("backup"))
+        .open()
+        .unwrap();
+    p.library.value.scan(&[], std::slice::from_ref(&song));
+    assert_eq!(p.library.value.tracks.len(), 1);
+    p.library.save().unwrap();
+    assert!(
+        fs::read_to_string(t.path().join("library.json"))
+            .unwrap()
+            .contains(r"\ud800.wav")
+    );
+}
+
 #[test]
 fn cli_scan_inspect_and_stable_second_roundtrip() {
     let t = tempdir().unwrap();
