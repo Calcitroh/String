@@ -80,6 +80,7 @@ pub(crate) enum Evt {
 pub(crate) type Position = SeqLock<7>;
 pub(crate) const FLAG_SONG: u64 = 1;
 pub(crate) const FLAG_PLAYING: u64 = 2;
+pub(crate) const FLAG_NO_OUTPUT: u64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
@@ -359,8 +360,33 @@ impl Mixer {
         self.analyser.set_rate(rate);
     }
 
+    /// The old stream has stopped. Keep the last rendered position, and freeze interpolation
+    /// until the next device publishes a frame. Transport intent still belongs to the engine.
+    pub fn output_waiting(&mut self, playing: bool) {
+        let mut snapshot = [0; 7];
+        self.position.read(&mut snapshot);
+        snapshot[1] = (snapshot[1] & !FLAG_PLAYING) | FLAG_NO_OUTPUT;
+        if playing {
+            snapshot[1] |= FLAG_PLAYING;
+        }
+        self.position.write(&snapshot);
+    }
+
+    /// No audio is being rendered. Complete a pause or seek that was waiting for its fade
+    /// so the replacement device cannot play the tail of a song paused during the outage.
+    pub fn settle_pause(&mut self) {
+        self.commands();
+        self.running = false;
+        self.transport.set(0.0);
+        for deck in &mut self.decks {
+            if let Some(pending) = deck.pending.take() {
+                deck.switch_to(pending.era, 0);
+            }
+        }
+    }
+
     /// Forgets every deck's state (the output's rate changed; the engine loads again).
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self) -> [u32; 2] {
         for d in &mut self.decks {
             d.role = Role::Idle;
             d.pending = None;
@@ -372,6 +398,7 @@ impl Mixer {
         self.cur = None;
         self.armed = None;
         self.started = 0;
+        self.decks.each_ref().map(|deck| deck.era)
     }
 
     fn emit(&mut self, e: Evt) {

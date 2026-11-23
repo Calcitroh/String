@@ -32,6 +32,29 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fmt, thread};
 
+thread_local! { static PRIVATE_PIPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+fn private_pipe_name() -> String {
+    format!(
+        "string-test-presence-{}-{:?}",
+        std::process::id(),
+        thread::current().id()
+    )
+}
+
+/// Run the host integration against its own pipe. The override affects only options created
+/// on this thread inside the call. The worker receives its endpoints by value.
+#[doc(hidden)]
+pub fn with_test_pipe<T>(run: impl FnOnce(&str) -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PRIVATE_PIPE.set(self.0);
+        }
+    }
+    let _restore = Restore(PRIVATE_PIPE.replace(true));
+    run(&private_pipe_name())
+}
+
 /// How the presence thread runs. [`Options::new`] has String's; the rest is for tests (a pipe, searches and waits of
 /// their own).
 #[derive(Clone, Debug)]
@@ -56,7 +79,7 @@ pub struct Options {
 
 impl Options {
     pub fn new(app_id: impl Into<String>, data_dir: &Path) -> Options {
-        Options {
+        let mut options = Options {
             app_id: app_id.into(),
             covers_file: data_dir.join("discord-covers.json"),
             pipe: None,
@@ -65,7 +88,14 @@ impl Options {
             min_interval: Duration::from_millis(4200),
             retry_after: Duration::from_secs(10),
             reconnect_after: Duration::from_secs(4),
+        };
+        if PRIVATE_PIPE.get() {
+            options.pipe = Some(private_pipe_name());
+            // Even if a test profile requests online artwork, no external search can start.
+            options.itunes = String::new();
+            options.deezer = String::new();
         }
+        options
     }
 }
 

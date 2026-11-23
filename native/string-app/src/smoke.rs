@@ -79,6 +79,7 @@ pub const CASES: &[Case] = &[
         ready: library_ready,
     },
     crate::integration::smoke::HOST,
+    crate::platform::live_checks::TRANSPORT,
     crate::integration::helpers::smoke::SIDEBAR,
     lib::HOME,
     lib::ALBUMS,

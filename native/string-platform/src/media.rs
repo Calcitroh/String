@@ -7,7 +7,7 @@
 //! # use std::time::Duration;
 //! # let hwnd = Hwnd(0);
 //! let media = MediaControls::new(hwnd, |button| match button {
-//!     MediaButton::Play | MediaButton::Pause | MediaButton::Next | MediaButton::Previous => { /* to the player */ }
+//!     MediaButton::Play | MediaButton::Pause | MediaButton::Toggle | MediaButton::Next | MediaButton::Previous => { /* to the player */ }
 //!     MediaButton::Stop => { /* pause, as String 1.x did */ }
 //!     MediaButton::Rewind | MediaButton::FastForward => { /* 10 s back or on */ }
 //!     MediaButton::Seek(to) => { /* seek */ }
@@ -33,12 +33,18 @@ use windows::Storage::Streams::{
 use windows::Win32::System::WinRT::ISystemMediaTransportControlsInterop;
 use windows::core::{HSTRING, Ref, factory};
 
+mod app_commands;
+mod smoke;
+pub use app_commands::AppCommands;
+
 /// A press on a media key, the overlay or a headset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaButton {
     /// The play/pause key sends `Play` while paused and `Pause` while playing.
     Play,
     Pause,
+    /// A play/pause window message doesn't distinguish between the two states.
+    Toggle,
     /// String 1.x paused on it.
     Stop,
     Next,
@@ -63,6 +69,10 @@ pub struct Song<'a> {
 /// String's entry in the media overlay. Hidden until the first [`MediaControls::set_song`]; gone when dropped.
 pub struct MediaControls {
     smtc: SystemMediaTransportControls,
+    button_handler: TypedEventHandler<
+        SystemMediaTransportControls,
+        SystemMediaTransportControlsButtonPressedEventArgs,
+    >,
     pressed: i64,
     seek: i64,
 }
@@ -86,7 +96,7 @@ impl MediaControls {
         smtc.SetIsFastForwardEnabled(true)?;
         let on_button = Arc::new(on_button);
         let tell = on_button.clone();
-        let pressed = smtc.ButtonPressed(&TypedEventHandler::new(
+        let button_handler = TypedEventHandler::new(
             move |_: Ref<SystemMediaTransportControls>,
                   args: Ref<SystemMediaTransportControlsButtonPressedEventArgs>| {
                 if let Some(b) = button(args.ok()?.Button()?) {
@@ -94,7 +104,8 @@ impl MediaControls {
                 }
                 Ok(())
             },
-        ))?;
+        );
+        let pressed = smtc.ButtonPressed(&button_handler)?;
         let tell = on_button;
         let seek = smtc.PlaybackPositionChangeRequested(&TypedEventHandler::new(
             move |_: Ref<SystemMediaTransportControls>,
@@ -107,6 +118,7 @@ impl MediaControls {
         ))?;
         Ok(MediaControls {
             smtc,
+            button_handler,
             pressed,
             seek,
         })

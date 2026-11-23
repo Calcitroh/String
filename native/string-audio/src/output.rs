@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use crate::Error;
+use crate::engine::Engine;
 use crate::mixer::Mixer;
+use crate::types::Event;
 
 /// A playing stream that hasn't called back for this long is taken as dead.
 const SILENT_LIMIT: Duration = Duration::from_millis(1500);
@@ -19,9 +21,10 @@ const RETRY: Duration = Duration::from_secs(1);
 /// The largest block the sound thread renders at once (bigger device periods come in pieces).
 const MAX_BLOCK: usize = 8192;
 
-pub(crate) struct Output {
+pub(crate) struct Output<S = cpal::Stream> {
     mixer: Arc<Mutex<Mixer>>,
-    stream: Option<cpal::Stream>,
+    stream: Option<S>,
+    waiting_playing: Option<bool>,
     broken: Arc<AtomicBool>,
     beats: Arc<AtomicU64>,
     last_beats: u64,
@@ -36,25 +39,95 @@ pub(crate) fn default_rate() -> Option<u32> {
     device.default_output_config().ok().map(|c| c.sample_rate())
 }
 
-impl Output {
-    pub fn new(mixer: Arc<Mutex<Mixer>>, epoch: Instant) -> Output {
-        let now = Instant::now();
+impl<S> Output<S> {
+    pub fn new(mixer: Arc<Mutex<Mixer>>, epoch: Instant) -> Self {
         Output {
             mixer,
             stream: None,
+            waiting_playing: None,
             broken: Arc::new(AtomicBool::new(false)),
             beats: Arc::new(AtomicU64::new(0)),
             last_beats: 0,
-            last_beat_at: now,
-            retry_at: now,
+            last_beat_at: epoch,
+            retry_at: epoch,
             epoch,
         }
     }
 
-    /// Opens the default device: its name and rate.
-    pub fn open(&mut self) -> Result<(String, u32), Error> {
-        self.stream = None;
-        self.retry_at = Instant::now() + RETRY;
+    // Inject just the device operations and clock. The decision to drop, wait, retry and
+    // resynchronise the real decks is the same with an in-memory stream in tests.
+    fn update_with(
+        &mut self,
+        now: Instant,
+        engine: &mut Engine,
+        open: impl FnOnce(&Self) -> Result<(S, String, u32), Error>,
+        start: impl FnOnce(&S) -> Result<(), Error>,
+    ) {
+        let reopen = self.needs_reopen(now, engine.playing());
+        if reopen && self.stream.take().is_some() {
+            // Collect anything the retiring stream reported in its final callback.
+            engine.pump();
+        }
+        // Keep play/pause usable while unplugged, without counting the outage as listening.
+        if self.stream.is_none() && self.waiting_playing != Some(engine.playing()) {
+            self.mixer.lock().unwrap().output_waiting(engine.playing());
+            self.waiting_playing = Some(engine.playing());
+        }
+        if !reopen {
+            return;
+        }
+        self.retry_at = now + RETRY;
+        self.broken.store(false, Ordering::Relaxed);
+        let Ok((stream, name, rate)) = open(self) else {
+            return;
+        };
+        {
+            let mut mixer = self.mixer.lock().unwrap();
+            if mixer.rate() != rate {
+                mixer.set_rate(rate);
+                let rendered_eras = mixer.reset();
+                drop(mixer);
+                engine.resync(rate, rendered_eras);
+            }
+        }
+        if !engine.playing() {
+            self.mixer.lock().unwrap().settle_pause();
+        }
+        if start(&stream).is_ok() {
+            self.stream = Some(stream);
+            self.waiting_playing = None;
+            self.last_beat_at = now;
+            self.last_beats = self.beats.load(Ordering::Relaxed);
+            engine.notify(Event::Output { name, rate });
+        }
+    }
+
+    fn needs_reopen(&mut self, now: Instant, playing: bool) -> bool {
+        if self.stream.is_none() {
+            return now >= self.retry_at;
+        }
+        if self.broken.load(Ordering::Relaxed) {
+            return true;
+        }
+        let beats = self.beats.load(Ordering::Relaxed);
+        if beats != self.last_beats || !playing {
+            self.last_beats = beats;
+            self.last_beat_at = now;
+            return false;
+        }
+        now.duration_since(self.last_beat_at) > SILENT_LIMIT
+    }
+}
+
+impl Output {
+    pub fn update(&mut self, engine: &mut Engine) {
+        self.update_with(Instant::now(), engine, Self::open, |s| {
+            s.play().map_err(|e| Error::Output(e.to_string()))
+        });
+    }
+
+    /// Build the stream paused. A replacement must never render at the old mixer's rate.
+    fn open(&self) -> Result<(cpal::Stream, String, u32), Error> {
         let host = cpal::default_host();
         let device = host
             .default_output_device()
@@ -78,7 +151,6 @@ impl Output {
         let epoch = self.epoch;
         let mut stereo = vec![0.0f32; MAX_BLOCK * 2];
         let broken = self.broken.clone();
-        broken.store(false, Ordering::Relaxed);
         let stream = device
             .build_output_stream::<f32, _, _>(
                 stream_config,
@@ -106,36 +178,12 @@ impl Output {
                 None,
             )
             .map_err(|e| Error::Output(e.to_string()))?;
-        stream.play().map_err(|e| Error::Output(e.to_string()))?;
-        self.stream = Some(stream);
-        self.last_beat_at = Instant::now();
-        self.last_beats = self.beats.load(Ordering::Relaxed);
-        Ok((name, rate))
-    }
-
-    /// Whether the stream needs opening again: it broke, went silent while playing, or there was
-    /// none and it's time to try.
-    pub fn needs_reopen(&mut self, playing: bool) -> bool {
-        let now = Instant::now();
-        if self.stream.is_none() {
-            return now >= self.retry_at;
-        }
-        if self.broken.load(Ordering::Relaxed) {
-            return true;
-        }
-        let beats = self.beats.load(Ordering::Relaxed);
-        if beats != self.last_beats || !playing {
-            self.last_beats = beats;
-            self.last_beat_at = now;
-            return false;
-        }
-        now.duration_since(self.last_beat_at) > SILENT_LIMIT
-    }
-
-    pub fn close(&mut self) {
-        self.stream = None;
+        Ok((stream, name, rate))
     }
 }
+
+#[cfg(test)]
+mod tests;
 
 /// Stereo into the device's channels: left and right first, the rest silent; mono gets both.
 fn spread(stereo: &[f32], out: &mut [f32], channels: usize) {
