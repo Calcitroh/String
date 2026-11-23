@@ -109,6 +109,7 @@ struct WebmSeek {
     file: File,
     cues: bool,
     opus_delay: Option<u64>,
+    padding: webm::Padding,
 }
 
 fn probe(path: &Path, media: Box<dyn MediaSource>) -> Result<Box<dyn FormatReader>, Error> {
@@ -303,6 +304,7 @@ impl Source {
             let opus = codec == CODEC_ID_OPUS;
             let layout =
                 webm::layout(clone(&file)?, opus.then_some(track.id)).map_err(|e| err(path, e))?;
+            let padding = layout.padding(rate);
             format = reprobe(path, &mut file)?;
             if opus {
                 let header = params.extra_data.as_deref().unwrap_or_default();
@@ -314,27 +316,12 @@ impl Source {
                     .delay_ns
                     .map(|n| webm::ns_to_frames(n, rate))
                     .unwrap_or(pre_skip * u64::from(rate) / 48000);
-                let samples = match layout.samples {
-                    Some(n) => n,
-                    None => {
-                        let mut total = 0;
-                        while let Some(p) =
-                            next_packet(format.as_mut()).map_err(|e| err(path, e))?
-                        {
-                            if p.track_id == track.id {
-                                total += webm::packet_samples(&p.data)
-                                    .ok_or_else(|| err(path, "invalid Opus packet"))?;
-                            }
-                        }
-                        format = reprobe(path, &mut file)?;
-                        total
-                    }
-                };
-                let tail = webm::ns_to_frames(layout.tail_ns.max(0) as u64, rate);
+                // Padding that overlaps codec priming is discarded only once.
+                delay -= padding.before(delay);
                 frames = Some(
-                    (samples * u64::from(rate) / 48000)
+                    (layout.samples * u64::from(rate) / 48000)
                         .saturating_sub(delay)
-                        .saturating_sub(tail),
+                        .saturating_sub(padding.total()),
                 );
                 limit = frames;
             } else if frames.is_none() {
@@ -346,6 +333,7 @@ impl Source {
                 file,
                 cues: layout.cues,
                 opus_delay: opus.then_some(delay),
+                padding,
             });
         } else if codec == CODEC_ID_OPUS {
             // the reader counts the pre-skip in its timestamps and in its length; the decoder
@@ -553,8 +541,18 @@ impl NativeSource {
                     Err(e) => return Err(Error::Decode(e.to_string())),
                 }
             }
-            let trim_start = self.ticks_to_frames(packet.trim_start.get() as i64).max(0) as usize;
-            let trim_end = self.ticks_to_frames(packet.trim_end.get() as i64).max(0) as usize;
+            let mut trim_start =
+                self.ticks_to_frames(packet.trim_start.get() as i64).max(0) as usize;
+            let mut trim_end = self.ticks_to_frames(packet.trim_end.get() as i64).max(0) as usize;
+            if let Some(w) = &mut self.webm
+                && w.padding.interior
+            {
+                // Advance on the packet clock even when the decoder skips a damaged packet.
+                let frames = webm::opus_frames(&packet.data, self.rate)?;
+                let (lo, hi) = w.padding.keep(frames);
+                trim_start = trim_start.max(lo);
+                trim_end = trim_end.max(frames - hi);
+            }
             let pts = self.ticks_to_frames(packet.pts.get());
             #[cfg(windows)]
             if let Some(check) = &mut self.aac_check {
