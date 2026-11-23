@@ -26,8 +26,8 @@ changing them. No ads, no accounts, no cloud.
 - **Duplicates:** `Library → Find duplicates` catches tracks you have more than once. Pick the copy to keep and either
   hide or Recycle Bin the rest (it asks first). Your likes, plays, loops, and playlist spots carry over to the one you
   kept.
-- **Custom look:** `Library → Look → Open folder` creates a `look.css` with examples for colors, a custom logo, a
-  background image, and fonts. It loads on top of the default theme and updates won't touch it.
+- **Custom look:** `Library → Look → Open folder` creates a `look.css` with examples. String 2.0 uses its tint, a
+  custom logo, and a background image (colors and fonts aren't in yet), and updates won't touch it.
 - **Discord:** Shows "Listening to" with the song, artist, and time bar. Set it up once in `Library → Discord`.
 - **Updates:** Checks once a day for signed updates from this project and asks before installing (turn it off in
   `Library → Updates`).
@@ -46,12 +46,11 @@ Windows will probably warn you since it isn't signed with a paid cert: click **M
 Installs for your Windows account only (no admin needed), adds Start menu and desktop shortcuts, and uninstalls from
 Settings → Apps. `Read me first.txt` in the zip has the details, and `Phone setup.txt` covers listening on your phone.
 
-## String 2.0 preview
+## String 2.0
 
-String is getting rebuilt as a native Windows app in Rust (`native/`). Same player, about half the RAM and way less CPU
-usage. There's a pre-release on the [Releases](../../releases) page: unzip it and open `String.exe`. It uses your
-existing String library without messing with your main install (installed copies never auto-update to previews). Not in
-yet: add-ons, custom CSS, installer, and auto-updates.
+String got rebuilt as a native Windows app in Rust (`native/`). Same player, about half the RAM and way less CPU usage.
+If you have String 1.x installed, it updates itself to 2.0, and your library, likes, playlists, loops, and stats carry
+over. The 1.x web player is still in `src/`.
 
 ## What goes online
 
@@ -67,8 +66,9 @@ Your library, likes, playlists, and stats stay on your PC in `%LOCALAPPDATA%\Str
 
 ## Add-ons & Building
 
-Drop add-ons into `%LOCALAPPDATA%\String\addons\<name>\`. They run as part of String, so only install ones from people
-you trust.
+Drop add-ons into `%LOCALAPPDATA%\String\addons\<name>\`. In 2.0 an add-on is a helper program with its own button in
+the sidebar (1.x's script add-ons don't run in 2.0). They run on your PC like String does, so only install ones from
+people you trust.
 
-For [how add-ons work](DEVELOPING.md#add-ons) or building from source, check [DEVELOPING.md](DEVELOPING.md). String is
+For [how add-ons work](native/HELPERS.md) or building from source, check [DEVELOPING.md](DEVELOPING.md). String is
 MIT-licensed (see [LICENSE](LICENSE)).

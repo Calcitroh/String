@@ -1,6 +1,6 @@
 #Requires -Version 7
 # Makes an installable native release, or a loose preview that installed copies skip.
-#   pwsh -File tools\release-native.ps1 -Full -Version 2.0.0 [-Key <release key>]
+#   pwsh -File tools\release-native.ps1 -Full -Version 2.0.0 [-Key <release key>] [-Notes "..."] [-Publish]
 #   pwsh -File tools\release-native.ps1 -Version 2.0.0-preview.1 [-Notes "What it is"] [-Publish]
 # Nothing personal goes in: the same check as tools\release.ps1 (this PC's user and profile name, and any words listed,
 # one per line, in %USERPROFILE%\.string-release\private-words.txt).
@@ -12,7 +12,6 @@ param(
     [string]$Key = (Join-Path $env:USERPROFILE '.string-release\release-key.pem')
 )
 $ErrorActionPreference = 'Stop'
-if ($Full -and $Publish) { 'Publishing full native releases is disabled.'; exit 1 }
 if ($Full) {
     if ($Version -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') { "a full version looks like 2.0.0 (got '$Version')"; exit 1 }
 } elseif ($Version -notmatch '^\d+\.\d+\.\d+-preview\.\d+$') { "a preview's version looks like 2.0.0-preview.1 (got '$Version')"; exit 1 }
@@ -41,7 +40,7 @@ if ($Publish) {
     git -C $root fetch --quiet origin main
     if ($LASTEXITCODE) { "couldn't reach GitHub: not published"; exit 1 }
     git -C $root merge-base --is-ancestor $commit origin/main
-    if ($LASTEXITCODE) { "push $commit to main first: the preview's tag goes on it"; exit 1 }
+    if ($LASTEXITCODE) { "push $commit to main first: the release's tag goes on it"; exit 1 }
 }
 "building String $Version..."
 # A Rust program keeps the source paths of everything it's built from (for its error messages): the libraries' under
@@ -224,6 +223,7 @@ if ($Full) {
     [IO.File]::WriteAllText((Join-Path $setup.FullName 'version.txt'), "$Version`r`n")
     CopyText 'Install String.cmd' (Join-Path $stage 'Install String.cmd')
     CopyText 'Native read me.txt' (Join-Path $stage 'Read me first.txt')
+    CopyText 'Phone setup.txt' (Join-Path $stage 'Phone setup.txt')
     $rows = @(foreach ($f in (Get-ChildItem -LiteralPath $app -Recurse -File -Force | Sort-Object FullName)) {
         "{0}`t{1}`t{2}" -f (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash, $f.Length, $f.FullName.Substring($app.Length + 1)
     })
@@ -274,7 +274,10 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 "release\$name.zip: {0:N1} MB" -f ((Get-Item $zip).Length / 1MB)
 
 if ($Full) {
-    if (-not (Test-Path -LiteralPath $Key)) { "not signed: no release key at $Key"; exit 0 }
+    if (-not (Test-Path -LiteralPath $Key)) {
+        "not signed: no release key at $Key"
+        exit $(if ($Publish) { 1 } else { 0 })   # installed copies only take a signed release
+    }
     $ecdsa = [Security.Cryptography.ECDsa]::Create()
     try {
         $ecdsa.ImportFromPem([IO.File]::ReadAllText($Key))
@@ -315,12 +318,23 @@ if ($Publish) {
         }
         if ($tagged -ne $commit) { "the tag $tag on GitHub is on $tagged, not on ${commit}: not published"; exit 1 }
         $text = if ($Notes) { $Notes } else { "String $Version" }
-        gh release create $tag $zip --repo $repo --verify-tag --prerelease --title "String $Version" --notes $text
-        if ($LASTEXITCODE) { 'publishing failed'; exit 1 }
-        "published $tag as a pre-release, on $commit"
-        $after = "$(gh api "repos/$repo/releases/latest" --jq .tag_name)".Trim()
-        if ($LASTEXITCODE -or -not $after) { "published, but couldn't read the newest full release back: check that it's still $before"; exit 1 }
-        if ($after -cne $before) { "the newest full release is now $after, not ${before}: installed copies would update to it. Fix it on GitHub now"; exit 1 }
-        "installed copies still update to $after"
+        if ($Full) {
+            # The newest full release is what every installed copy updates to: String.zip and its signature, as latest.
+            if (-not (Test-Path -LiteralPath $sigFile)) { 'a full release has to be signed: not published'; exit 1 }
+            gh release create $tag $zip $sigFile --repo $repo --verify-tag --latest --title "String $Version" --notes $text
+            if ($LASTEXITCODE) { 'publishing failed'; exit 1 }
+            "published $tag as the newest full release, on $commit"
+            $after = "$(gh api "repos/$repo/releases/latest" --jq .tag_name)".Trim()
+            if ($LASTEXITCODE -or $after -cne $tag) { "published, but GitHub's newest full release reads '$after', not ${tag}: check it on GitHub"; exit 1 }
+            "installed copies (on $before) will update to $tag"
+        } else {
+            gh release create $tag $zip --repo $repo --verify-tag --prerelease --title "String $Version" --notes $text
+            if ($LASTEXITCODE) { 'publishing failed'; exit 1 }
+            "published $tag as a pre-release, on $commit"
+            $after = "$(gh api "repos/$repo/releases/latest" --jq .tag_name)".Trim()
+            if ($LASTEXITCODE -or -not $after) { "published, but couldn't read the newest full release back: check that it's still $before"; exit 1 }
+            if ($after -cne $before) { "the newest full release is now $after, not ${before}: installed copies would update to it. Fix it on GitHub now"; exit 1 }
+            "installed copies still update to $after"
+        }
     } finally { Pop-Location }
 }
