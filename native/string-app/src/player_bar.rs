@@ -35,7 +35,16 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     let cy2 = r.top() + 65.;
     let seek_w = c2.min(620.);
     let seek = area(mid - seek_w / 2. + 58., cy2 - 9., seek_w - 116., 18.);
-    let (response, val) = ui::rail(ui, seek, "Seek", (position / duration.max(0.01)) as f32, t);
+    // A release belongs to the widget pressed, including the queue occurrence it showed.
+    let seek_scope = ui.scope_id().with(song.and(v.st.key));
+    let mut seek_ui = ui.new_child(egui::UiBuilder::new().scope_id(seek_scope).max_rect(seek));
+    let (response, val) = ui::rail(
+        &mut seek_ui,
+        seek,
+        "Seek",
+        (position / duration.max(0.01)) as f32,
+        t,
+    );
     let preview = val.map_or(position, |n| f64::from(n) * duration);
     // the lit line along the top edge, brightest where the song has got to
     if duration > 0. {
@@ -153,11 +162,13 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
     {
         v.s.toggle(v.player);
     }
-    if has_song && duration > 0. {
+    if let Some(key) = v.s.bar_song(v.st).and(v.st.key)
+        && duration > 0.
+    {
         if response.clicked_by(egui::PointerButton::Primary)
             || response.drag_stopped_by(egui::PointerButton::Primary)
         {
-            v.s.seek(v.player, preview);
+            v.s.seek_from_bar(v.player, key, preview);
         }
         loop_controls(ui, v, &response, duration);
     }
@@ -406,6 +417,10 @@ mod player_tests {
             serde_json::from_value(json!({"path":"test.wav","title":"Test","duration":200}))
                 .unwrap(),
         );
+        lib.tracks.push(
+            serde_json::from_value(json!({"path":"next.wav","title":"Next","duration":3600}))
+                .unwrap(),
+        );
         let mut s = Session::new(Default::default(), Default::default(), lib);
         assert!(
             s.state
@@ -455,7 +470,11 @@ mod player_tests {
                 show(&mut bar, v);
                 seek = ui
                     .ctx()
-                    .read_response(bar.scope_id().with("Seek"))
+                    .read_response(
+                        bar.scope_id()
+                            .with(v.s.bar_song(v.st).and(v.st.key))
+                            .with("Seek"),
+                    )
                     .unwrap()
                     .rect;
             },
@@ -559,6 +578,32 @@ mod player_tests {
             assert_eq!(v.s.seek_revision, 1);
         });
     }
+    #[test]
+    fn review_releasing_a_seek_on_the_next_track_keeps_its_position() {
+        with_bar(|ctx, v| {
+            let (r, _) = frame(ctx, v, vec![]);
+            let start = r.center();
+            let end = pos2(r.right(), start.y);
+            frame(
+                ctx,
+                v,
+                vec![
+                    Event::PointerMoved(start),
+                    button(start, PointerButton::Primary, true),
+                ],
+            );
+            frame(ctx, v, vec![Event::PointerMoved(end)]);
+            v.s.play_ids(v.player, &["next.wav".into()], 0, Value::Null);
+            v.st.key = Some(1);
+            v.st.duration = Some(3600.);
+            v.st.position = 0.;
+            assert_eq!(v.s.bar_song(v.st).unwrap().id, "next.wav");
+            frame(ctx, v, vec![button(end, PointerButton::Primary, false)]);
+            assert_eq!(v.s.state.queue.pos(), 0.);
+            assert_eq!(v.s.seek_revision, 0);
+        });
+    }
+
     #[test]
     fn spectrum_switch_controls_the_painted_bars() {
         with_bar(|ctx, v| {

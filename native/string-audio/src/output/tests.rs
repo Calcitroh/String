@@ -202,6 +202,29 @@ fn loss_retries_freezes_time_and_restores_playing_or_paused_at_the_new_rate() {
     let same_rate = engine::status(&position, None);
     assert!(!same_rate.playing && same_rate.key == sought.key);
     assert_eq!(same_rate.position, sought.position);
+
+    engine.command(Command::Resume);
+    open(&mut out, &mut engine, 14_001, 44_100);
+    let old = render(&mut engine, 2);
+    out.broken.store(true, Ordering::Relaxed);
+    out.update_with(
+        epoch + Duration::from_secs(15),
+        &mut engine,
+        |_| Err(Error::Output("no device".into())),
+        |_| unreachable!(),
+    );
+    engine.command(Command::Play {
+        track: Track::new(72, &song.0),
+        from: 0.75,
+        start: true,
+    });
+    assert_eq!(engine::status(&position, None).key, old.key);
+    engine.command(Command::Toggle);
+    open(&mut out, &mut engine, 16_000, 48_000);
+    assert!(out.stream.is_none());
+    let cancelled = engine::status(&position, None);
+    assert!(!cancelled.playing && cancelled.key == Some(72));
+    assert!((cancelled.position - 0.75).abs() <= 1. / 44_100.);
 }
 
 #[test]
@@ -338,4 +361,45 @@ fn seek_after_the_last_callback_supersedes_its_queued_finish() {
         1
     );
     assert!(!events.contains(&Event::Stopped));
+}
+
+#[test]
+fn review_loop_restarted_after_finished_accounts_for_the_rendered_rewind() {
+    let position = Arc::new(Position::new());
+    let (a, ar) = deck::rings(8000);
+    let (b, br) = deck::rings(8000);
+    let (mut mixer, link) = Mixer::new(8000, [ar, br], Spectrum::new().shared, position.clone());
+    let mut engine = Engine::new(
+        Box::new(HostEvents(Default::default())),
+        Config::default(),
+        [a, b],
+        link,
+        position.clone(),
+    );
+    let song = Song::new("late-loop");
+    engine.command(Command::Play {
+        track: Track::new(1, &song.0),
+        from: 3.5,
+        start: true,
+    });
+    engine.pump();
+    mixer.render(&mut [0.; 1600], 0);
+    let before = engine::status(&position, None);
+    // The current deck is already primed through EOF. The user sets a loop before
+    // the final callback, and the engine hasn't had a chance to arm the other deck.
+    engine.command(Command::Loop(Some(crate::LoopRange {
+        start: 1.,
+        end: Some(3.),
+    })));
+    mixer.render(&mut [0.; 6600], 0);
+    engine.pump();
+    mixer.render(&mut [0.; 1600], 0);
+    let after = engine::status(&position, None);
+    assert_eq!(after.key, Some(1));
+    assert!((after.position - 1.1).abs() < 0.0001, "{after:?}");
+    let heard = after.position - before.position + after.loop_offset - before.loop_offset;
+    assert!(
+        (heard - 0.5).abs() < 0.0001,
+        "heard {heard} s, {before:?} -> {after:?}"
+    );
 }

@@ -153,7 +153,7 @@ impl Engine {
                 self.failures = 0;
                 self.send(Cmd::Selecting);
                 let fade = if from > 0.0 { self.frames(f.play) } else { 0 };
-                self.play(track, from, start.then_some(fade));
+                self.play(track, from, start.then_some(fade), None);
             }
             Command::Resume => {
                 if self.current.is_some() && !self.playing {
@@ -161,6 +161,21 @@ impl Engine {
                     self.send(Cmd::Transport { play: true, fade });
                     self.playing = true;
                 }
+            }
+            Command::Toggle => {
+                self.command(if self.playing {
+                    Command::Pause
+                } else {
+                    Command::Resume
+                });
+            }
+            Command::RewindPaused => {
+                self.playing = false;
+                self.send(Cmd::Transport {
+                    play: false,
+                    fade: 0,
+                });
+                self.seek(0.);
             }
             Command::Pause => {
                 if self.playing {
@@ -173,6 +188,14 @@ impl Engine {
                 self.stop(self.frames(f.pause));
             }
             Command::Seek(secs) => self.seek(secs),
+            Command::SeekTrack { key, position } => {
+                // The engine and callback can observe a handover on different turns.
+                if self.song().is_some_and(|s| s.track.key == key)
+                    && status(&self.position, None).key == Some(key)
+                {
+                    self.seek(position);
+                }
+            }
             Command::Volume(v) => {
                 self.config.volume = v.clamp(0.0, 1.0);
                 if v > 0.0 {
@@ -226,24 +249,14 @@ impl Engine {
         self.last_handle
     }
 
-    fn open(&mut self, track: &Track) -> Option<Source> {
-        match Source::open(&track.path) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                self.host.event(Event::Failed {
-                    track: track.clone(),
-                    error: e.to_string(),
-                });
-                None
-            }
-        }
-    }
-
     /// Plays from the requested position with the given fade-in, or cues paused.
-    fn play(&mut self, track: Track, from: f64, fade_in: Option<u32>) {
-        let Some(source) = self.open(&track) else {
-            self.failed_selection(&track, fade_in.is_some());
-            return;
+    fn play(&mut self, track: Track, from: f64, fade_in: Option<u32>, loop_end: Option<i64>) {
+        let source = match Source::open(&track.path) {
+            Ok(source) => source,
+            Err(error) => {
+                self.failed_selection(&track, fade_in.is_some(), error);
+                return;
+            }
         };
         let info = source.info();
         let deck = self
@@ -258,11 +271,7 @@ impl Engine {
         let era = match self.feeders[deck].load(source, handle, track.key, from_frame, false) {
             Ok(g) => g,
             Err(e) => {
-                self.host.event(Event::Failed {
-                    track: track.clone(),
-                    error: e.to_string(),
-                });
-                self.failed_selection(&track, fade_in.is_some());
+                self.failed_selection(&track, fade_in.is_some(), e);
                 return;
             }
         };
@@ -292,6 +301,9 @@ impl Engine {
             era,
             out,
             in_: fade_in.unwrap_or(0),
+            loop_rewind: loop_end.map_or(0., |end| {
+                (end - self.feeders[deck].out_pos(from_frame)) as f64 / self.rate as f64
+            }),
         });
         self.cur = Some(deck);
         self.current = Some(handle);
@@ -304,14 +316,22 @@ impl Engine {
         self.fill();
     }
 
-    fn failed_selection(&mut self, track: &Track, start: bool) {
+    fn failed_selection(&mut self, track: &Track, start: bool, error: crate::Error) {
         self.stop(0);
+        self.host.event(Event::Failed {
+            track: track.clone(),
+            error: error.to_string(),
+            selection: true,
+        });
+        // A failed paused cue never reached the end of the queue.
+        if !start {
+            return;
+        }
         self.failures += 1;
-        if start
-            && self.failures < MAX_FAILURES
+        if self.failures < MAX_FAILURES
             && let Some(next) = self.host.next_after(track)
         {
-            self.play(next, 0.0, Some(0));
+            self.play(next, 0.0, Some(0), None);
         } else {
             self.host.event(Event::Stopped);
         }
@@ -383,6 +403,7 @@ impl Engine {
             Err(e) => self.host.event(Event::Failed {
                 track,
                 error: e.to_string(),
+                selection: false,
             }),
         }
     }
@@ -492,6 +513,7 @@ impl Engine {
                 self.host.event(Event::Failed {
                     track,
                     error: err.to_string(),
+                    selection: false,
                 });
             }
         }
@@ -556,7 +578,7 @@ impl Engine {
                 }
                 self.feeders[deck].clear();
             }
-            Evt::Finished { handle } => {
+            Evt::Finished { handle, end } => {
                 if self.current != Some(handle) {
                     return;
                 }
@@ -568,6 +590,7 @@ impl Engine {
                         track,
                         start,
                         self.playing.then(|| self.frames(self.config.fades.loop_in)),
+                        Some(end),
                     );
                     return;
                 }
@@ -582,13 +605,10 @@ impl Engine {
                     None => None,
                 };
                 if let Some(next) = next {
-                    self.play(next, 0.0, self.playing.then_some(0));
+                    self.play(next, 0.0, self.playing.then_some(0), None);
                 } else {
-                    self.play(track, 0.0, None);
-                    // A failed cue already reported its failure and stop.
-                    if self.current.is_some() {
-                        self.host.event(Event::Stopped);
-                    }
+                    self.play(track, 0.0, None, None);
+                    self.host.event(Event::Stopped);
                 }
             }
         }
@@ -659,14 +679,22 @@ impl Engine {
         if wants_crossfade && !self.free[other] {
             return;
         }
-        let Some(source) = self.open(&track) else {
-            self.failures += 1;
-            self.next = if self.failures < MAX_FAILURES {
-                self.host.next_after(&track).map(Next::Want)
-            } else {
-                None
-            };
-            return;
+        let source = match Source::open(&track.path) {
+            Ok(source) => source,
+            Err(error) => {
+                self.host.event(Event::Failed {
+                    track: track.clone(),
+                    error: error.to_string(),
+                    selection: false,
+                });
+                self.failures += 1;
+                self.next = if self.failures < MAX_FAILURES {
+                    self.host.next_after(&track).map(Next::Want)
+                } else {
+                    None
+                };
+                return;
+            }
         };
         let info = source.info();
         let next_len = info.frames.map(|f| f as f64 / info.rate as f64);
@@ -700,6 +728,7 @@ impl Engine {
                 self.host.event(Event::Failed {
                     track,
                     error: e.to_string(),
+                    selection: false,
                 });
                 self.next = None;
                 return;
@@ -781,6 +810,7 @@ impl Engine {
                 song.track.clone(),
                 position,
                 self.playing.then(|| self.frames(self.config.fades.play)),
+                None,
             );
         }
     }

@@ -31,6 +31,16 @@ macro_rules! controls {
             self.send(Command::Resume);
         }
 
+        /// Toggles the loaded song using the engine's current transport intent.
+        pub fn toggle(&$($m)? self) {
+            self.send(Command::Toggle);
+        }
+
+        /// Stops at the first frame of the current song, ready to resume.
+        pub fn rewind_paused(&$($m)? self) {
+            self.send(Command::RewindPaused);
+        }
+
         /// Pauses, fading out.
         pub fn pause(&$($m)? self) {
             self.send(Command::Pause);
@@ -44,6 +54,11 @@ macro_rules! controls {
         /// Moves the current song to `secs`, fading out and in.
         pub fn seek(&$($m)? self, secs: f64) {
             self.send(Command::Seek(secs));
+        }
+
+        /// Seeks only if the queue occurrence displayed at the start of the gesture is still current.
+        pub fn seek_track(&$($m)? self, key: u64, position: f64) {
+            self.send(Command::SeekTrack { key, position });
         }
 
         /// Volume 0..1 (heard as its square).
