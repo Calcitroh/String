@@ -1,4 +1,7 @@
 //! Windows services for the main window.
+pub(crate) mod live_checks;
+#[cfg(test)]
+mod presence_test;
 use crate::{
     Args, Error,
     integration::{
@@ -23,7 +26,7 @@ use string_platform::{
     Hwnd,
     errors_log::ErrorLog,
     instance::{self, Claim, Instance, Names, Signal},
-    media::{MediaButton, MediaControls},
+    media::{AppCommands, MediaButton, MediaControls},
     taskbar::{ThumbButton, ThumbButtons},
     window,
 };
@@ -98,7 +101,9 @@ pub struct Platform {
     receiver: mpsc::Receiver<Command>,
     dialogs: Option<mpsc::Receiver<Dialog>>,
     media: Option<MediaControls>,
+    app_commands: Option<AppCommands>,
     taskbar: Option<ThumbButtons>,
+    live_check: live_checks::Probe,
     transport: Transport,
     pub log: Arc<ErrorLog>,
     pub phone: Phone,
@@ -130,7 +135,9 @@ impl Platform {
             receiver,
             dialogs: None,
             media: None,
+            app_commands: None,
             taskbar: None,
+            live_check: Default::default(),
             transport: Transport::default(),
             log,
             phone: Phone::new(&args.root, smoke),
@@ -171,7 +178,8 @@ impl Platform {
         self.optional("title bar", window::style_title_bar(hwnd));
         window::set_background(hwnd, window::BACKGROUND);
         if self.smoke {
-            return Ok(offscreen(hwnd)?);
+            offscreen(hwnd)?;
+            live_checks::contain_keys(hwnd)?;
         }
         let send = self.sender.clone();
         let ctx = cc.egui_ctx.clone();
@@ -179,17 +187,32 @@ impl Platform {
             let _ = send.send(command);
             ctx.request_repaint();
         };
-        let listener = post.clone();
-        self.instance.listen(move |s| listener(Command::Window(s)));
+        if !self.smoke {
+            let listener = post.clone();
+            self.instance.listen(move |s| listener(Command::Window(s)));
+        }
+        let keys = post.clone();
+        self.app_commands = self.optional(
+            "media keys",
+            AppCommands::new(hwnd, move |b| keys(Command::Media(b))),
+        );
         let buttons = post.clone();
+        let pressed = move |b| buttons(Command::Thumb(b));
         self.taskbar = self.optional(
             "taskbar",
-            ThumbButtons::new(hwnd, move |b| buttons(Command::Thumb(b))),
+            if self.smoke {
+                ThumbButtons::messages_only(hwnd, pressed)
+            } else {
+                ThumbButtons::new(hwnd, pressed)
+            },
         );
         self.media = self.optional(
             "media controls",
             MediaControls::new(hwnd, move |b| post(Command::Media(b))),
         );
+        if self.smoke {
+            return Ok(());
+        }
         if window::restore_placement(
             hwnd,
             &self.root.join("window.json"),
@@ -255,8 +278,8 @@ impl Platform {
     }
 
     pub(crate) fn smoke_play_pause(&self) {
-        if self.smoke {
-            let _ = self.sender.send(Command::Thumb(ThumbButton::PlayPause));
+        if let Some(hwnd) = self.hwnd.filter(|_| self.smoke) {
+            live_checks::thumbnail(hwnd, 0x5302);
         }
     }
 
@@ -285,7 +308,8 @@ impl Platform {
                 command => {
                     if let Some((s, p)) = playback.as_mut() {
                         match command {
-                            Command::Thumb(ThumbButton::PlayPause) => s.toggle(p),
+                            Command::Thumb(ThumbButton::PlayPause)
+                            | Command::Media(MediaButton::Toggle) => s.toggle(p),
                             Command::Thumb(ThumbButton::Next)
                             | Command::Media(MediaButton::Next) => s.next(p),
                             Command::Thumb(ThumbButton::Previous)

@@ -11,7 +11,7 @@ use crate::engine::{self, Engine};
 use crate::mixer::{Mixer, Position};
 use crate::output::{self, Output};
 use crate::spectrum::Spectrum;
-use crate::types::{Command, Config, Event, Host, LoopRange, Status, Track};
+use crate::types::{Command, Config, Host, LoopRange, Status, Track};
 
 /// The calls both players share (`&self` for the threaded one, `&mut self` offline).
 macro_rules! controls {
@@ -155,7 +155,7 @@ fn run(
     let (mixer, link) = Mixer::new(rate, [ra, rb], spectrum, position.clone());
     let mixer = Arc::new(Mutex::new(mixer));
     let mut engine = Engine::new(host, config, [fa, fb], link, position);
-    let mut out = Output::new(mixer.clone(), epoch);
+    let mut out = Output::new(mixer, epoch);
     loop {
         let wait = if engine.busy() {
             Duration::from_millis(3)
@@ -178,23 +178,6 @@ fn run(
             Err(RecvTimeoutError::Timeout) => {}
         }
         engine.pump();
-        if out.needs_reopen(engine.playing()) {
-            out.close();
-            if let Ok((name, new_rate)) = out.open() {
-                let old_rate = mixer.lock().map(|m| m.rate()).unwrap_or(new_rate);
-                if new_rate != old_rate {
-                    if let Ok(mut m) = mixer.lock() {
-                        m.set_rate(new_rate);
-                        m.reset();
-                    }
-                    engine.resync(new_rate);
-                }
-                engine.notify(Event::Output {
-                    name,
-                    rate: new_rate,
-                });
-            }
-        }
+        out.update(&mut engine);
     }
-    out.close();
 }

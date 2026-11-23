@@ -42,6 +42,7 @@ pub struct ThumbButtons {
 
 struct Inner {
     hwnd: HWND,
+    publish: bool,
     created: u32,
     list: RefCell<Option<ITaskbarList3>>,
     added: Cell<bool>,
@@ -57,6 +58,22 @@ impl ThumbButtons {
         hwnd: Hwnd,
         on_press: impl FnMut(ThumbButton) + 'static,
     ) -> io::Result<ThumbButtons> {
+        Self::attach(hwnd, on_press, true)
+    }
+
+    /// The same window procedure on the off-screen self-test window, without adding shell buttons.
+    pub fn messages_only(
+        hwnd: Hwnd,
+        on_press: impl FnMut(ThumbButton) + 'static,
+    ) -> io::Result<Self> {
+        Self::attach(hwnd, on_press, false)
+    }
+
+    fn attach(
+        hwnd: Hwnd,
+        on_press: impl FnMut(ThumbButton) + 'static,
+        publish: bool,
+    ) -> io::Result<Self> {
         com::init();
         let h = hwnd.get();
         let created = unsafe { RegisterWindowMessageW(w!("TaskbarButtonCreated")) };
@@ -68,6 +85,7 @@ impl ThumbButtons {
         let light = light_taskbar();
         let inner = Box::new(Inner {
             hwnd: h,
+            publish,
             created,
             list: RefCell::new(None),
             added: Cell::new(false),
@@ -144,7 +162,7 @@ impl Inner {
 
     /// Adds the buttons, once the window has a taskbar button (a hidden window has none: it comes when shown).
     fn add(&self) {
-        if !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
+        if !self.publish || !unsafe { IsWindowVisible(self.hwnd) }.as_bool() {
             return;
         }
         let Some(list) = self.list() else { return };

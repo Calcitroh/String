@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::deck::{Feeder, UNKNOWN};
-use crate::mixer::{Cmd, Evt, FLAG_PLAYING, FLAG_SONG, Handover, Link, Position};
+use crate::mixer::{Cmd, Evt, FLAG_NO_OUTPUT, FLAG_PLAYING, FLAG_SONG, Handover, Link, Position};
 use crate::source::Source;
 use crate::types::{Command, Config, Event, Host, LoopRange, Status, Track};
 
@@ -25,6 +25,14 @@ struct Song {
     /// The source's sample rate and playable length in its frames.
     rate: u32,
     frames: Option<u64>,
+    /// The last explicit load or seek, in case the output is lost before it renders it.
+    request: Option<RequestedPosition>,
+}
+
+struct RequestedPosition {
+    deck: usize,
+    era: u32,
+    seconds: f64,
 }
 
 impl Song {
@@ -253,6 +261,11 @@ impl Engine {
                 track,
                 rate: info.rate,
                 frames: info.frames,
+                request: Some(RequestedPosition {
+                    deck,
+                    era,
+                    seconds: from_frame as f64 / info.rate as f64,
+                }),
             },
         );
         // whatever waited on the other deck belonged to the song before (the mixer lets it go)
@@ -333,6 +346,11 @@ impl Engine {
         };
         match era {
             Ok(era) => {
+                self.songs.get_mut(&h).unwrap().request = Some(RequestedPosition {
+                    deck,
+                    era,
+                    seconds: frame as f64 / rate as f64,
+                });
                 let f = self.config.fades;
                 let (out, in_) = (self.frames(f.seek_out), self.frames(f.seek_in));
                 self.send(Cmd::Seek {
@@ -606,6 +624,7 @@ impl Engine {
             track: track.clone(),
             rate: info.rate,
             frames: info.frames,
+            request: None,
         };
         let source = if crossfade {
             source
@@ -689,7 +708,7 @@ impl Engine {
     }
 
     /// The output's rate changed (another device): what played starts again where it was.
-    pub fn resync(&mut self, rate: u32) {
+    pub fn resync(&mut self, rate: u32, rendered_eras: [u32; 2]) {
         let st = status(&self.position, None);
         self.rate = rate;
         for f in &mut self.feeders {
@@ -700,9 +719,13 @@ impl Engine {
         self.next = None;
         self.loop_deck = None;
         self.asked = false;
-        if let Some(track) = self.song().map(|s| s.track.clone()) {
-            let playing = self.playing;
-            self.play(track, st.position, playing);
+        if let Some(song) = self.song() {
+            let position = song
+                .request
+                .as_ref()
+                .filter(|r| (r.era.wrapping_sub(rendered_eras[r.deck]) as i32) > 0)
+                .map_or(st.position, |r| r.seconds);
+            self.play(song.track.clone(), position, self.playing);
         }
     }
 }
@@ -722,6 +745,7 @@ pub(crate) fn status(position: &Position, now_ns: Option<u64>) -> Status {
     let mut position = w[2] as f64 / rate;
     if let Some(now) = now_ns
         && playing
+        && w[1] & FLAG_NO_OUTPUT == 0
     {
         position += (now as f64 - w[5] as f64) / 1e9;
     }
