@@ -133,22 +133,33 @@ pub const SPOTIFY: Case = Case {
     },
     ready: spotify_ready,
 };
-/// After the Spotify step: Top artists and Top songs expanded, so a list longer than ten draws its rows past ten.
+/// Both expanded lists must paint a rank past ten in the same frame.
 pub const EXPANDED: Case = Case {
     name: "stats-top-expanded",
     prepare: |v| {
-        select(v, "week", false);
+        let at = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        for n in 1..=12 {
+            let track = Track(
+                format!("smoke-rank-{n}"),
+                format!("Fixture track {n:02}"),
+                format!("Fixture artist {n:02}"),
+            );
+            v.s.listening.add(&track, f64::from(n), at);
+        }
+        v.s.listening_dirty = true;
+        v.views.stats.snapshot = None;
+        select(v, "all", false);
         v.s.set_field(more_field(true), true.into());
         v.s.set_field(more_field(false), true.into());
         v.views.stats.reveal_top = true;
-        v.views.stats.top_shown = [0; 2];
     },
     ready: |v| {
-        let Some(s) = v.views.stats.snapshot.as_ref() else {
-            return false;
-        };
-        let want = [s.artists.len(), s.tracks.len()].map(|n| n.min(TOP_EXPANDED));
-        s.tracks.len() > TOP && v.views.stats.top_shown == want
+        v.s.field(more_field(true)) == true
+            && v.s.field(more_field(false)) == true
+            && v.views.stats.expanded_row_painted == [true; 2]
     },
 };
 enum Run {

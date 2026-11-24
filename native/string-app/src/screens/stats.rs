@@ -392,10 +392,10 @@ pub struct StatsView {
     phone_visible: bool,
     /// Asking before the Spotify history is taken out.
     confirm_remove: bool,
-    /// Scroll Top artists into view once (the self-test).
+    /// Scroll the expanded ranks into view once for the self-test.
     reveal_top: bool,
-    /// Rows drawn in Top artists and Top songs in the last frame.
-    top_shown: [usize; 2],
+    /// Whether a rank past ten was painted in Top artists and Top songs this frame.
+    expanded_row_painted: [bool; 2],
 }
 impl StatsView {
     /// Exchange account choices and manual sync requests with the phone scheduler.
@@ -408,6 +408,7 @@ impl StatsView {
     }
 }
 pub fn show(ui: &mut Ui, v: &mut View<'_>) {
+    v.views.stats.expanded_row_painted = [false; 2];
     let &(kind, key, name, _) = KINDS
         .iter()
         .find(|(_, k, _, _)| v.s.field("statsKind") == *k)
@@ -467,17 +468,13 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                 let rows = &all[..counts[which]];
                 panel().show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    if artists && std::mem::take(&mut v.views.stats.reveal_top) {
-                        ui.scroll_to_cursor(Some(egui::Align::TOP));
-                    }
                     let button = (all.len() > TOP).then_some(if more[which] { "Collapse" } else { "Expand" });
                     if panel_header(ui, title, &name.to_lowercase(), button) {
                         v.s.set_field(more_field(artists), (!more[which]).into());
                     }
-                    v.views.stats.top_shown[which] = rows.len();
                     if rows.is_empty() { ui.label("Nothing yet"); }
                     for (rank, item) in rows.iter().enumerate() {
-                        if rank_row(ui, v, rank, item, rows[0].seconds) && let Some(id) = &item.key {
+                        if rank_row(ui, v, which, rank, item, rows[0].seconds) && let Some(id) = &item.key {
                             if artists { v.go(Route::Artist(id.clone())); }
                             else { play_ranked_song(v, rows, id, key, name); }
                         }
@@ -673,9 +670,16 @@ fn panel_header(ui: &mut Ui, title: &str, note: &str, button: Option<&str>) -> b
         re.clicked()
     })
 }
-fn rank_row(ui: &mut Ui, v: &mut View<'_>, i: usize, item: &Rank, max: f64) -> bool {
+fn rank_row(ui: &mut Ui, v: &mut View<'_>, which: usize, i: usize, item: &Rank, max: f64) -> bool {
     let (r, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), 54.), egui::Sense::click());
+    if which == 0 && i == TOP + 1 && std::mem::take(&mut v.views.stats.reveal_top) {
+        ui.scroll_to_rect_animation(
+            r,
+            Some(egui::Align::BOTTOM),
+            egui::style::ScrollAnimation::none(),
+        );
+    }
     if !ui.is_rect_visible(r) {
         return false;
     }
@@ -745,6 +749,9 @@ fn rank_row(ui: &mut Ui, v: &mut View<'_>, i: usize, item: &Rank, max: f64) -> b
     let fill = bar.with_max_x(x + w * (item.seconds / max.max(0.1)) as f32);
     ui::glow(p, fill, 2., 8., v.tint.ink(if text { 0.3 } else { 0.12 }));
     p.rect_filled(fill, 2, v.tint.ink(if text { 0.75 } else { 0.35 }));
+    if i >= TOP && ui.clip_rect().contains(r.center()) {
+        v.views.stats.expanded_row_painted[which] = true;
+    }
     if item.key.is_some() {
         response
             .on_hover_cursor(egui::CursorIcon::PointingHand)
