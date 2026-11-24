@@ -806,3 +806,139 @@ fn a_guest_whose_name_is_a_common_word_still_folds_away() {
     )]));
     assert_eq!(secs_of(&out, "lib/home.flac"), 60.);
 }
+
+#[test]
+fn leaving_out_another_guests_copy_never_leaves_a_stranger_as_the_match() {
+    for flip in [false, true] {
+        let mut library = vec![
+            song("ben/home.flac", "Home (feat. Ben)", "Mira & Ben"),
+            song("sol/home.flac", "Home", "Mira & Sol"),
+        ];
+        if flip {
+            library.reverse();
+        }
+        let m = Matcher::new(library);
+        let (out, resolved) = m.resolve(&history_on(&[(
+            "1",
+            "Home (feat. Cora)",
+            "Mira",
+            "Singles",
+            60.,
+        )]));
+        assert_eq!(resolved.matched_seconds, 0., "{flip}");
+        assert_eq!(secs_of(&out, "spotify:track:1"), 60., "{flip}");
+    }
+}
+
+#[test]
+fn the_same_guests_in_another_order_are_the_same_guests() {
+    let m = Matcher::new([
+        on_album(
+            "rin/home.flac",
+            "Home (feat. Ena & Yui)",
+            "Mio & Rin",
+            "Duets",
+        ),
+        on_album("sol/home.flac", "Home", "Mio & Sol", "Other Duets"),
+    ]);
+    let (out, _) = m.resolve(&history_on(&[(
+        "1",
+        "Home (feat. Yui & Ena)",
+        "Mio",
+        "Duets",
+        60.,
+    )]));
+    assert_eq!(secs_of(&out, "rin/home.flac"), 60.);
+}
+
+#[test]
+fn one_artist_alone_never_takes_a_song_by_a_name_with_a_mark_in_it() {
+    let m = Matcher::new([
+        song("nw/other.flac", "Other", "North West"),
+        song("slash/signal.flac", "Signal", "North/West"),
+        song("gh/home.flac", "Home", "Glass/House"),
+        song("glass-house/pier.flac", "Pier", "Glass House"),
+        song("plus/ode.flac", "Ode", "North+"),
+        song("nova/quay.flac", "Quay", "&Nova"),
+    ]);
+    let h = history_on(&[
+        ("1", "Signal", "North West", "Album", 60.),
+        ("2", "Signal", "North&West", "Album", 10.),
+        ("3", "Home", "Glass House", "Album", 30.),
+        ("4", "Ode", "North", "Album", 20.),
+        ("5", "Quay", "Nova", "Album", 5.),
+    ]);
+    let (_, resolved) = m.resolve(&h);
+    assert_eq!(resolved.matched_seconds, 0.);
+}
+
+#[test]
+fn a_named_remaster_year_picks_that_remaster() {
+    let m = Matcher::new([
+        on_album("r/2009.flac", "Home - 2009 Remaster", "North", "Home Again"),
+        on_album("r/2018.flac", "Home - 2018 Remaster", "North", "Home Again"),
+    ]);
+    let h = linked(
+        &[
+            ("1", "Home - 2018 Remaster", "North", "Home Again", 60.),
+            ("2", "Home - 2018 Remaster", "ノース", "Home Again", 30.),
+        ],
+        serde_json::json!([artist_link("ノース", "North")]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "r/2018.flac"), 90.);
+}
+
+#[test]
+fn a_named_guest_outweighs_the_album() {
+    let m = Matcher::new([
+        on_album("mira/solo.flac", "Home", "Mira", "Best Mixes 2024"),
+        on_album("mira/cora.flac", "Home (feat. Cora)", "Mira", "Duets"),
+    ]);
+    let h = linked(
+        &[
+            ("1", "Home (feat. Cora)", "Mira", "Best Mixes 2024", 60.),
+            ("2", "Home (feat. Cora)", "ミラ", "Best Mixes 2024", 30.),
+        ],
+        serde_json::json!([artist_link("ミラ", "Mira")]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "mira/cora.flac"), 90.);
+}
+
+#[test]
+fn a_long_dash_in_an_album_is_a_hyphen() {
+    let m = Matcher::new([
+        on_album("live/south.flac", "Home", "Mio", "Live - South"),
+        on_album("live/north.flac", "Home", "Mio", "Live - North"),
+    ]);
+    let h = linked(
+        &[
+            ("1", "Home", "Mio", "Live \u{2013} North", 60.),
+            ("2", "Home (Encore)", "Fan", "Live \u{2014} North", 30.),
+        ],
+        serde_json::json!([
+            {"title": "Home (Encore)", "artist": "Fan", "as": {"title": "Home", "artist": "Mio"}},
+        ]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "live/north.flac"), 90.);
+}
+
+#[test]
+fn a_take_named_after_a_guest_is_another_recording() {
+    let m = Matcher::new([song("lib/home.flac", "Home", "North")]);
+    let h = history_on(&[
+        ("1", "Home (feat. Ben, Take 2)", "North", "Album", 60.),
+        (
+            "2",
+            "Home (feat. Ben, alternate take)",
+            "North",
+            "Album",
+            30.,
+        ),
+    ]);
+    let (out, resolved) = m.resolve(&h);
+    assert_eq!(resolved.matched_seconds, 0.);
+    assert_eq!(secs_of(&out, "lib/home.flac"), 0.);
+}

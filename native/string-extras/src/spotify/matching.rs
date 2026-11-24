@@ -34,9 +34,12 @@ impl From<Track> for LibrarySong {
 struct Keys {
     /// `normalize_title`: featured artists and remaster notes gone.
     title: String,
+    /// The title as written, as `spelling` ("home - 2018 remaster", not "home - 2009 remaster").
+    exact: String,
     /// The title as written, remaster notes gone, as `spelling` ("home feat cora", not "home feat ben").
     written: String,
-    /// The guest a "(feat. …)" or "(with …)" names, normalized; empty when there is none.
+    /// The guests a "(feat. …)" or "(with …)" names, normalized and in order ("ena & yui" for "Yui & Ena"); empty
+    /// when there are none.
     guest: String,
     /// `main_artist` of the credit.
     main: String,
@@ -56,6 +59,7 @@ impl Keys {
         let marked = artist.contains(|c: char| MARKS.contains(&c) && c != '-');
         Keys {
             title: normalize_title(title),
+            exact: spelling(title),
             written: spelling(&without_remaster(title)),
             guest: guest(title),
             solo: !marked && lead.is_empty() && normalize_text(artist) == main,
@@ -136,13 +140,16 @@ impl Matcher {
         (!keys.title.is_empty()).then_some(keys)
     }
 
-    /// Of `found`, the song that agrees most with `p`: the same whole credit first, then the same album (the live
-    /// album's copy for a live play), then the same title as written ("(feat. Cora)" over "(feat. Ben)"); library
-    /// order between copies that agree as much. Songs naming another guest than the play are never chosen.
+    /// Of `found`, the song that agrees most with `p`: the same whole credit first, then the guest the play names,
+    /// then the same album (the live album's copy for a live play), then the title exactly as written ("Home - 2018
+    /// Remaster"), then as written without remaster notes ("(feat. Cora)" over "(feat. Ben)"); library order between
+    /// copies that agree as much. Songs naming another guest than the play are never chosen.
     fn best(&self, found: &[usize], credit: &str, p: &Keys) -> Option<&Track> {
         let score = |c: &Keys| {
-            4 * u8::from(c.credit == credit)
-                + 2 * u8::from(!p.album.is_empty() && c.album == p.album)
+            16 * u8::from(c.credit == credit)
+                + 8 * u8::from(!p.guest.is_empty() && c.guest == p.guest)
+                + 4 * u8::from(!p.album.is_empty() && c.album == p.album)
+                + 2 * u8::from(c.exact == p.exact)
                 + u8::from(c.written == p.written)
         };
         found
@@ -162,6 +169,7 @@ impl Matcher {
             // A song link is the person's own decision: the song it names, on the play's album if it has copies.
             let named = Keys {
                 title: String::new(),
+                exact: to.0.clone(),
                 written: to.0.clone(),
                 guest: String::new(),
                 main: String::new(),
@@ -202,15 +210,23 @@ impl Matcher {
         if p.main.is_empty() {
             return None;
         }
+        // One artist alone takes their own songs or a duet they lead ("North" takes "North & South", never
+        // "North/West" or "North+"); a credit joining names takes its lead's own songs.
         let fits = |c: &Keys| {
-            p.solo || (c.solo && !p.lead.is_empty() && normalize_text(&c.credit) == p.lead)
+            if p.solo {
+                c.solo || c.lead == p.main
+            } else {
+                c.solo && !p.lead.is_empty() && normalize_text(&c.credit) == p.lead
+            }
         };
+        // Which credits it could be is decided before songs naming other guests are left out (`best` leaves them
+        // out): leaving out one credit's copy never makes another credit the match.
         let found: Vec<usize> = self
             .by_artist
             .get(&(p.title.clone(), p.main.clone()))?
             .iter()
             .copied()
-            .filter(|&i| fits(&self.songs[i].keys) && !self.songs[i].keys.guests_differ(p))
+            .filter(|&i| fits(&self.songs[i].keys))
             .collect();
         let credits = |set: &[usize]| -> HashSet<&str> {
             set.iter()
@@ -370,6 +386,10 @@ fn fold(s: &str, marks: &[char]) -> String {
             }
             _ => "",
         };
+        let c = match c {
+            '\u{2013}' | '\u{2014}' if marks.contains(&'-') => '-',
+            c => c,
+        };
         if marks.contains(&c) {
             if !space && !out.is_empty() {
                 out.push(' ');
@@ -427,8 +447,15 @@ fn guest(title: &str) -> String {
             continue;
         };
         let inner = text[start + 1..start + len].trim();
-        if let Some(name) = CREDITS.iter().find_map(|p| inner.strip_prefix(p)) {
-            return normalize_text(name);
+        if let Some(names) = CREDITS.iter().find_map(|p| inner.strip_prefix(p)) {
+            let mut guests: Vec<String> = names
+                .split([',', '&'])
+                .flat_map(|n| n.split(" and "))
+                .map(normalize_text)
+                .filter(|n| !n.is_empty())
+                .collect();
+            guests.sort();
+            return guests.join(" & ");
         }
     }
     String::new()
@@ -487,8 +514,13 @@ fn removable_group(text: &str, credits: bool) -> Option<(usize, usize)> {
         let version = inner
             .split(|c: char| !c.is_alphanumeric())
             .any(|w| VERSION_WORDS.contains(&w))
-            || inner.contains(['\u{2013}', '\u{2014}', '/'])
-            || inner.contains(" - ");
+                        || inner.contains(['\u{2013}', '\u{2014}', '/'])
+            || inner.contains(" - ")
+            // "(feat. Ben, Take 2)", "(feat. Ben, alternate take)": after a comma, "take" names a take, not a guest.
+            || inner.split_once(',').is_some_and(|(_, rest)| {
+                rest.split(|c: char| !c.is_alphanumeric())
+                    .any(|w| matches!(w, "take" | "alternate"))
+            });
         if (credit && !version) || is_remaster_note(inner) {
             return Some((start, start + len + 1));
         }
