@@ -133,6 +133,24 @@ pub const SPOTIFY: Case = Case {
     },
     ready: spotify_ready,
 };
+/// After the Spotify step: Top artists and Top songs expanded, so a list longer than ten draws its rows past ten.
+pub const EXPANDED: Case = Case {
+    name: "stats-top-expanded",
+    prepare: |v| {
+        select(v, "week", false);
+        v.s.set_field(more_field(true), true.into());
+        v.s.set_field(more_field(false), true.into());
+        v.views.stats.reveal_top = true;
+        v.views.stats.top_shown = [0; 2];
+    },
+    ready: |v| {
+        let Some(s) = v.views.stats.snapshot.as_ref() else {
+            return false;
+        };
+        let want = [s.artists.len(), s.tracks.len()].map(|n| n.min(TOP_EXPANDED));
+        s.tracks.len() > TOP && v.views.stats.top_shown == want
+    },
+};
 enum Run {
     Start,
     Sent(Instant, Expect),

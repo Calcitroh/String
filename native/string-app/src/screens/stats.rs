@@ -35,6 +35,9 @@ const KINDS: [(PeriodKind, &str, &str, &str); 5] = [
     (All, "all", "All time", ""),
 ];
 const REFRESH: Duration = Duration::from_secs(20);
+/// Rows in Top artists and Top songs, and with Expand.
+const TOP: usize = 10;
+const TOP_EXPANDED: usize = 50;
 
 fn duration(seconds: f64, short: bool) -> String {
     let seconds = seconds.round() as u64;
@@ -298,7 +301,7 @@ impl Snapshot {
         let artists = range
             .artists
             .into_iter()
-            .take(10)
+            .take(TOP_EXPANDED)
             .map(|(name, seconds)| {
                 let key = norm(&name);
                 let group = models.catalog.artists.iter().find(|g| g.key == key);
@@ -325,7 +328,7 @@ impl Snapshot {
         let tracks = range
             .tracks
             .into_iter()
-            .take(10)
+            .take(TOP_EXPANDED)
             .map(|(t, seconds)| {
                 let song = models.by_id.get(&t.0);
                 let (name, artist) = song.map_or((t.1.as_str(), t.2.as_str()), |s| {
@@ -389,6 +392,10 @@ pub struct StatsView {
     phone_visible: bool,
     /// Asking before the Spotify history is taken out.
     confirm_remove: bool,
+    /// Scroll Top artists into view once (the self-test).
+    reveal_top: bool,
+    /// Rows drawn in Top artists and Top songs in the last frame.
+    top_shown: [usize; 2],
 }
 impl StatsView {
     /// Exchange account choices and manual sync requests with the phone scheduler.
@@ -446,12 +453,28 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             spotify_panel::show(ui, v);
             ui.add_space(18.);
             let side_by_side = ui.available_width() >= 698.;
-            let min_rows = if side_by_side { s.artists.len().max(s.tracks.len()) } else { 0 };
+            let expanded = |artists: bool| v.s.field(more_field(artists)) == true;
+            let more = [expanded(true), expanded(false)];
+            let shown = |artists: bool, rows: &[Rank]| {
+                rows.len().min(if more[usize::from(!artists)] { TOP_EXPANDED } else { TOP })
+            };
+            let counts = [shown(true, &s.artists), shown(false, &s.tracks)];
+            // Side by side, the two panels end level unless only one of them is expanded.
+            let min_rows = if side_by_side && more[0] == more[1] { counts[0].max(counts[1]) } else { 0 };
             let mut ranks = |ui: &mut Ui, artists: bool| {
-                let (title, rows) = if artists { ("Top artists", &s.artists) } else { ("Top songs", &s.tracks) };
+                let (title, all) = if artists { ("Top artists", &s.artists) } else { ("Top songs", &s.tracks) };
+                let which = usize::from(!artists);
+                let rows = &all[..counts[which]];
                 panel().show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
-                    panel_header(ui, title, &name.to_lowercase(), None);
+                    if artists && std::mem::take(&mut v.views.stats.reveal_top) {
+                        ui.scroll_to_cursor(Some(egui::Align::TOP));
+                    }
+                    let button = (all.len() > TOP).then_some(if more[which] { "Collapse" } else { "Expand" });
+                    if panel_header(ui, title, &name.to_lowercase(), button) {
+                        v.s.set_field(more_field(artists), (!more[which]).into());
+                    }
+                    v.views.stats.top_shown[which] = rows.len();
                     if rows.is_empty() { ui.label("Nothing yet"); }
                     for (rank, item) in rows.iter().enumerate() {
                         if rank_row(ui, v, rank, item, rows[0].seconds) && let Some(id) = &item.key {
@@ -476,6 +499,15 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             ui.add_space(18.);
             phone(ui, v, &s.phone);
         });
+}
+
+/// The saved field that says whether Top artists or Top songs is expanded.
+fn more_field(artists: bool) -> &'static str {
+    if artists {
+        "statsMoreArtists"
+    } else {
+        "statsMoreSongs"
+    }
 }
 
 fn play_ranked_song(v: &mut View<'_>, rows: &[Rank], id: &str, period: &str, name: &str) {
@@ -521,7 +553,11 @@ fn periods(ui: &mut Ui, v: &mut View<'_>, snapshot: &Snapshot) {
             p.rect(
                 r,
                 0,
-                if selected { v.tint.ink(0.06) } else { STATS_PANEL },
+                if selected {
+                    v.tint.ink(0.06)
+                } else {
+                    STATS_PANEL
+                },
                 (1., border),
                 StrokeKind::Inside,
             );
@@ -600,7 +636,14 @@ fn panel_header(ui: &mut Ui, title: &str, note: &str, button: Option<&str>) -> b
         font("HUD", 12.),
         TEXT,
     );
-    let end = r.right() - if button.is_some() { 67. } else { 0. };
+    // Wide enough for its label: "Collapse" is longer than "Table".
+    let width = button.map_or(0., |b| {
+        let label = ui
+            .painter()
+            .layout_no_wrap(b.to_uppercase(), font("HUD", 11.), SECONDARY);
+        (label.size().x + 20.).max(57.)
+    });
+    let end = r.right() - if button.is_some() { width + 10. } else { 0. };
     let n = ui.painter().text(
         pos2(end, r.center().y),
         Align2::RIGHT_CENTER,
@@ -614,8 +657,9 @@ fn panel_header(ui: &mut Ui, title: &str, note: &str, button: Option<&str>) -> b
     }
     ui.add_space(13.);
     button.is_some_and(|b| {
-        let rect = area(r.right() - 57., r.top(), 57., 26.);
-        let re = ui::hit(ui, rect, b, b);
+        let rect = area(r.right() - width, r.top(), width, 26.);
+        // Keyed by the panel too: both top lists have an Expand.
+        let re = ui::hit(ui, rect, (title, b), b);
         if re.hovered() {
             ui.painter().rect_filled(rect, 0, RAISED);
         }

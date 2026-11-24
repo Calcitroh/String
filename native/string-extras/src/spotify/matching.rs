@@ -65,13 +65,14 @@ impl Matcher {
         }
     }
 
-    /// A play's library song: the same title by the same main artist, else the same title on the same album (the
-    /// same recording, its artist spelled another way), else the same title by the library artist `aliases` says
-    /// this spelling is.
+    /// A play's library song: the song a link names, else the same title by the same main artist, else the same
+    /// title on the same album (the same recording, its artist spelled another way), else the same title by the
+    /// library artist `aliases` says this spelling is.
     fn find(
         &self,
         history: &Listening,
         t: &Track,
+        links: &Links,
         aliases: &HashMap<String, String>,
     ) -> Option<&Track> {
         let title = normalize_title(&t.1);
@@ -80,6 +81,12 @@ impl Matcher {
             return None;
         }
         let artist = main_artist(&t.2);
+        if let Some(song) = links
+            .get(&(title.clone(), artist.clone()))
+            .and_then(|to| self.songs.get(to))
+        {
+            return Some(song);
+        }
         if let Some(song) = self.songs.get(&(title.clone(), artist.clone())) {
             return Some(song);
         }
@@ -127,10 +134,11 @@ impl Matcher {
     }
 
     pub fn resolve(&self, history: &Listening) -> (Listening, Resolved) {
+        let links = links(history);
         let aliases = self.aliases(history);
         let mut matched = HashSet::new();
         let out = history.remap(|t| {
-            if let Some(song) = self.find(history, t, &aliases) {
+            if let Some(song) = self.find(history, t, &links, &aliases) {
                 matched.insert(song.0.clone());
                 return song.clone();
             }
@@ -156,6 +164,28 @@ impl Matcher {
         }
         (out, resolved)
     }
+}
+
+/// The history's own top-level key for links set by hand.
+const LINKS: &str = "sameAs";
+/// (title, main artist) of a Spotify song → (title, main artist) of the library song it counts as, normalized.
+type Links = HashMap<(String, String), (String, String)>;
+
+/// Links set by hand in the history: `"sameAs": [{ "title", "artist", "as": { "title", "artist" } }]`, for a
+/// recording that is the same song by another name (a re-upload, a cover the person counts as the original). Kept by
+/// imports like any top-level key; a link that isn't whole is passed over.
+fn links(history: &Listening) -> Links {
+    let key = |v: &serde_json::Value| -> Option<(String, String)> {
+        let title = normalize_title(v.get("title")?.as_str()?);
+        let artist = main_artist(v.get("artist")?.as_str()?);
+        (!title.is_empty()).then_some((title, artist))
+    };
+    let Some(list) = history.top_field(LINKS).and_then(|v| v.as_array()) else {
+        return Links::new();
+    };
+    list.iter()
+        .filter_map(|link| Some((key(link)?, key(link.get("as")?)?)))
+        .collect()
 }
 
 /// An album that can tell recordings apart: named, and not a single named after its song.

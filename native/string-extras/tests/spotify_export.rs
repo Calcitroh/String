@@ -370,6 +370,26 @@ fn a_newer_export_adds_only_newer_plays() {
 }
 
 #[test]
+fn a_newer_export_keeps_links_set_by_hand() {
+    let tmp = tempdir().unwrap();
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    fs::create_dir_all(&a).unwrap();
+    fs::create_dir_all(&b).unwrap();
+    fs::write(a.join(AUDIO), json_bytes(&two_plays())).unwrap();
+    let mut rows = two_plays();
+    rows.push(row("2021-06-01T10:00:00Z", 3, 60_000));
+    fs::write(b.join(AUDIO), json_bytes(&rows)).unwrap();
+    let mut h = SpotifyHistory::default();
+    run(&[a], &mut h).unwrap();
+    let links =
+        json!([{"title": "Song 1", "artist": "Artist A", "as": {"title": "Song", "artist": "B"}}]);
+    h.0.set_top_field("sameAs", links.clone());
+    run(&[b], &mut h).unwrap();
+    assert_eq!(h.0.top_field("sameAs"), Some(&links));
+}
+
+#[test]
 fn an_older_export_adds_nothing() {
     let tmp = tempdir().unwrap();
     let new = tmp.path().join("new");

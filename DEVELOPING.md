@@ -296,14 +296,26 @@ per step; `--data` takes a copy of a real profile too. Without `--smoke-test`, `
 folder (its backups stay inside it), and it shares the single-instance names, so close any other String first.
 Its `stats-spotify` step imports the export `STRING_SMOKE_SPOTIFY_EXPORT` names (else a small made-up one, unless the
 profile already has a Spotify history) the way a drop on Stats does, and writes its numbers to `stats-spotify.json`;
-an import that fails, or a made-up history that doesn't come in whole, fails the self-test.
+an import that fails, or a made-up history that doesn't come in whole, fails the self-test. Its `stats-top-expanded`
+step expands Top artists and Top songs and checks they draw past ten rows.
 
 Stats can include a Spotify history (Spotify's "Extended streaming history" export) from `<data>\spotify.json`, a
 document of its own in `listening.json`'s shape: written only by an import, read on a worker at startup, never touched
 by 1.x. Stats' "Spotify history" panel takes the export dropped on the page or chosen there (a drop is sorted on a
 worker: a history to the import, music to the library); a newer export adds only later plays, and Remove sets the
-file aside in the backup folder. Plays are matched when Stats reads them, not stored: normalized title and main artist
-to a library song, artists merged by name, matched again when song names change.
+file aside in the backup folder. Plays are matched when Stats reads them, not stored, and again when song names or
+albums change (`string-extras\src\spotify\matching.rs`):
+- the same normalized title and main artist is that library song;
+- else the same title on the same album (not a single named after its song), whatever the artist credit: the same
+  recording, its artist spelled another way (a name in Japanese, a label's credit);
+- two or more such songs make a Spotify spelling one library artist (the one with the most, never a tie): its other
+  plays match by title, and Stats shows the library's spelling;
+- other plays keep Spotify's names, with an artist of the same normalized name shown under the library's spelling;
+- `spotify.json` may hold links set by hand, kept by imports like any top-level key:
+  `"sameAs": [{ "title", "artist", "as": { "title", "artist" } }]`. Each counts a song as the library song it names
+  (a re-upload, or a cover the person counts as the original), checked first.
+
+Top artists and Top songs show ten rows; Expand (`statsMoreArtists`, `statsMoreSongs`) shows up to fifty.
 
 `pwsh -File tools\release-native.ps1 -Version 2.0.0-preview.1 [-Notes "..."] [-Publish]` makes
 `release\String-<version>.zip`: `String.exe`, `Read me first.txt` (from `tools\share\Preview read me.txt`) and

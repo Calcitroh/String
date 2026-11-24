@@ -264,3 +264,85 @@ fn a_spelling_joins_the_artist_with_the_most_proof_and_a_tie_joins_none() {
     let (out, _) = Matcher::new(lib(true)).resolve(&plays(6));
     assert_eq!(artist_secs(&out, "青葉 凛"), 5.);
 }
+
+fn linked(plays: &[(&str, &str, &str, &str, f64)], links: serde_json::Value) -> Listening {
+    let mut h = history_on(plays);
+    h.set_top_field("sameAs", links);
+    h
+}
+
+#[test]
+fn a_link_set_by_hand_counts_another_recording_as_a_library_song() {
+    let m = Matcher::new([on_album(
+        "lib/theme.flac",
+        "Hero MainTheme",
+        "Composer A",
+        "Show OST",
+    )]);
+    let h = linked(
+        &[
+            (
+                "1",
+                "Hero (Main Theme)",
+                "Cover Artist",
+                "Hero (Main Theme)",
+                60.,
+            ),
+            (
+                "2",
+                "Hero (Main Theme)",
+                "Cover Artist",
+                "Hero (Main Theme)",
+                30.,
+            ),
+            (
+                "3",
+                "Hero (Main Theme)",
+                "Another Cover",
+                "Hero (Main Theme)",
+                5.,
+            ),
+        ],
+        serde_json::json!([{
+            "title": "hero (main theme)",
+            "artist": "COVER ARTIST",
+            "as": { "title": "Hero MainTheme", "artist": "Composer A" }
+        }]),
+    );
+    let (out, resolved) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "lib/theme.flac"), 90.);
+    assert_eq!(resolved.matched_seconds, 90.);
+    assert_eq!(artist_secs(&out, "Composer A"), 90.);
+    assert_eq!(artist_secs(&out, "Another Cover"), 5.);
+}
+
+#[test]
+fn a_link_to_a_song_the_library_no_longer_has_changes_nothing() {
+    let m = Matcher::new([song("lib/other.flac", "Other", "Composer A")]);
+    let h = linked(
+        &[("1", "Hero (Main Theme)", "Cover Artist", "Single", 60.)],
+        serde_json::json!([{
+            "title": "Hero (Main Theme)",
+            "artist": "Cover Artist",
+            "as": { "title": "Hero MainTheme", "artist": "Composer A" }
+        }]),
+    );
+    let (out, resolved) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "spotify:track:1"), 60.);
+    assert_eq!(resolved.matched_seconds, 0.);
+    assert_eq!(artist_secs(&out, "Cover Artist"), 60.);
+}
+
+#[test]
+fn damaged_links_are_passed_over() {
+    let m = Matcher::new([song("lib/song.flac", "Song", "Artist A")]);
+    for links in [
+        serde_json::json!("not a list"),
+        serde_json::json!([1, null, {"title": "Song"}, {"title": 5, "artist": "x", "as": {}}]),
+    ] {
+        let h = linked(&[("1", "Song", "Artist A", "Album", 10.)], links);
+        let (out, resolved) = m.resolve(&h);
+        assert_eq!(secs_of(&out, "lib/song.flac"), 10.);
+        assert_eq!(resolved.matched_seconds, 10.);
+    }
+}

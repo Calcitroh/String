@@ -197,6 +197,7 @@ pub const CASES: &[Case] = &[
         ready: lists::ready,
     },
     crate::screens::stats::smoke::SPOTIFY,
+    crate::screens::stats::smoke::EXPANDED,
     Case {
         name: "02-now-playing",
         prepare: record,
