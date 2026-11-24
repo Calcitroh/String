@@ -2,6 +2,7 @@
 pub mod duplicates;
 pub mod edit;
 pub mod phone;
+pub mod spotify;
 mod text;
 pub mod updates;
 
