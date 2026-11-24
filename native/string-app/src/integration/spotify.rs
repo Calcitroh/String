@@ -21,7 +21,6 @@ use std::{
 };
 use string_core::{
     data::{DataFolder, Document, SpotifyHistory},
-    library::is_song_name,
     stats::{Listening, Track},
 };
 use string_extras::spotify::{self as export, Holds, ImportError, Matcher, Resolved, Summary};
@@ -386,28 +385,16 @@ struct Sorting {
 struct Sorted {
     /// What to import: the paths that hold a history or can't be read, when dropped on Stats.
     history: Vec<PathBuf>,
-    /// A history alone was dropped on another page.
+    /// A history alone, all of it readable, was dropped on another page.
     elsewhere: bool,
     /// The library couldn't take its share.
     refused: bool,
 }
 impl Default for Drops {
     fn default() -> Self {
-        Self::with_classifier(look)
+        // A path is a folder, or a song, by what it is on disk: a folder can be named like a song.
+        Self::with_classifier(export::holds)
     }
-}
-fn look(path: &Path) -> Holds {
-    // A song file is never a history, so no disk access for it.
-    if path
-        .file_name()
-        .is_some_and(|n| is_song_name(&n.to_string_lossy()))
-    {
-        return Holds {
-            music: true,
-            ..Holds::default()
-        };
-    }
-    export::holds(path)
 }
 impl Drops {
     pub(crate) fn with_classifier(classify: impl Fn(&Path) -> Holds + Send + 'static) -> Self {
@@ -490,7 +477,7 @@ impl Drops {
                             if holds.music || !import {
                                 library.push(path);
                             }
-                        } else if holds.history && !holds.music {
+                        } else if holds.history && !holds.music && !holds.unreadable {
                             sorted.elsewhere = true;
                         } else {
                             library.push(path);
@@ -516,15 +503,11 @@ impl Drops {
     pub(crate) fn sorting(&self) -> bool {
         self.sorting.load(Ordering::SeqCst) > 0
     }
-    /// Waits until no drop is being sorted, or until `deadline`; whether none is.
-    pub(crate) fn wait_sorted(&self, deadline: Instant) -> bool {
-        while self.sorting() {
-            if Instant::now() >= deadline {
-                return false;
-            }
-            thread::sleep(Duration::from_millis(2));
+    /// Waits until no drop is being sorted, or until `deadline`.
+    pub(crate) fn wait_sorted(&self, deadline: Instant) {
+        while self.sorting() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
         }
-        true
     }
     /// Takes in sorted drops: a history dropped on Stats starts the import, one dropped elsewhere says where it goes.
     pub(crate) fn poll(&mut self, s: &mut Session, toast: &mut Toast) {

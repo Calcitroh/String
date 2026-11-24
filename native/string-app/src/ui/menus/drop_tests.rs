@@ -463,3 +463,91 @@ fn a_broken_zip_dropped_on_stats_goes_to_the_import_which_names_it() {
     d.finish(&mut session, &mut scan);
     assert_eq!(d.said, ["Those aren't songs String can play"]);
 }
+
+#[test]
+fn a_zip_moved_away_before_it_is_sorted_refuses_the_import_on_stats() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = storage::folder(&temp.path().join("profile"), true);
+    let mut d = Dropping::new(Adds::new().unwrap(), Drops::default());
+    let (_store, mut session) = Storage::open(&folder, &d.ctx).unwrap();
+    let mut scan = Scanner::default();
+    // Dropped with a history folder, then moved away before the sorter looked: imported without it, the history
+    // would pass its plays for good.
+    let gone = temp.path().join("older.zip");
+    d.drop(&[unzipped(temp.path()), gone.clone()], true);
+    d.finish(&mut session, &mut scan);
+    assert!(
+        d.said
+            .iter()
+            .any(|m| m.starts_with("Couldn't read older.zip (")),
+        "{:?}",
+        d.said
+    );
+    assert!(!temp.path().join("profile/spotify.json").exists());
+
+    // Elsewhere it goes to the library, as before.
+    d.said.clear();
+    d.drop(&[gone], false);
+    d.finish(&mut session, &mut scan);
+    assert_eq!(d.said, ["Those aren't songs String can play"]);
+}
+
+#[test]
+fn a_folder_named_like_a_song_is_searched_for_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = storage::folder(&temp.path().join("profile"), true);
+    let mut d = Dropping::new(Adds::new().unwrap(), Drops::default());
+    let (_store, mut session) = Storage::open(&folder, &d.ctx).unwrap();
+    let mut scan = Scanner::default();
+    // Newer plays in one folder, older ones in a folder whose name ends like a song's, with an album inside.
+    let newer = unzipped(temp.path());
+    let older = temp.path().join("old.flac");
+    std::fs::create_dir_all(older.join("Album")).unwrap();
+    std::fs::write(older.join("Album/one.flac"), []).unwrap();
+    let mut plays = spotify::sample_files(2, &[]);
+    for (i, row) in plays.iter_mut().flat_map(|(_, rows)| rows).enumerate() {
+        row["ts"] = format!("2021-05-0{}T10:00:00Z", i + 1).into();
+    }
+    for (name, rows) in plays {
+        std::fs::write(older.join(name), serde_json::to_vec(&rows).unwrap()).unwrap();
+    }
+    d.drop(&[newer, older.clone()], true);
+    d.finish(&mut session, &mut scan);
+    assert_eq!(
+        session.spotify_summary().map(|s| s.plays),
+        Some(4),
+        "{:?}",
+        d.said
+    );
+    assert_eq!(*session.field("roots"), json!([older]));
+}
+
+#[test]
+fn off_stats_a_history_folder_with_a_part_that_cant_be_read_goes_to_the_library() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = storage::folder(&temp.path().join("profile"), true);
+    let mut d = Dropping::new(Adds::new().unwrap(), Drops::default());
+    let (_store, mut session) = Storage::open(&folder, &d.ctx).unwrap();
+    let mut scan = Scanner::default();
+    // A history, and a link to a folder that's gone (a drive unplugged), maybe of songs.
+    let history = unzipped(temp.path());
+    let target = temp.path().join("gone");
+    std::fs::create_dir(&target).unwrap();
+    let made = std::process::Command::new("cmd")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(history.join("Music"))
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(made.status.success());
+    std::fs::remove_dir(&target).unwrap();
+    d.drop(&[history.clone()], false);
+    d.finish(&mut session, &mut scan);
+    assert_eq!(*session.field("roots"), json!([history]));
+    assert!(
+        !d.said.contains(&spotify::ELSEWHERE.to_string()),
+        "{:?}",
+        d.said
+    );
+    assert!(!temp.path().join("profile/spotify.json").exists());
+}

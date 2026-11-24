@@ -144,13 +144,15 @@ impl App {
                 while let Some(batch) = self.adds.next_at_exit(add_deadline) {
                     batch.apply(&mut rt.session.lock().unwrap(), &mut self.scan);
                 }
-                // A drop still being sorted queues its songs once sorted; no new drop starts now adds are closed.
-                if !self.views.drops.wait_sorted(add_deadline)
-                    || !self.adds.pending()
+                if !add_unfinished(|| self.views.drops.sorting(), || self.adds.pending())
                     || Instant::now() >= add_deadline
                 {
                     break;
                 }
+                // A drop still being sorted queues its songs once sorted (no new drop starts now adds are closed).
+                // Looking again soon takes in one sorted meanwhile, though another may still be sorting at the end.
+                let soon = Instant::now() + Duration::from_millis(5);
+                self.views.drops.wait_sorted(soon.min(add_deadline));
             }
         }
         let mut reasons = Vec::new();
@@ -735,6 +737,54 @@ mod add_close_tests {
         assert_eq!(
             folder.open().unwrap().state.value.fields["files"],
             serde_json::json!([song])
+        );
+    }
+
+    #[test]
+    fn an_exit_keeps_a_sorted_drop_while_another_is_still_sorting() {
+        let dir = tempfile::tempdir().unwrap();
+        let [first, second] = ["first.wav", "second.wav"].map(|n| dir.path().join(n));
+        for song in [&first, &second] {
+            std::fs::write(song, []).unwrap();
+        }
+        let (entered, sorting) = mpsc::channel();
+        let (release_first, first_gate) = mpsc::channel::<()>();
+        let (_hold_second, second_gate) = mpsc::channel::<()>();
+        let ctx = Context::default();
+        let mut a = app(dir.path(), Adds::new().unwrap());
+        a.open(&ctx);
+        let held = first.clone();
+        a.views.drops = crate::integration::spotify::Drops::with_classifier(move |path: &Path| {
+            let _ = entered.send(());
+            // The first is sorted once the exit has begun; the second is still sorting when it ends.
+            let gate = if path == held.as_path() {
+                &first_gate
+            } else {
+                &second_gate
+            };
+            let _ = gate.recv_timeout(Duration::from_secs(3));
+            string_extras::spotify::Holds {
+                music: true,
+                ..Default::default()
+            }
+        });
+        for song in [&first, &second] {
+            assert!(a.views.drops.send(vec![song.clone()], false, &a.adds.input));
+        }
+        sorting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let sorter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = release_first.send(());
+        });
+        let start = Instant::now();
+        assert!(!a.flush(), "the exit didn't see the drop still sorting");
+        sorter.join().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(a.close_reason.contains("add"), "{}", a.close_reason);
+        let folder = storage::folder(dir.path(), true);
+        assert_eq!(
+            folder.open().unwrap().state.value.fields["files"],
+            serde_json::json!([first])
         );
     }
 }

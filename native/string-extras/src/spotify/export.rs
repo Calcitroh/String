@@ -148,7 +148,8 @@ fn open_zip(path: &Path) -> io::Result<zip::ZipArchive<BufReader<File>>> {
 }
 
 /// What a dropped path holds: a history file by `find_history`'s rules, and songs by the library scan's.
-/// `unreadable`: part of what `find_history` would read can't be (a zip, or a folder), so only the import can tell.
+/// `unreadable`: part of what `find_history` would read can't be (a zip, a folder, or the path itself, gone since it
+/// was dropped), so only the import can tell.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Holds {
     pub history: bool,
@@ -180,8 +181,7 @@ fn look(path: &Path, songs: bool) -> Holds {
                 note(&name.to_string_lossy(), true, songs, &mut found);
             }
         }
-        // Gone since it was dropped, rather than a link to something that can't be reached.
-        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() => {}
+        // Gone since it was dropped counts too: it may come back, with its plays.
         Err(_) => found.unreadable = true,
     }
     found

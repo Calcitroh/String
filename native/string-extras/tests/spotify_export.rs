@@ -157,6 +157,8 @@ fn holds_finds_history_as_find_history_does_and_songs_as_the_scan_does() {
     );
     let broken = tmp.path().join("broken.zip");
     fs::write(&broken, b"not a zip").unwrap();
+    // Dropped, then moved away before it was looked at.
+    let missing = tmp.path().join("missing.zip");
 
     // (history, music)
     let cases = [
@@ -171,14 +173,18 @@ fn holds_finds_history_as_find_history_does_and_songs_as_the_scan_does() {
         (song, (false, true)),
         (loud, (false, true)),
         (playlist, (false, false)),
-        (tmp.path().join("missing"), (false, false)),
+        (missing.clone(), (false, false)),
     ];
     for (path, (history, music)) in cases {
         let found = holds(&path);
         assert_eq!((found.history, found.music), (history, music), "{path:?}");
         assert_eq!(is_history(&path), history, "{path:?}");
-        // Only the broken zip can't be read; `find_history` refuses it.
-        assert_eq!(found.unreadable, path == broken, "{path:?}");
+        // Only the broken zip and the missing one can't be read; `find_history` refuses both.
+        assert_eq!(
+            found.unreadable,
+            path == broken || path == missing,
+            "{path:?}"
+        );
         if path != broken && path.exists() {
             assert_eq!(
                 !find_history(&[path.clone()]).unwrap().is_empty(),
@@ -188,6 +194,7 @@ fn holds_finds_history_as_find_history_does_and_songs_as_the_scan_does() {
         }
     }
     assert!(find_history(&[broken]).is_err());
+    assert!(find_history(&[missing]).is_err());
 }
 
 #[test]
