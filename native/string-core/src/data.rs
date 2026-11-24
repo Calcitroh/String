@@ -2,7 +2,7 @@
 
 use crate::{library::Library, state::State, stats::Listening};
 use chrono::{Local, NaiveDate};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     env,
@@ -90,6 +90,39 @@ impl Model for Library {
     const CACHE: bool = true;
     fn valid(&self) -> bool {
         self.v == 1
+    }
+}
+
+/// Every play from a Spotify history export, in the same shape as listening.json. Its `spotify` top field says
+/// how far the export reached.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SpotifyHistory(pub Listening);
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SpotifyMeta {
+    pub through: i64,
+    pub plays: u64,
+    pub imported: i64,
+    pub files: u64,
+}
+impl SpotifyHistory {
+    pub fn meta(&self) -> SpotifyMeta {
+        self.0
+            .top_field("spotify")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+    pub fn set_meta(&mut self, meta: SpotifyMeta) {
+        self.0
+            .set_top_field("spotify", serde_json::to_value(meta).expect("meta is JSON"));
+    }
+}
+impl sealed::Sealed for SpotifyHistory {}
+impl Model for SpotifyHistory {
+    const NAME: &'static str = "spotify";
+    fn valid(&self) -> bool {
+        true
     }
 }
 
@@ -233,7 +266,12 @@ impl DataFolder {
             .prefix(".copying-")
             .tempdir_in(&days)?;
         let dir = staging.path();
-        for name in [State::NAME, Listening::NAME, Library::NAME] {
+        for name in [
+            State::NAME,
+            Listening::NAME,
+            Library::NAME,
+            SpotifyHistory::NAME,
+        ] {
             if let Some(bytes) = read_existing(&self.root.join(format!("{name}.json")))? {
                 replace(dir, &dir.join(format!("{name}.json")), &bytes)?;
             }
@@ -264,6 +302,42 @@ impl DataFolder {
             fs::remove_dir_all(old)?;
         }
         Ok(())
+    }
+    /// Moves a model's file into the backup folder as `<name>-removed-<stamp>.json`, or `None` when there is no
+    /// file. An existing target is never overwritten: that fails with `AlreadyExists`. Takes the lock saves take.
+    pub fn set_aside<T: Model>(&self, stamp: &str) -> io::Result<Option<PathBuf>> {
+        fs::create_dir_all(&self.root)?;
+        let lock: File = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join(format!(".{}.lock", T::NAME)))?;
+        lock.lock()?;
+        let from = self.path::<T>();
+        let Some(bytes) = read_existing(&from)? else {
+            return Ok(None);
+        };
+        fs::create_dir_all(&self.backup)?;
+        let to = self.backup.join(format!("{}-removed-{stamp}.json", T::NAME));
+        if to.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} is in the way", to.display()),
+            ));
+        }
+        if fs::rename(&from, &to).is_err() {
+            // Another volume: copy without clobbering, check the copy, then remove the original.
+            let mut copy = OpenOptions::new().write(true).create_new(true).open(&to)?;
+            copy.write_all(&bytes)?;
+            copy.sync_all()?;
+            if fs::read(&to)? != bytes {
+                fs::remove_file(&to)?;
+                return Err(io::Error::other("the copy differs from the original"));
+            }
+            fs::remove_file(&from)?;
+        }
+        Ok(Some(to))
     }
     /// Load the whole profile before enabling saves in the application.
     pub fn open(&self) -> io::Result<Profile> {

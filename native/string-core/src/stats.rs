@@ -41,6 +41,9 @@ pub struct Day {
     pub t: BTreeMap<usize, f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p: Option<f64>,
+    /// Seconds that came from the Spotify layer in a merged day; never saved.
+    #[serde(skip)]
+    pub sp: f64,
     #[serde(flatten)]
     pub extra: Fields,
 }
@@ -236,6 +239,7 @@ fn seconds(value: Value, dictionary_len: usize) -> BTreeMap<usize, f64> {
 pub struct Range {
     pub total: f64,
     pub phone: f64,
+    pub spotify: f64,
     pub artists: Vec<(String, f64)>,
     pub tracks: Vec<(Track, f64)>,
 }
@@ -296,20 +300,100 @@ impl Listening {
         self.doc.artists.len()
     }
     pub fn add(&mut self, t: &Track, secs: f64, when: NaiveDateTime) -> bool {
-        self.record(t, secs, when, false)
+        self.record(t, secs, when, 30., false, None)
     }
     pub fn add_phone(&mut self, t: &Track, secs: f64, when: NaiveDateTime) -> bool {
-        self.record(t, secs, when, true)
+        self.record(t, secs, when, 14400., true, None)
     }
-    fn record(&mut self, t: &Track, secs: f64, when: NaiveDateTime, phone: bool) -> bool {
-        let limit = if phone { 14400. } else { 30. };
+    /// A play from an imported history: as long as a phone play, but not counted as phone time.
+    pub fn add_imported(&mut self, t: &Track, secs: f64, when: NaiveDateTime, album: &str) -> bool {
+        self.record(t, secs, when, 14400., false, Some(album))
+    }
+    pub fn album(&self, id: &str) -> Option<&str> {
+        self.doc.tracks[*self.tracks.get(id)?].extra.first()?.as_str()
+    }
+    pub fn tracks(&self) -> impl Iterator<Item = &Track> {
+        self.doc.tracks.iter().map(|t| &t.names)
+    }
+    /// A top-level key this version doesn't know, kept for round trips.
+    pub fn top_field(&self, key: &str) -> Option<&Value> {
+        self.doc.extra.get(key)
+    }
+    /// Keys the document itself uses are ignored, so a caller can't damage its shape.
+    pub fn set_top_field(&mut self, key: &str, v: Value) {
+        if !["v", "tracks", "artists", "days", "phoneImport"].contains(&key) {
+            self.doc.extra.insert(key.into(), v);
+        }
+    }
+    /// This layer plus `other`, which is cloned (it is the big one). Neither input changes. Every second that
+    /// came from `other` is also counted in the day's `sp`; the phone import state stays this layer's.
+    pub fn merged(&self, other: &Listening) -> Listening {
+        let mut out = other.clone();
+        for day in out.doc.days.dated.values_mut() {
+            day.sp = day.s;
+        }
+        let tracks: Vec<usize> = self
+            .doc
+            .tracks
+            .iter()
+            .map(|saved| {
+                *out.tracks.entry(saved.names.0.clone()).or_insert_with(|| {
+                    out.doc.tracks.push(saved.clone());
+                    out.doc.tracks.len() - 1
+                })
+            })
+            .collect();
+        let artists: Vec<usize> = self
+            .doc
+            .artists
+            .iter()
+            .map(|name| {
+                *out.artists.entry(name.clone()).or_insert_with(|| {
+                    out.doc.artists.push(name.clone());
+                    out.doc.artists.len() - 1
+                })
+            })
+            .collect();
+        for (date, mine) in &self.doc.days.dated {
+            let day = out.doc.days.dated.entry(*date).or_default();
+            day.s += mine.s;
+            for (to, from) in day.h.iter_mut().zip(mine.h) {
+                *to += from;
+            }
+            for (&i, &s) in &mine.a {
+                *day.a.entry(artists[i]).or_default() += s;
+            }
+            for (&i, &s) in &mine.t {
+                *day.t.entry(tracks[i]).or_default() += s;
+            }
+            if let Some(p) = mine.p {
+                *day.p.get_or_insert(0.) += p;
+            }
+            for (key, value) in &mine.extra {
+                day.extra.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+        out.doc.phone_import = self.doc.phone_import.clone();
+        out.phone = self.phone.clone();
+        out.doc.extra = self.doc.extra.clone();
+        out
+    }
+    fn record(
+        &mut self,
+        t: &Track,
+        secs: f64,
+        when: NaiveDateTime,
+        limit: f64,
+        phone: bool,
+        album: Option<&str>,
+    ) -> bool {
         if !(secs > 0. && secs <= limit) {
             return false;
         }
         let ti = *self.tracks.entry(t.0.clone()).or_insert_with(|| {
             self.doc.tracks.push(SavedTrack {
                 names: t.clone(),
-                extra: vec![],
+                extra: album.map(|a| vec![Value::from(a)]).unwrap_or_default(),
             });
             self.doc.tracks.len() - 1
         });
@@ -378,12 +462,14 @@ impl Listening {
     pub fn range(&self, from: NaiveDate, to: NaiveDate) -> Range {
         let mut total = 0.;
         let mut phone = 0.;
+        let mut spotify = 0.;
         let mut artists = Ranking::default();
         let mut tracks = Ranking::default();
         if from <= to {
             for day in self.doc.days.dated.range(from..=to).map(|(_, d)| d) {
                 total += day.s;
                 phone += day.p.unwrap_or(0.);
+                spotify += day.sp;
                 artists.add(&day.a);
                 tracks.add(&day.t);
             }
@@ -391,6 +477,7 @@ impl Listening {
         Range {
             total: round1(total),
             phone: round1(phone),
+            spotify: round1(spotify),
             artists: artists.sorted(|i| self.doc.artists[i].clone()),
             tracks: tracks.sorted(|i| self.doc.tracks[i].names.clone()),
         }
