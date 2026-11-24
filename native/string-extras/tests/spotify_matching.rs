@@ -84,6 +84,9 @@ fn normalizes_feat_and_remaster_but_not_live_or_remix() {
         "Song (feat. X – Live)",
         "Song (with X, Remix)",
         "Song (feat. X / Acoustic)",
+        "Song (feat. X - Reprise)",
+        "Song (feat. X - Karaoke)",
+        "Song (feat. X – Dub)",
     ] {
         assert_ne!(normalize_title(other), song, "{other}");
     }
@@ -428,4 +431,123 @@ fn japanese_voicing_marks_tell_kana_apart() {
     let h = history_on(&[("1", "カ\u{3099}", "Kana Band", "Kana", 60.)]);
     let (out, _) = m.resolve(&h);
     assert_eq!(secs_of(&out, "lib/ka.flac"), 0.);
+}
+
+#[test]
+fn a_collaboration_takes_its_own_credit_or_its_lead_alone_never_another_duet() {
+    let m = Matcher::new([
+        on_album("duo/home.flac", "Home", "North & South", "Duets"),
+        on_album("north/home.flac", "Home", "North", "Solo"),
+    ]);
+    let (out, _) = m.resolve(&history_on(&[("1", "Home", "North & West", "Duets", 60.)]));
+    assert_eq!(secs_of(&out, "duo/home.flac"), 0.);
+    assert_eq!(secs_of(&out, "north/home.flac"), 60.);
+}
+
+#[test]
+fn a_play_two_different_duets_could_be_needs_the_album_to_choose() {
+    let m = Matcher::new([
+        on_album("ab/finale.flac", "Finale", "Ada & Ben", "Ben Sessions"),
+        on_album("ac/finale.flac", "Finale", "Ada & Cora", "Cora Sessions"),
+    ]);
+    let (out, resolved) = m.resolve(&history_on(&[("1", "Finale", "Ada", "Solo Sessions", 60.)]));
+    assert_eq!(resolved.matched_seconds, 0.);
+    assert_eq!(secs_of(&out, "spotify:track:1"), 60.);
+    let (out, _) = m.resolve(&history_on(&[("1", "Finale", "Ada", "Cora Sessions", 60.)]));
+    assert_eq!(secs_of(&out, "ac/finale.flac"), 60.);
+}
+
+#[test]
+fn names_that_differ_only_by_a_separator_stay_apart() {
+    let m = Matcher::new([
+        song("rs/home.flac", "Home", "River Stone").into(),
+        song("rivers/tide.flac", "Tide", "The Rivers"),
+    ]);
+    let h = linked(
+        &[
+            ("1", "Home", "River Stone", "Solo", 60.),
+            ("2", "Tide", "River & Stone", "Duo", 10.),
+            ("3", "Unknown", "River Stone", "Solo", 30.),
+        ],
+        serde_json::json!([artist_link("River & Stone", "The Rivers")]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "rs/home.flac"), 60.);
+    assert_eq!(secs_of(&out, "rivers/tide.flac"), 10.);
+    assert_eq!(artist_secs(&out, "River Stone"), 90.);
+    assert_eq!(artist_secs(&out, "The Rivers"), 10.);
+}
+
+#[test]
+fn a_song_link_names_the_whole_title_and_uses_the_plays_album() {
+    let m = Matcher::new([
+        song("mio/yui.flac", "Home (feat. Yui)", "Mio").into(),
+        on_album("north/home.flac", "Home", "North", "Studio Days"),
+        on_album("north/home-live.flac", "Home", "North", "Live"),
+    ]);
+    let h = linked(
+        &[
+            ("1", "Home (feat. Ena)", "Mio", "Duets", 10.),
+            ("2", "Home (feat. Yui)", "Mio", "Duets", 20.),
+        ],
+        serde_json::json!([
+            {"title": "Home (feat. Ena)", "artist": "Mio", "as": {"title": "Home", "artist": "North"}},
+        ]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "mio/yui.flac"), 20.);
+    assert_eq!(
+        secs_of(&out, "north/home.flac") + secs_of(&out, "north/home-live.flac"),
+        10.
+    );
+    let live = linked(
+        &[("1", "Home (feat. Ena)", "Mio", "Live", 10.)],
+        serde_json::json!([
+            {"title": "Home (feat. Ena)", "artist": "Mio", "as": {"title": "Home", "artist": "North"}},
+        ]),
+    );
+    let (out, _) = m.resolve(&live);
+    assert_eq!(secs_of(&out, "north/home-live.flac"), 10.);
+}
+
+#[test]
+fn albums_that_differ_only_by_a_separator_stay_apart() {
+    let m = Matcher::new([
+        on_album("a/plus.flac", "Overture", "North", "Act I + II"),
+        on_album("a/slash.flac", "Overture", "North", "Act I / II"),
+    ]);
+    let (out, _) = m.resolve(&history_on(&[(
+        "1",
+        "Overture",
+        "North",
+        "Act I / II",
+        60.,
+    )]));
+    assert_eq!(secs_of(&out, "a/slash.flac"), 60.);
+}
+
+#[test]
+fn an_artist_link_to_a_name_the_library_lacks_leaves_normal_matching_alone() {
+    let m = Matcher::new([song("ada/home.flac", "Home", "Ada")]);
+    let h = linked(
+        &[("1", "Home", "Ada", "Solo", 60.)],
+        serde_json::json!([artist_link("Ada", "Missing Name")]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "ada/home.flac"), 60.);
+}
+
+#[test]
+fn a_link_with_keys_it_doesnt_know_is_passed_over() {
+    let m = Matcher::new([song("north/theme.flac", "Theme", "North")]);
+    let h = linked(
+        &[
+            ("1", "Hero", "Fan", "Covers", 60.),
+            ("2", "Ode", "Fan", "Covers", 30.),
+        ],
+        serde_json::json!([{"name": "Hero", "artist": "Fan", "as": {"name": "Theme", "artist": "North"}}]),
+    );
+    let (out, resolved) = m.resolve(&h);
+    assert_eq!(resolved.matched_seconds, 0.);
+    assert_eq!(artist_secs(&out, "Fan"), 90.);
 }

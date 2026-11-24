@@ -29,19 +29,23 @@ impl From<Track> for LibrarySong {
 /// One library song with the keys matching compares.
 struct Candidate {
     track: Track,
-    /// `main_artist` of its credit.
-    main: String,
-    /// The whole credit, normalized.
+    /// The whole credit, as `spelling`.
     credit: String,
-    /// The album, normalized ("" when unknown).
+    /// A credit that is one artist alone (no second name after `&`, `,`, `feat.` and the like).
+    solo: bool,
+    /// The album, as `spelling` ("" when unknown).
     album: String,
 }
 
 /// A Spotify song's keys. Only songs with a title that normalizes to something have them.
 struct Play {
+    /// `normalize_title`: featured artists and remaster notes gone.
     title: String,
+    /// The whole title as written, as `spelling`, for song links.
+    written: String,
     main: String,
     credit: String,
+    solo: bool,
     album: String,
 }
 
@@ -52,7 +56,9 @@ pub struct Matcher {
     by_artist: HashMap<(String, String), Vec<usize>>,
     /// (title, whole credit) → songs, in library order.
     by_credit: HashMap<(String, String), Vec<usize>>,
-    /// Normalized credit → the library's spelling.
+    /// (whole title as written, whole credit) → songs, in library order: what a song link names.
+    by_written: HashMap<(String, String), Vec<usize>>,
+    /// Whole credit → the library's spelling.
     artists: HashMap<String, String>,
 }
 
@@ -63,11 +69,12 @@ impl Matcher {
             songs: Vec::new(),
             by_artist: HashMap::new(),
             by_credit: HashMap::new(),
+            by_written: HashMap::new(),
             artists: HashMap::new(),
         };
         for song in songs {
             let LibrarySong { track, album } = song.into();
-            let credit = normalize_text(&track.2);
+            let credit = spelling(&track.2);
             if !credit.is_empty() {
                 m.artists
                     .entry(credit.clone())
@@ -87,10 +94,14 @@ impl Matcher {
                 .entry((title, credit.clone()))
                 .or_default()
                 .push(i);
+            m.by_written
+                .entry((spelling(&track.1), credit.clone()))
+                .or_default()
+                .push(i);
             m.songs.push(Candidate {
-                album: normalize_text(&album),
+                solo: normalize_text(&track.2) == main,
+                album: spelling(&album),
                 track,
-                main,
                 credit,
             });
         }
@@ -103,10 +114,13 @@ impl Matcher {
         if title.is_empty() {
             return None;
         }
+        let main = main_artist(&t.2);
         Some(Play {
-            album: normalize_text(history.album(&t.0).unwrap_or("")),
-            main: main_artist(&t.2),
-            credit: normalize_text(&t.2),
+            written: spelling(&t.1),
+            solo: normalize_text(&t.2) == main,
+            album: spelling(history.album(&t.0).unwrap_or("")),
+            credit: spelling(&t.2),
+            main,
             title,
         })
     }
@@ -124,39 +138,69 @@ impl Matcher {
             .map(|&i| &self.songs[i].track)
     }
 
-    /// Songs with `title` by exactly the library credit `credit`: a link to "North" never lands on "North & South".
-    fn by_named_credit(&self, title: &str, credit: &str) -> Option<&Vec<usize>> {
-        self.by_credit.get(&(title.to_string(), credit.to_string()))
+    /// A play's library song: the one a song link names; else, for an artist link, the same title by the library
+    /// artist it names; else the same title by the same main artist (see `by_name`).
+    fn find(&self, p: &Play, links: &Links) -> Option<&Track> {
+        if let Some(to) = links.songs.get(&(p.written.clone(), p.credit.clone()))
+            && let Some(song) = self
+                .by_written
+                .get(to)
+                .and_then(|f| self.best(f, &to.1, &p.album))
+        {
+            return Some(song);
+        }
+        if let Some(credit) = links.artists.get(&p.credit)
+            && let Some(song) = self
+                .by_credit
+                .get(&(p.title.clone(), credit.clone()))
+                .and_then(|f| self.best(f, credit, &p.album))
+        {
+            return Some(song);
+        }
+        self.by_name(p)
     }
 
-    /// A play's library song: the one a song link names; else, for an artist link, the same title by the library
-    /// artist it names; else the same title by the same main artist, unless the play is a collaboration and every
-    /// such song is another one.
-    fn find(&self, p: &Play, links: &Links) -> Option<&Track> {
-        if let Some((title, credit)) = links.songs.get(&(p.title.clone(), p.credit.clone())) {
-            let found = self.by_named_credit(title, credit);
-            if let Some(song) = found.and_then(|f| self.best(f, credit, "")) {
-                return Some(song);
-            }
-        }
-        if let Some(credit) = links.artists.get(&p.credit) {
-            let found = self.by_named_credit(&p.title, credit);
-            return found.and_then(|f| self.best(f, credit, &p.album));
-        }
+    /// The same title by the same main artist. A play credited to a collaboration takes its own credit or its lead
+    /// artist alone, never another collaboration ("North & West" is not "North & South"). When the songs left are
+    /// by more than one other credit, the album must choose, or nothing matches.
+    fn by_name(&self, p: &Play) -> Option<&Track> {
         // A play with no artist name is never matched by artist.
         if p.main.is_empty() {
             return None;
         }
-        let found = self.by_artist.get(&(p.title.clone(), p.main.clone()))?;
-        // "North & West" is not "North & South": a collaboration matches its own credit or its lead artist alone.
-        let other_duet = |&i: &usize| {
-            let c = &self.songs[i];
-            c.credit != p.credit && c.credit != c.main
-        };
-        if p.credit != p.main && found.iter().all(other_duet) {
-            return None;
+        let fits = |c: &Candidate| c.credit == p.credit || p.solo || c.solo;
+        let found: Vec<usize> = self
+            .by_artist
+            .get(&(p.title.clone(), p.main.clone()))?
+            .iter()
+            .copied()
+            .filter(|&i| fits(&self.songs[i]))
+            .collect();
+        let exact: Vec<usize> = found
+            .iter()
+            .copied()
+            .filter(|&i| self.songs[i].credit == p.credit)
+            .collect();
+        if !exact.is_empty() {
+            return self.best(&exact, &p.credit, &p.album);
         }
-        self.best(found, &p.credit, &p.album)
+        let credits: HashSet<&str> = found
+            .iter()
+            .map(|&i| self.songs[i].credit.as_str())
+            .collect();
+        if credits.len() <= 1 {
+            return self.best(&found, &p.credit, &p.album);
+        }
+        let on_album: Vec<usize> = found
+            .iter()
+            .copied()
+            .filter(|&i| !p.album.is_empty() && self.songs[i].album == p.album)
+            .collect();
+        let credits: HashSet<&str> = on_album
+            .iter()
+            .map(|&i| self.songs[i].credit.as_str())
+            .collect();
+        (credits.len() == 1).then(|| &self.songs[on_album[0]].track)
     }
 
     pub fn resolve(&self, history: &Listening) -> (Listening, Resolved) {
@@ -168,8 +212,8 @@ impl Matcher {
                 matched.insert(song.0.clone());
                 return song.clone();
             }
-            // An artist name that normalizes to nothing (an emoji) is never shown under a library artist.
-            let credit = normalize_text(&t.2);
+            // An artist name that comes to nothing (an emoji) is never shown under a library artist.
+            let credit = spelling(&t.2);
             let artist = links
                 .artists
                 .get(&credit)
@@ -202,11 +246,11 @@ impl Matcher {
 /// The history's own top-level key for links set by hand.
 const LINKS: &str = "sameAs";
 
-/// Links the person set by hand, normalized. Only these join names that differ: automatic matching can't tell a name
-/// written in another script from a label's or a compilation's credit, and a wrong join silently moves hours.
+/// Links the person set by hand, as `spelling`. Only these join names that differ: automatic matching can't tell a
+/// name written in another script from a label's or a compilation's credit, and a wrong join silently moves hours.
 #[derive(Default)]
 struct Links {
-    /// (title, Spotify credit) → (title, library credit).
+    /// (whole title as written, Spotify credit) → (whole title as written, library credit).
     songs: HashMap<(String, String), (String, String)>,
     /// Spotify credit → library credit.
     artists: HashMap<String, String>,
@@ -218,41 +262,59 @@ struct Links {
 /// - `{ "artist", "as": { "artist" } }` counts every song credited so as the library artist's (a name written in
 ///   another script).
 ///
-/// Both ends name the whole credit, so a link for a duet leaves the singer's solo songs alone. A link that isn't
-/// whole is passed over.
+/// Both ends name the whole title and credit as written, so a link for a duet leaves the singer's solo songs alone,
+/// and one for a "(feat. Ena)" version leaves the "(feat. Yui)" one alone. A link with other keys, or with an empty
+/// name, is passed over.
 fn links(history: &Listening) -> Links {
-    let credit = |v: &serde_json::Value| -> Option<String> {
-        let credit = normalize_text(v.get("artist")?.as_str()?);
-        (!credit.is_empty()).then_some(credit)
+    let text = |v: &serde_json::Value, key: &str| -> Option<String> {
+        let s = spelling(v.get(key)?.as_str()?);
+        (!s.is_empty()).then_some(s)
     };
-    let title = |v: &serde_json::Value| -> Option<String> {
-        let title = normalize_title(v.get("title")?.as_str()?);
-        (!title.is_empty()).then_some(title)
+    let only = |v: &serde_json::Value, keys: &[&str]| {
+        v.as_object()
+            .is_some_and(|o| o.keys().all(|k| keys.contains(&k.as_str())))
     };
     let mut links = Links::default();
     let Some(list) = history.top_field(LINKS).and_then(|v| v.as_array()) else {
         return links;
     };
     for link in list {
-        let (Some(from), Some(to)) = (credit(link), link.get("as").and_then(credit)) else {
+        let Some(to) = link.get("as") else {
             continue;
         };
-        match (
-            link.get("title"),
-            link.get("as").and_then(|to| to.get("title")),
-        ) {
-            (None, None) => {
-                links.artists.insert(from, to);
-            }
-            (Some(_), Some(_)) => {
-                if let (Some(a), Some(b)) = (title(link), link.get("as").and_then(title)) {
-                    links.songs.insert((a, from), (b, to));
-                }
-            }
-            _ => {}
+        let (Some(from_artist), Some(to_artist)) = (text(link, "artist"), text(to, "artist"))
+        else {
+            continue;
+        };
+        if only(link, &["artist", "as"]) && only(to, &["artist"]) {
+            links.artists.insert(from_artist, to_artist);
+        } else if only(link, &["title", "artist", "as"])
+            && only(to, &["title", "artist"])
+            && let (Some(from_title), Some(to_title)) = (text(link, "title"), text(to, "title"))
+        {
+            links
+                .songs
+                .insert((from_title, from_artist), (to_title, to_artist));
         }
     }
     links
+}
+
+/// A name as written, for comparing whole names: `normalize_text`, but the marks that join or split names stay as
+/// words, so "River & Stone" is not "River Stone" and "Act I / II" is not "Act I + II".
+fn spelling(s: &str) -> String {
+    let mut words = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '&' => words.push_str(" and "),
+            ',' => words.push_str(" comma "),
+            '/' => words.push_str(" slash "),
+            '+' => words.push_str(" plus "),
+            ';' => words.push_str(" semicolon "),
+            _ => words.push(c),
+        }
+    }
+    normalize_text(&words)
 }
 
 /// Lower case, common accents folded, punctuation and repeated spaces collapsed.
@@ -327,13 +389,19 @@ fn is_remaster_note(note: &str) -> bool {
 
 /// Words that make a recording another one: a credit group holding one stays in the title.
 const VERSION_WORDS: &[&str] = &[
+    "acapella",
     "acoustic",
     "demo",
+    "dub",
     "edit",
+    "extended",
     "instrumental",
+    "karaoke",
     "live",
     "mix",
+    "orchestral",
     "remix",
+    "reprise",
     "version",
 ];
 
@@ -348,10 +416,14 @@ fn removable_group(text: &str) -> Option<(usize, usize)> {
         let credit = ["feat.", "feat ", "ft.", "ft ", "featuring ", "with "]
             .iter()
             .any(|p| inner.starts_with(p));
-        // "(feat. Ena - Live)", "(with Ena, Remix)": a version mark keeps the group, it's another recording.
+        // "(feat. Ena - Live)", "(with Ena, Remix)", "(feat. Ena – Reprise)": a version mark, or anything after a
+        // dash or a slash, keeps the group: it's another recording.
         let version = inner
             .split(|c: char| !c.is_alphanumeric())
-            .any(|w| VERSION_WORDS.contains(&w));
+            .any(|w| VERSION_WORDS.contains(&w))
+            || [" - ", " – ", " — ", " / "]
+                .iter()
+                .any(|d| inner.contains(d));
         if (credit && !version) || is_remaster_note(inner) {
             return Some((start, start + len + 1));
         }

@@ -30,6 +30,15 @@ fn imported_plays_keep_their_album_and_allow_long_plays() {
 }
 
 #[test]
+fn a_play_without_an_album_keeps_the_album_already_known() {
+    let mut layer = Listening::default();
+    let t = track("spotify:track:x", "Band");
+    assert!(layer.add_imported(&t, 30., at(day(2020, 3, 1)), "Live"));
+    assert!(layer.add_imported(&t, 30., at(day(2020, 3, 2)), ""));
+    assert_eq!(layer.album("spotify:track:x"), Some("Live"));
+}
+
+#[test]
 fn a_newer_album_keeps_the_other_saved_cells() {
     let tmp = tempdir().unwrap();
     let folder = DataFolder::new(tmp.path(), tmp.path().join("backup"));
