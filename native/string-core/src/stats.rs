@@ -309,6 +309,9 @@ impl Listening {
     pub fn add_imported(&mut self, t: &Track, secs: f64, when: NaiveDateTime, album: &str) -> bool {
         self.record(t, secs, when, 14400., false, Some(album))
     }
+    pub(crate) fn version(&self) -> u32 {
+        self.doc.v
+    }
     pub fn album(&self, id: &str) -> Option<&str> {
         self.doc.tracks[*self.tracks.get(id)?].extra.first()?.as_str()
     }

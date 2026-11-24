@@ -109,3 +109,17 @@ fn the_opening_copy_includes_the_spotify_file() {
     let kept = backup.join("opened").join(Local::now().date_naive().to_string());
     assert_eq!(fs::read(kept.join("spotify.json")).unwrap(), b"{\"v\":1}");
 }
+
+#[test]
+fn set_aside_refusing_an_existing_target_leaves_both_files_alone() {
+    let dir = tempdir().unwrap();
+    let backup = dir.path().join("backup");
+    fs::create_dir_all(&backup).unwrap();
+    fs::write(backup.join("spotify-removed-2.json"), b"old").unwrap();
+    fs::write(dir.path().join("spotify.json"), b"new").unwrap();
+    let folder = DataFolder::new(dir.path(), &backup);
+    let err = folder.set_aside::<SpotifyHistory>("2").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read(backup.join("spotify-removed-2.json")).unwrap(), b"old");
+    assert_eq!(fs::read(dir.path().join("spotify.json")).unwrap(), b"new");
+}

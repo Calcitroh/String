@@ -122,7 +122,7 @@ impl sealed::Sealed for SpotifyHistory {}
 impl Model for SpotifyHistory {
     const NAME: &'static str = "spotify";
     fn valid(&self) -> bool {
-        true
+        self.0.version() == 1
     }
 }
 
@@ -320,22 +320,31 @@ impl DataFolder {
         };
         fs::create_dir_all(&self.backup)?;
         let to = self.backup.join(format!("{}-removed-{stamp}.json", T::NAME));
-        if to.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("{} is in the way", to.display()),
-            ));
-        }
-        if fs::rename(&from, &to).is_err() {
-            // Another volume: copy without clobbering, check the copy, then remove the original.
-            let mut copy = OpenOptions::new().write(true).create_new(true).open(&to)?;
-            copy.write_all(&bytes)?;
-            copy.sync_all()?;
-            if fs::read(&to)? != bytes {
-                fs::remove_file(&to)?;
-                return Err(io::Error::other("the copy differs from the original"));
-            }
-            fs::remove_file(&from)?;
+        // A hard link fails if the target exists (rename would replace it on Windows), so nothing is overwritten
+        // even when two callers race. Where a link can't be made (another volume), copy into a new file instead.
+        // Any failure after the target appears removes it again while the original is still intact, so a retry works.
+        let moved = match fs::hard_link(&from, &to) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+            Err(_) => (|| {
+                let mut copy = OpenOptions::new().write(true).create_new(true).open(&to)?;
+                let written = copy.write_all(&bytes).and_then(|()| copy.sync_all());
+                drop(copy);
+                if let Err(e) = written {
+                    let _ = fs::remove_file(&to);
+                    return Err(e);
+                }
+                if fs::read(&to).ok().as_deref() != Some(&bytes[..]) {
+                    let _ = fs::remove_file(&to);
+                    return Err(io::Error::other("the copy differs from the original"));
+                }
+                Ok(())
+            })(),
+        };
+        moved?;
+        if let Err(e) = fs::remove_file(&from) {
+            let _ = fs::remove_file(&to);
+            return Err(e);
         }
         Ok(Some(to))
     }
