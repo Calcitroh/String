@@ -21,9 +21,11 @@ use std::{
 };
 use string_core::{
     data::{DataFolder, Document, SpotifyHistory},
-    stats::{Listening, Track},
+    stats::Listening,
 };
-use string_extras::spotify::{self as export, Holds, ImportError, Matcher, Resolved, Summary};
+use string_extras::spotify::{
+    self as export, Holds, ImportError, LibrarySong, Matcher, Resolved, Summary,
+};
 
 /// Said when an import or a removal is asked for while one runs: the panel shows the one running.
 pub const BUSY: &str = "String is still busy with your Spotify history.";
@@ -52,7 +54,7 @@ pub(crate) type LayerParts = (
 );
 impl SpotifyLayer {
     /// `doc` matched to `songs`, the library's from `Session::spotify_songs`.
-    pub fn matched(doc: Document<SpotifyHistory>, songs: Vec<Track>) -> Self {
+    pub fn matched(doc: Document<SpotifyHistory>, songs: Vec<LibrarySong>) -> Self {
         let fingerprint = fingerprint(&songs);
         Self {
             view: resolve(&doc.value.0, songs),
@@ -62,7 +64,7 @@ impl SpotifyLayer {
         }
     }
     /// Reads `spotify.json` and matches it to `songs`. A missing file is no layer.
-    pub fn read(folder: &DataFolder, songs: Vec<Track>) -> Self {
+    pub fn read(folder: &DataFolder, songs: Vec<LibrarySong>) -> Self {
         match folder.read::<SpotifyHistory>() {
             Ok(doc) if doc.exists() => Self::matched(doc, songs),
             Ok(_) => Self::default(),
@@ -101,7 +103,7 @@ impl Drop for Wake {
 /// Reads and matches `spotify.json` on a worker; the window repaints when it's in.
 pub fn load(
     folder: DataFolder,
-    songs: Vec<Track>,
+    songs: Vec<LibrarySong>,
     ctx: &Context,
 ) -> io::Result<Receiver<SpotifyLayer>> {
     let (tx, rx) = bounded(1);
@@ -115,18 +117,25 @@ pub fn load(
     Ok(rx)
 }
 
-pub(crate) fn resolve(history: &Listening, songs: Vec<Track>) -> Option<(Listening, Resolved)> {
+pub(crate) fn resolve(
+    history: &Listening,
+    songs: Vec<LibrarySong>,
+) -> Option<(Listening, Resolved)> {
     history
         .first_day()
         .is_some()
         .then(|| Matcher::new(songs).resolve(history))
 }
 
-/// Changes when any song's id, title or artist changes, or their order does.
-pub(crate) fn fingerprint<'a>(songs: impl IntoIterator<Item = &'a Track>) -> u64 {
-    fingerprint_names(songs.into_iter().map(|t| [&*t.0, &*t.1, &*t.2]))
+/// Changes when any song's id, title, artist or album changes, or their order does.
+pub(crate) fn fingerprint<'a>(songs: impl IntoIterator<Item = &'a LibrarySong>) -> u64 {
+    fingerprint_names(
+        songs
+            .into_iter()
+            .map(|s| [&*s.track.0, &*s.track.1, &*s.track.2, &*s.album]),
+    )
 }
-pub(crate) fn fingerprint_names<'a>(songs: impl Iterator<Item = [&'a str; 3]>) -> u64 {
+pub(crate) fn fingerprint_names<'a>(songs: impl Iterator<Item = [&'a str; 4]>) -> u64 {
     let mut hasher = DefaultHasher::new();
     for names in songs {
         names.hash(&mut hasher);
@@ -250,7 +259,7 @@ fn spawn_job(
 pub(crate) fn start_import(
     folder: DataFolder,
     paths: Vec<PathBuf>,
-    songs: Vec<Track>,
+    songs: Vec<LibrarySong>,
     ctx: &Context,
 ) -> io::Result<Job> {
     spawn_job(JobKind::Import, ctx, move |progress| {
@@ -260,7 +269,7 @@ pub(crate) fn start_import(
 fn import(
     folder: &DataFolder,
     paths: &[PathBuf],
-    songs: Vec<Track>,
+    songs: Vec<LibrarySong>,
     progress: &dyn Fn(usize, usize),
 ) -> Result<Imported, String> {
     let sources = export::find_history(paths).map_err(|e| {
@@ -617,6 +626,7 @@ mod tests {
         fs,
         time::{Duration, Instant},
     };
+    use string_core::stats::Track;
 
     fn open(dir: &Path) -> Session {
         let (_store, s) = Storage::open(&storage::folder(dir, true), &Context::default()).unwrap();

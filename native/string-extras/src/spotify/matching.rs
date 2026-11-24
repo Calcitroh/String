@@ -11,45 +11,134 @@ pub struct Resolved {
     pub seconds: f64,
 }
 
-/// The library's songs by (normalized title, main artist), and its artist spellings.
+/// A library song as matching sees it: the names and id String plays it under, and its album.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibrarySong {
+    pub track: Track,
+    pub album: String,
+}
+impl From<Track> for LibrarySong {
+    fn from(track: Track) -> Self {
+        LibrarySong {
+            track,
+            album: String::new(),
+        }
+    }
+}
+
+/// How many songs on the same album must prove that two spellings name one artist.
+const SAME_ARTIST_PROOF: usize = 2;
+
+/// The library's songs by (normalized title, main artist) and by (normalized title, album), and its artist spellings.
 pub struct Matcher {
     songs: HashMap<(String, String), Track>,
+    recordings: HashMap<(String, String), Track>,
     artists: HashMap<String, String>,
 }
 
 impl Matcher {
     /// `songs` are in library order and carry the names and id String plays them under. The first of duplicates wins.
-    pub fn new(songs: impl IntoIterator<Item = Track>) -> Matcher {
+    pub fn new<S: Into<LibrarySong>>(songs: impl IntoIterator<Item = S>) -> Matcher {
         let mut by_key = HashMap::new();
+        let mut recordings = HashMap::new();
         let mut artists = HashMap::new();
         for song in songs {
+            let LibrarySong { track: song, album } = song.into();
             artists
                 .entry(normalize_text(&song.2))
                 .or_insert_with(|| song.2.clone());
             let title = normalize_title(&song.1);
-            if !title.is_empty() {
-                by_key.entry((title, main_artist(&song.2))).or_insert(song);
+            if title.is_empty() {
+                continue;
             }
+            if let Some(album) = album_key(&title, &album) {
+                recordings
+                    .entry((title.clone(), album))
+                    .or_insert_with(|| song.clone());
+            }
+            by_key.entry((title, main_artist(&song.2))).or_insert(song);
         }
         Matcher {
             songs: by_key,
+            recordings,
             artists,
         }
     }
 
+    /// A play's library song: the same title by the same main artist, else the same title on the same album (the
+    /// same recording, its artist spelled another way), else the same title by the library artist `aliases` says
+    /// this spelling is.
+    fn find(
+        &self,
+        history: &Listening,
+        t: &Track,
+        aliases: &HashMap<String, String>,
+    ) -> Option<&Track> {
+        let title = normalize_title(&t.1);
+        // A title that is only punctuation or a credit would match any such song by the artist.
+        if title.is_empty() {
+            return None;
+        }
+        let artist = main_artist(&t.2);
+        if let Some(song) = self.songs.get(&(title.clone(), artist.clone())) {
+            return Some(song);
+        }
+        if let Some(song) = self.recording(history, t, &title) {
+            return Some(song);
+        }
+        self.songs.get(&(title, aliases.get(&artist)?.clone()))
+    }
+    fn recording(&self, history: &Listening, t: &Track, title: &str) -> Option<&Track> {
+        let album = album_key(title, history.album(&t.0)?)?;
+        self.recordings.get(&(title.to_string(), album))
+    }
+
+    /// Spotify spellings (main artist) that name a library artist: at least `SAME_ARTIST_PROOF` different songs of
+    /// theirs found on the same album under that artist, and more than under any other.
+    fn aliases(&self, history: &Listening) -> HashMap<String, String> {
+        let mut proof: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::new();
+        for t in history.tracks() {
+            let title = normalize_title(&t.1);
+            let artist = main_artist(&t.2);
+            if title.is_empty() || self.songs.contains_key(&(title.clone(), artist.clone())) {
+                continue;
+            }
+            if let Some(song) = self.recording(history, t, &title) {
+                let library = main_artist(&song.2);
+                if library != artist {
+                    proof
+                        .entry(artist)
+                        .or_default()
+                        .entry(library)
+                        .or_default()
+                        .insert(title);
+                }
+            }
+        }
+        proof
+            .into_iter()
+            .filter_map(|(spelling, found)| {
+                let most = found.values().map(HashSet::len).max()?;
+                let mut best = found.into_iter().filter(|(_, titles)| titles.len() == most);
+                let (library, _) = best.next()?;
+                (most >= SAME_ARTIST_PROOF && best.next().is_none()).then_some((spelling, library))
+            })
+            .collect()
+    }
+
     pub fn resolve(&self, history: &Listening) -> (Listening, Resolved) {
+        let aliases = self.aliases(history);
         let mut matched = HashSet::new();
         let out = history.remap(|t| {
-            let title = normalize_title(&t.1);
-            // A title that is only punctuation or a credit would match any such song by the artist.
-            let found = (!title.is_empty())
-                .then(|| self.songs.get(&(title, main_artist(&t.2))))
-                .flatten();
-            if let Some(song) = found {
+            if let Some(song) = self.find(history, t, &aliases) {
                 matched.insert(song.0.clone());
                 return song.clone();
             }
-            let artist = self.artists.get(&normalize_text(&t.2)).unwrap_or(&t.2);
+            let artist = self
+                .artists
+                .get(&normalize_text(&t.2))
+                .or_else(|| self.artists.get(aliases.get(&main_artist(&t.2))?))
+                .unwrap_or(&t.2);
             Track(t.0.clone(), t.1.clone(), artist.clone())
         });
         let ids: Vec<bool> = out.tracks().map(|t| matched.contains(&t.0)).collect();
@@ -67,6 +156,12 @@ impl Matcher {
         }
         (out, resolved)
     }
+}
+
+/// An album that can tell recordings apart: named, and not a single named after its song.
+fn album_key(title: &str, album: &str) -> Option<String> {
+    let album = normalize_text(album);
+    (!album.is_empty() && album != title && normalize_title(&album) != title).then_some(album)
 }
 
 /// Lower case, common accents folded, punctuation and repeated spaces collapsed.

@@ -20,7 +20,7 @@ use string_core::{
     state::State,
     stats::{Listening, Track as CountedTrack},
 };
-use string_extras::spotify::Resolved;
+use string_extras::spotify::{LibrarySong, Resolved};
 
 /// Queue controls used by both the live player and the in-memory playback tests.
 pub trait Transport {
@@ -189,9 +189,12 @@ impl Session {
     }
     /// The songs Spotify plays are matched to: the library's in library order, hidden ones too, under the names
     /// String's own plays record, so a matched Spotify play adds to the person's own plays of that song.
-    pub fn spotify_songs(&self) -> Vec<CountedTrack> {
+    pub fn spotify_songs(&self) -> Vec<LibrarySong> {
         self.library_songs()
-            .map(|s| CountedTrack(s.id.clone(), s.title.clone(), s.artist.clone()))
+            .map(|s| LibrarySong {
+                track: CountedTrack(s.id.clone(), s.title.clone(), s.artist.clone()),
+                album: s.album.clone(),
+            })
             .collect()
     }
     fn library_songs(&self) -> impl Iterator<Item = &Song> {
@@ -203,7 +206,7 @@ impl Session {
     fn songs_fingerprint(&self) -> u64 {
         spotify::fingerprint_names(
             self.library_songs()
-                .map(|s| [&*s.id, &*s.title, &*s.artist]),
+                .map(|s| [&*s.id, &*s.title, &*s.artist, &*s.album]),
         )
     }
     /// Starts reading `spotify.json` on a worker; `poll_spotify` takes it in.

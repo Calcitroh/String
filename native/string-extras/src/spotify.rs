@@ -6,4 +6,4 @@ pub use export::{
     Holds, ImportError, Limits, Source, Summary, find_history, holds, import, import_within,
     is_history,
 };
-pub use matching::{Matcher, Resolved, main_artist, normalize_title};
+pub use matching::{LibrarySong, Matcher, Resolved, main_artist, normalize_title};
