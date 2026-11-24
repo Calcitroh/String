@@ -78,7 +78,7 @@ fn reads_the_zip_the_folder_and_loose_files_alike() {
         let s = run(&[path], &mut h).unwrap();
         assert_eq!((s.added, s.skipped, s.files), (2, 0, 1));
         assert!((s.seconds - 300.).abs() < 1e-9);
-        totals.push((s.added, s.seconds as u64, h.meta().plays));
+        totals.push((s.added, s.seconds as u64, h.meta().unwrap().plays));
     }
     assert!(totals.windows(2).all(|w| w[0] == w[1]));
 }
@@ -133,9 +133,10 @@ fn holds_finds_history_as_find_history_does_and_songs_as_the_scan_does() {
             fs::write(dir.join("tracks.json"), b"[]").unwrap();
         }
     }
-    // History four folders down is found (as `find_history` finds it); five folders down isn't, nor are songs.
-    let near = tmp.path().join("a/b/c/d");
-    let far = tmp.path().join("e/f/g/h/i");
+    // History four folders below the one dropped is found (as `find_history` finds it); five folders down isn't,
+    // though a song beside it is, as the library scan reaches it.
+    let near = tmp.path().join("near/a/b/c/d");
+    let far = tmp.path().join("far/a/b/c/d/e");
     for dir in [&near, &far] {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(AUDIO), &bytes).unwrap();
@@ -160,8 +161,8 @@ fn holds_finds_history_as_find_history_does_and_songs_as_the_scan_does() {
     // (history, music)
     let cases = [
         (music.join("Artist 0"), (false, true)),
-        (tmp.path().join("a"), (true, false)),
-        (tmp.path().join("e"), (false, false)),
+        (tmp.path().join("near"), (true, false)),
+        (tmp.path().join("far"), (false, true)),
         // Songs with an export among them: both.
         (music.clone(), (true, true)),
         (videos, (false, false)),
@@ -173,8 +174,11 @@ fn holds_finds_history_as_find_history_does_and_songs_as_the_scan_does() {
         (tmp.path().join("missing"), (false, false)),
     ];
     for (path, (history, music)) in cases {
-        assert_eq!(holds(&path), Holds { history, music }, "{path:?}");
+        let found = holds(&path);
+        assert_eq!((found.history, found.music), (history, music), "{path:?}");
         assert_eq!(is_history(&path), history, "{path:?}");
+        // Only the broken zip can't be read; `find_history` refuses it.
+        assert_eq!(found.unreadable, path == broken, "{path:?}");
         if path != broken && path.exists() {
             assert_eq!(
                 !find_history(&[path.clone()]).unwrap().is_empty(),
@@ -183,6 +187,7 @@ fn holds_finds_history_as_find_history_does_and_songs_as_the_scan_does() {
             );
         }
     }
+    assert!(find_history(&[broken]).is_err());
 }
 
 #[test]
@@ -331,11 +336,11 @@ fn the_same_export_twice_adds_nothing() {
         .unwrap()
         .timestamp_millis();
     assert_eq!(first.through, t);
-    assert_eq!(h.meta().through, t);
-    assert_eq!((h.meta().plays, h.meta().files), (2, 1));
-    assert!(h.meta().imported > 0);
+    assert_eq!(h.meta().unwrap().through, t);
+    assert_eq!((h.meta().unwrap().plays, h.meta().unwrap().files), (2, 1));
+    assert!(h.meta().unwrap().imported > 0);
     assert!(matches!(run(&[file], &mut h), Err(ImportError::NothingNew)));
-    assert_eq!(h.meta().plays, 2);
+    assert_eq!(h.meta().unwrap().plays, 2);
 }
 
 #[test]
@@ -354,7 +359,7 @@ fn a_newer_export_adds_only_newer_plays() {
     run(&[a], &mut h).unwrap();
     let s = run(&[b], &mut h).unwrap();
     assert_eq!((s.added, s.skipped), (2, 0));
-    assert_eq!(h.meta().plays, 4);
+    assert_eq!(h.meta().unwrap().plays, 4);
 }
 
 #[test]
@@ -433,7 +438,7 @@ fn the_same_file_reached_several_ways_counts_once() {
     let mut h = SpotifyHistory::default();
     let s = import(&found, &mut h, |_, _| {}).unwrap();
     assert_eq!((s.added, s.skipped), (2, 0));
-    assert_eq!(h.meta().plays, 2);
+    assert_eq!(h.meta().unwrap().plays, 2);
 }
 
 #[test]
@@ -446,4 +451,208 @@ fn a_corrupt_zip_next_to_a_good_folder_refuses_the_import() {
     fs::write(&zip, b"this is not a zip").unwrap();
     let err = find_history(&[folder, zip]).unwrap_err();
     assert!(err.to_string().contains("broken.zip"), "{err}");
+}
+
+#[test]
+fn a_history_whose_import_record_is_damaged_refuses_a_reimport() {
+    let tmp = tempdir().unwrap();
+    let file = tmp.path().join(AUDIO);
+    fs::write(&file, json_bytes(&two_plays())).unwrap();
+    let folder = DataFolder::new(tmp.path().join("data"), tmp.path().join("backup"));
+    let mut doc = folder.read::<SpotifyHistory>().unwrap();
+    run(&[file.clone()], &mut doc.value).unwrap();
+    doc.save().unwrap();
+    let saved = tmp.path().join("data/spotify.json");
+    let good: Value = serde_json::from_slice(&fs::read(&saved).unwrap()).unwrap();
+    // The record gone, its cursor gone, or a cursor of the wrong type.
+    for record in [
+        None,
+        Some(json!({"plays": 2, "imported": 1, "files": 1})),
+        Some(json!({"through": "soon", "plays": 2, "imported": 1, "files": 1})),
+    ] {
+        let mut damaged = good.clone();
+        match record {
+            None => {
+                damaged.as_object_mut().unwrap().remove("spotify");
+            }
+            Some(record) => damaged["spotify"] = record,
+        }
+        fs::write(&saved, serde_json::to_vec(&damaged).unwrap()).unwrap();
+        let mut doc = folder.read::<SpotifyHistory>().unwrap();
+        let before = serde_json::to_string(&doc.value).unwrap();
+        let err = run(&[file.clone()], &mut doc.value).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Your saved Spotify history's import record is damaged, so nothing was imported."
+        );
+        assert_eq!(serde_json::to_string(&doc.value).unwrap(), before);
+    }
+}
+
+#[test]
+fn songs_count_as_deep_as_the_library_scan_reaches() {
+    let tmp = tempdir().unwrap();
+    let nested = |root: &Path, levels: usize| {
+        (0..levels).fold(root.to_owned(), |p, i| p.join(format!("d{i}")))
+    };
+    // History at the top of the folder, its only song fourteen folders down: the scan's deepest.
+    let mixed = tmp.path().join("mixed");
+    let deep = nested(&mixed, 14);
+    fs::create_dir_all(&deep).unwrap();
+    fs::write(mixed.join(AUDIO), json_bytes(&two_plays())).unwrap();
+    fs::write(deep.join("track.flac"), b"").unwrap();
+    // A song one folder deeper than the scan goes.
+    let beyond = tmp.path().join("beyond");
+    fs::create_dir_all(nested(&beyond, 15)).unwrap();
+    fs::write(nested(&beyond, 15).join("track.flac"), b"").unwrap();
+    // Songs only in folders the scan skips.
+    let skipped = tmp.path().join("skipped");
+    for name in [".hidden", "$RECYCLE.BIN", "node_modules", "__MACOSX"] {
+        fs::create_dir_all(skipped.join(name)).unwrap();
+        fs::write(skipped.join(name).join("track.mp3"), b"").unwrap();
+    }
+    for (path, want) in [
+        (mixed, (true, true)),
+        (beyond, (false, false)),
+        (skipped, (false, false)),
+    ] {
+        let found = holds(&path);
+        assert_eq!((found.history, found.music), want, "{path:?}");
+    }
+}
+
+fn replaced(bytes: &[u8], from: &[u8], to: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut count = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(from) {
+            out.extend_from_slice(to);
+            i += from.len();
+            count += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    (out, count)
+}
+
+#[test]
+fn a_zip_holding_two_files_of_one_name_is_refused() {
+    let tmp = tempdir().unwrap();
+    let zip = tmp.path().join("export.zip");
+    let other = "Streaming_History_Audio_2021_9.json";
+    zip_of(
+        &zip,
+        &[
+            (AUDIO, json_bytes(&[row("2020-01-01T10:00:00Z", 9, 60_000)])),
+            (other, json_bytes(&two_plays())),
+        ],
+    );
+    // The second entry renamed to the first's name, in its own header and in the zip's list alike.
+    let (bytes, count) = replaced(&fs::read(&zip).unwrap(), other.as_bytes(), AUDIO.as_bytes());
+    assert_eq!(count, 2);
+    fs::write(&zip, bytes).unwrap();
+    let err = find_history(&[zip.clone()]).unwrap_err();
+    assert!(err.to_string().contains("export.zip"), "{err}");
+    // A drop of it goes to the import, which refuses it, as for any zip that can't be read.
+    assert!(holds(&zip).unreadable);
+}
+
+#[test]
+fn a_link_that_cant_be_followed_is_unreadable_within_the_history_search_only() {
+    let tmp = tempdir().unwrap();
+    // Links to a folder that's gone, as when the drive it was on is unplugged.
+    let root = tmp.path().join("root");
+    let four = ["a", "b", "c", "d"]
+        .iter()
+        .fold(root.clone(), |p, n| p.join(n));
+    let near = four.join("near");
+    let far = four.join("e").join("far");
+    fs::create_dir_all(four.join("e")).unwrap();
+    let target = tmp.path().join("gone");
+    fs::create_dir(&target).unwrap();
+    for at in [&near, &far] {
+        let made = std::process::Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(at)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+    }
+    fs::remove_dir(&target).unwrap();
+    // `near` is in a folder four down, which the search lists; given alone, a link is refused too.
+    assert!(holds(&root).unreadable);
+    assert!(find_history(&[root.clone()]).is_err());
+    assert!(holds(&near).unreadable);
+    fs::remove_dir(&near).unwrap();
+    // `far` is in a folder five down: beyond the search.
+    assert!(!holds(&root).unreadable);
+    assert!(find_history(&[root]).unwrap().is_empty());
+}
+
+#[test]
+fn an_import_beyond_its_limits_is_refused_before_anything_changes() {
+    let tmp = tempdir().unwrap();
+    let bytes = json_bytes(&two_plays());
+    let loose = tmp.path().join(AUDIO);
+    fs::write(&loose, &bytes).unwrap();
+    let zip = tmp.path().join("export.zip");
+    zip_of(&zip, &[(AUDIO, bytes.clone())]);
+    let size = bytes.len() as u64;
+    for path in [loose, zip] {
+        let sources = find_history(&[path.clone()]).unwrap();
+        let mut h = SpotifyHistory::default();
+        let small = Limits {
+            file_bytes: size - 1,
+            ..Limits::default()
+        };
+        let err = import_within(&sources, &mut h, small, |_, _| {}).unwrap_err();
+        assert!(
+            matches!(&err, ImportError::Unreadable { file, .. } if file == AUDIO),
+            "{path:?}: {err:?}"
+        );
+        assert_eq!((h.0.track_count(), h.0.days().len()), (0, 0));
+        let exact = Limits {
+            file_bytes: size,
+            ..Limits::default()
+        };
+        import_within(&sources, &mut h, exact, |_, _| {}).unwrap();
+    }
+    // Four plays in two files, against a limit of three.
+    let more = tmp.path().join("more");
+    fs::create_dir(&more).unwrap();
+    fs::write(more.join("Streaming_History_Audio_2021_0.json"), &bytes).unwrap();
+    fs::write(
+        more.join("Streaming_History_Audio_2021_1.json"),
+        json_bytes(&[
+            row("2021-06-01T10:00:00Z", 3, 60_000),
+            row("2021-06-02T10:00:00Z", 4, 60_000),
+        ]),
+    )
+    .unwrap();
+    let sources = find_history(&[more]).unwrap();
+    let mut h = SpotifyHistory::default();
+    let three = Limits {
+        plays: 3,
+        ..Limits::default()
+    };
+    let err = import_within(&sources, &mut h, three, |_, _| {}).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "That holds more than 5,000,000 plays, more than String can import, so nothing was imported."
+    );
+    assert_eq!((h.0.track_count(), h.0.days().len()), (0, 0));
+    let four = Limits {
+        plays: 4,
+        ..Limits::default()
+    };
+    assert_eq!(
+        import_within(&sources, &mut h, four, |_, _| {})
+            .unwrap()
+            .added,
+        4
+    );
 }

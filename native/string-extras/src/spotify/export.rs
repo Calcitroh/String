@@ -7,7 +7,11 @@ use std::{
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
 };
-use string_core::{data::SpotifyHistory, library::is_song_name, stats::Track};
+use string_core::{
+    data::SpotifyHistory,
+    library::{is_song_name, scan_enters},
+    stats::Track,
+};
 
 /// Where a history file lives: loose, or inside a zip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +48,15 @@ pub enum ImportError {
     NothingNew,
     #[error("That doesn't hold a Spotify listening history (Streaming_History_Audio files).")]
     NoHistory,
+    #[error("Your saved Spotify history's import record is damaged, so nothing was imported.")]
+    Damaged,
+    #[error(
+        "That holds more than 5,000,000 plays, more than String can import, so nothing was imported."
+    )]
+    TooMany,
 }
 
+/// How many folders below a folder given the history search goes.
 const DEPTH: usize = 4;
 
 fn is_audio_name(name: &str) -> bool {
@@ -64,7 +75,7 @@ pub fn find_history(paths: &[PathBuf]) -> io::Result<Vec<Source>> {
     let mut found = vec![];
     let mut seen = HashSet::new();
     for path in paths {
-        collect(path, 1, &mut found, &mut seen).map_err(|e| named(path, e))?;
+        collect(path, 0, &mut found, &mut seen).map_err(|e| named(path, e))?;
     }
     found.sort_by_cached_key(|s| (s.file_name().to_lowercase(), format!("{s:?}")));
     Ok(found)
@@ -76,25 +87,25 @@ fn named(path: &Path, e: io::Error) -> io::Error {
         .to_string_lossy();
     io::Error::new(e.kind(), format!("{name}: {e}"))
 }
+/// `depth`: how many folders below the path given `path` is.
 fn collect(
     path: &Path,
-    level: usize,
+    depth: usize,
     found: &mut Vec<Source>,
     seen: &mut HashSet<(PathBuf, String)>,
 ) -> io::Result<()> {
     if fs::metadata(path)?.is_dir() {
-        if level > DEPTH {
+        if depth > DEPTH {
             return Ok(());
         }
         for entry in fs::read_dir(path)? {
             let child = entry?.path();
-            collect(&child, level + 1, found, seen).map_err(|e| named(&child, e))?;
+            collect(&child, depth + 1, found, seen).map_err(|e| named(&child, e))?;
         }
         return Ok(());
     }
-    if is_zip(path) && level == 1 {
-        let mut archive =
-            zip::ZipArchive::new(BufReader::new(File::open(path)?)).map_err(zip_error)?;
+    if is_zip(path) && depth == 0 {
+        let mut archive = open_zip(path)?;
         let real = fs::canonicalize(path)?;
         for i in 0..archive.len() {
             let entry = archive.by_index_raw(i).map_err(zip_error)?;
@@ -123,111 +134,138 @@ fn collect(
 fn zip_error(e: zip::result::ZipError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
+/// A zip whose files can be told apart: the archive keeps one file of any name, so a second file of the same name
+/// would go unread, and its plays be passed for good.
+fn open_zip(path: &Path) -> io::Result<zip::ZipArchive<BufReader<File>>> {
+    let archive = zip::ZipArchive::new(BufReader::new(File::open(path)?)).map_err(zip_error)?;
+    if archive.has_duplicate_names() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "it holds two files with the same name",
+        ));
+    }
+    Ok(archive)
+}
 
 /// What a dropped path holds: a history file by `find_history`'s rules, and songs by the library scan's.
+/// `unreadable`: part of what `find_history` would read can't be (a zip, or a folder), so only the import can tell.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Holds {
     pub history: bool,
     pub music: bool,
+    pub unreadable: bool,
 }
 
 /// Whether `path` is, or holds, a history file by `find_history`'s rules. It stops at the first one; see `holds`.
 pub fn is_history(path: &Path) -> bool {
-    look(
-        path,
-        Holds {
-            history: true,
-            music: false,
-        },
-    )
-    .history
+    look(path, false).history
 }
-/// Whether `path` is, or holds, a history file, and whether it is or holds songs, looking as deep as
-/// `find_history` does and stopping once both are known. It tells folders from files by the folder listing, so a
-/// big music folder is walked without opening each file. What can't be read counts as nothing here; the import or the
-/// scan names it. Meant for a worker thread: it opens zips and walks folders.
+/// Whether `path` is, or holds, a history file, looking as deep as `find_history` does, and whether it is or holds
+/// songs, looking where the library scan does; it stops once both are known. It tells folders from files by the folder
+/// listing, so a big music folder is walked without opening each file. Meant for a worker thread: it opens zips and
+/// walks folders.
 pub fn holds(path: &Path) -> Holds {
-    look(
-        path,
-        Holds {
-            history: true,
-            music: true,
-        },
-    )
+    look(path, true)
 }
-fn look(path: &Path, want: Holds) -> Holds {
+fn look(path: &Path, songs: bool) -> Holds {
     let mut found = Holds::default();
     match fs::metadata(path) {
-        Ok(m) if m.is_dir() => look_in(path, 1, want, &mut found),
-        Ok(_) if is_zip(path) => found.history = want.history && zip_has_history(path),
+        Ok(m) if m.is_dir() => look_in(path, 0, songs, songs, &mut found),
+        Ok(_) if is_zip(path) => match zip_has_history(path) {
+            Ok(history) => found.history = history,
+            Err(_) => found.unreadable = true,
+        },
         Ok(_) => {
             if let Some(name) = path.file_name() {
-                note(&name.to_string_lossy(), want, &mut found);
+                note(&name.to_string_lossy(), true, songs, &mut found);
             }
         }
-        Err(_) => {}
+        // Gone since it was dropped, rather than a link to something that can't be reached.
+        Err(e) if e.kind() == io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() => {}
+        Err(_) => found.unreadable = true,
     }
     found
 }
-fn note(name: &str, want: Holds, found: &mut Holds) {
-    if want.history && is_audio_name(name) {
+fn note(name: &str, history: bool, songs: bool, found: &mut Holds) {
+    if history && is_audio_name(name) {
         found.history = true;
-    } else if want.music && is_song_name(name) {
+    } else if songs && is_song_name(name) {
         found.music = true;
     }
 }
-fn known(want: Holds, found: Holds) -> bool {
-    (found.history || !want.history) && (found.music || !want.music)
+fn known(want_songs: bool, found: Holds) -> bool {
+    found.history && (found.music || !want_songs)
 }
-fn look_in(dir: &Path, level: usize, want: Holds, found: &mut Holds) {
-    if level > DEPTH {
+/// Lists `dir`, `depth` folders below the path given: for history while `find_history` would, and for songs while
+/// `songs` (the scan goes there) and none are found yet.
+fn look_in(dir: &Path, depth: usize, songs: bool, want_songs: bool, found: &mut Holds) {
+    let history = depth <= DEPTH;
+    let songs = songs && !found.music;
+    if !history && !songs {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => {
+            found.unreadable |= history;
+            return;
+        }
     };
     let mut folders = vec![];
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            found.unreadable |= history;
             continue;
         };
-        // A link is followed, as `find_history` follows it.
+        let Ok(kind) = entry.file_type() else {
+            found.unreadable |= history;
+            continue;
+        };
+        // A link is followed, as `find_history` and the scan follow it; `find_history` refuses one it can't follow.
         let folder = if kind.is_symlink() {
-            fs::metadata(entry.path()).is_ok_and(|m| m.is_dir())
+            match fs::metadata(entry.path()) {
+                Ok(m) => m.is_dir(),
+                Err(_) => {
+                    found.unreadable |= history;
+                    continue;
+                }
+            }
         } else {
             kind.is_dir()
         };
+        let name = entry.file_name().to_string_lossy().into_owned();
         if folder {
-            folders.push(entry.path());
+            let deeper = songs && u8::try_from(depth).is_ok_and(|d| scan_enters(&name, d));
+            if depth < DEPTH || deeper {
+                folders.push((entry.path(), deeper));
+            }
         } else {
-            note(&entry.file_name().to_string_lossy(), want, found);
-            if known(want, *found) {
+            note(&name, history, songs, found);
+            if known(want_songs, *found) {
                 return;
             }
         }
     }
-    for folder in folders {
-        look_in(&folder, level + 1, want, found);
-        if known(want, *found) {
+    for (folder, songs) in folders {
+        look_in(&folder, depth + 1, songs, want_songs, found);
+        if known(want_songs, *found) {
             return;
         }
     }
 }
-fn zip_has_history(path: &Path) -> bool {
-    let Ok(mut archive) = File::open(path)
-        .map_err(zip::result::ZipError::Io)
-        .and_then(|f| zip::ZipArchive::new(BufReader::new(f)))
-    else {
-        return false;
-    };
-    (0..archive.len()).any(|i| {
-        archive.by_index_raw(i).is_ok_and(|entry| {
-            entry.is_file()
-                && entry
-                    .name()
-                    .is_ok_and(|n| is_audio_name(n.rsplit(['/', '\\']).next().unwrap_or("")))
-        })
-    })
+fn zip_has_history(path: &Path) -> io::Result<bool> {
+    let mut archive = open_zip(path)?;
+    for i in 0..archive.len() {
+        let entry = archive.by_index_raw(i).map_err(zip_error)?;
+        if entry.is_file()
+            && entry
+                .name()
+                .is_ok_and(|n| is_audio_name(n.rsplit(['/', '\\']).next().unwrap_or("")))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Only what the app uses; serde skips every other field (addresses, countries, devices) without keeping it.
@@ -249,32 +287,64 @@ struct Play {
     secs: f64,
 }
 
-fn read_rows(source: &Source) -> Result<Vec<Row>, ImportError> {
+/// The rows of `source`, refused when it unpacks to more than `limit` bytes.
+fn read_rows(source: &Source, limit: u64) -> Result<Vec<Row>, ImportError> {
     let unreadable = |reason: String| ImportError::Unreadable {
         file: source.file_name(),
         reason,
     };
+    let too_big = || unreadable("it's far larger than a Spotify history file".into());
     let mut bytes = vec![];
     match source {
         Source::File(path) => {
-            File::open(path)
-                .and_then(|mut f| f.read_to_end(&mut bytes))
+            let file = File::open(path).map_err(|e| unreadable(e.to_string()))?;
+            if file
+                .metadata()
+                .map_err(|e| unreadable(e.to_string()))?
+                .len()
+                > limit
+            {
+                return Err(too_big());
+            }
+            file.take(limit.saturating_add(1))
+                .read_to_end(&mut bytes)
                 .map_err(|e| unreadable(e.to_string()))?;
         }
         Source::ZipEntry { zip, name } => {
-            let mut archive = File::open(zip)
-                .map_err(zip::result::ZipError::Io)
-                .and_then(|f| zip::ZipArchive::new(BufReader::new(f)))
-                .map_err(|e| unreadable(e.to_string()))?;
-            let mut entry = archive
+            let mut archive = open_zip(zip).map_err(|e| unreadable(e.to_string()))?;
+            let entry = archive
                 .by_name(name)
                 .map_err(|e| unreadable(e.to_string()))?;
+            if entry.size() > limit {
+                return Err(too_big());
+            }
+            // The size a zip states can be false: what it unpacks to is counted too.
             entry
+                .take(limit.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .map_err(|e| unreadable(e.to_string()))?;
         }
     }
+    if bytes.len() as u64 > limit {
+        return Err(too_big());
+    }
     serde_json::from_slice(&bytes).map_err(|e| unreadable(e.to_string()))
+}
+
+/// The most one import takes: a history file's size once unpacked, and the plays it adds. Spotify's files are about
+/// 12 MB each, and years of listening are a few hundred thousand plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub file_bytes: u64,
+    pub plays: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            file_bytes: 256 << 20,
+            plays: 5_000_000,
+        }
+    }
 }
 
 /// Adds the plays newer than the history's cursor. Every source is parsed before `into` is touched, so a damaged
@@ -282,18 +352,27 @@ fn read_rows(source: &Source) -> Result<Vec<Row>, ImportError> {
 pub fn import(
     sources: &[Source],
     into: &mut SpotifyHistory,
+    progress: impl FnMut(usize, usize),
+) -> Result<Summary, ImportError> {
+    import_within(sources, into, Limits::default(), progress)
+}
+/// `import`, refusing more than `limits` allow.
+pub fn import_within(
+    sources: &[Source],
+    into: &mut SpotifyHistory,
+    limits: Limits,
     mut progress: impl FnMut(usize, usize),
 ) -> Result<Summary, ImportError> {
     if sources.is_empty() {
         return Err(ImportError::NoHistory);
     }
-    let meta = into.meta();
+    let meta = into.meta().ok_or(ImportError::Damaged)?;
     let mut plays = vec![];
     let mut skipped = 0u64;
     // Exports overlap, and a file can be reached twice; a play is the same play when all three match.
     let mut seen = HashSet::new();
     for (i, source) in sources.iter().enumerate() {
-        for row in read_rows(source)? {
+        for row in read_rows(source, limits.file_bytes)? {
             let Some(at) = row
                 .ts
                 .as_deref()
@@ -331,6 +410,9 @@ pub fn import(
                 album: row.master_metadata_album_album_name.unwrap_or_default(),
                 secs: played / 1000.,
             });
+            if plays.len() > limits.plays {
+                return Err(ImportError::TooMany);
+            }
         }
         progress(i + 1, sources.len());
     }

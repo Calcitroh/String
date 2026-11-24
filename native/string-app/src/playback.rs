@@ -336,7 +336,8 @@ impl Session {
             plays: self
                 .spotify
                 .as_ref()
-                .map_or(0, |doc| doc.value.meta().plays),
+                .and_then(|doc| doc.value.meta())
+                .map_or(0, |meta| meta.plays),
         })
     }
     pub fn current(&self) -> Option<&Song> {

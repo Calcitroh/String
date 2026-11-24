@@ -99,19 +99,24 @@ impl Model for Library {
 #[serde(transparent)]
 pub struct SpotifyHistory(pub Listening);
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct SpotifyMeta {
     pub through: i64,
+    #[serde(default)]
     pub plays: u64,
+    #[serde(default)]
     pub imported: i64,
+    #[serde(default)]
     pub files: u64,
 }
 impl SpotifyHistory {
-    pub fn meta(&self) -> SpotifyMeta {
+    /// How far the history reaches: none yet for a new one. `None` when it holds plays but its record of them is
+    /// missing or damaged, as importing from nothing would add every play it holds again.
+    pub fn meta(&self) -> Option<SpotifyMeta> {
+        let empty = self.0.days().is_empty() && self.0.track_count() == 0;
         self.0
             .top_field("spotify")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default()
+            .or_else(|| empty.then(SpotifyMeta::default))
     }
     pub fn set_meta(&mut self, meta: SpotifyMeta) {
         self.0
@@ -246,14 +251,19 @@ impl DataFolder {
     /// backups, in `<backup>/opened/<date>/`; ten days are kept. The daily backup holds what String last saved that
     /// day, so a profile another version of String saved earlier the same day would otherwise have no copy from before
     /// this version's first save (and with a file missing, today's backup of it may be the only copy left).
+    /// A Spotify history that can't be copied is an error naming it, but the other copies are kept.
     pub fn keep_opening_copy(&self) -> io::Result<()> {
-        self.keep_opening_copy_for(Local::now().date_naive())
+        match self.keep_opening_copy_for(Local::now().date_naive())? {
+            Some(spotify) => Err(spotify),
+            None => Ok(()),
+        }
     }
-    fn keep_opening_copy_for(&self, date: NaiveDate) -> io::Result<()> {
+    /// `Ok(Some(error))`: everything but the Spotify history was copied.
+    fn keep_opening_copy_for(&self, date: NaiveDate) -> io::Result<Option<io::Error>> {
         let days = self.backup.join("opened");
         let today = days.join(date.to_string());
         if today.is_dir() {
-            return Ok(());
+            return Ok(None);
         }
         if today.exists() {
             return Err(io::Error::new(
@@ -266,12 +276,7 @@ impl DataFolder {
             .prefix(".copying-")
             .tempdir_in(&days)?;
         let dir = staging.path();
-        for name in [
-            State::NAME,
-            Listening::NAME,
-            Library::NAME,
-            SpotifyHistory::NAME,
-        ] {
+        let copy = |name: &str| -> io::Result<()> {
             if let Some(bytes) = read_existing(&self.root.join(format!("{name}.json")))? {
                 replace(dir, &dir.join(format!("{name}.json")), &bytes)?;
             }
@@ -279,10 +284,17 @@ impl DataFolder {
             if let Some(bytes) = read_existing(&self.backup.join(&daily))? {
                 replace(dir, &dir.join(daily), &bytes)?;
             }
+            Ok(())
+        };
+        for name in [State::NAME, Listening::NAME, Library::NAME] {
+            copy(name)?;
         }
+        let spotify = copy(SpotifyHistory::NAME)
+            .err()
+            .map(|e| io::Error::new(e.kind(), format!("{}.json: {e}", SpotifyHistory::NAME)));
         if let Err(e) = fs::rename(dir, &today) {
             if today.is_dir() {
-                return Ok(());
+                return Ok(None);
             }
             return Err(e);
         }
@@ -301,7 +313,7 @@ impl DataFolder {
         for old in kept.into_iter().skip(10) {
             fs::remove_dir_all(old)?;
         }
-        Ok(())
+        Ok(spotify)
     }
     /// Moves a model's file into the backup folder as `<name>-removed-<stamp>.json`, or `None` when there is no
     /// file. An existing target is never overwritten: that fails with `AlreadyExists`. Takes the lock saves take.
@@ -461,7 +473,8 @@ impl<T: Model> Document<T> {
         let Some(bytes) = read_existing(&self.folder.backup.join(&name))? else {
             return Ok(());
         };
-        self.folder.keep_opening_copy_for(date)?;
+        // A Spotify history that couldn't be copied doesn't touch this document's copy, checked below.
+        let _ = self.folder.keep_opening_copy_for(date)?;
         let opened = self.folder.backup.join("opened").join(date.to_string());
         if read_existing(&opened.join(name))?.as_deref() == Some(&bytes)
             || read_existing(&opened.join(format!("{}.json", T::NAME)))?.as_deref() == Some(&bytes)

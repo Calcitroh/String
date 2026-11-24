@@ -295,7 +295,8 @@ The self-test runs muted and off-screen with instance names of its own, and writ
 per step; `--data` takes a copy of a real profile too. Without `--smoke-test`, `--data <folder>` opens String on that
 folder (its backups stay inside it), and it shares the single-instance names, so close any other String first.
 Its `stats-spotify` step imports the export `STRING_SMOKE_SPOTIFY_EXPORT` names (else a small made-up one, unless the
-profile already has a Spotify history) the way a drop on Stats does, and writes its numbers to `stats-spotify.json`.
+profile already has a Spotify history) the way a drop on Stats does, and writes its numbers to `stats-spotify.json`;
+an import that fails, or a made-up history that doesn't come in whole, fails the self-test.
 
 Stats can include a Spotify history (Spotify's "Extended streaming history" export) from `<data>\spotify.json`, a
 document of its own in `listening.json`'s shape: written only by an import, read on a worker at startup, never touched

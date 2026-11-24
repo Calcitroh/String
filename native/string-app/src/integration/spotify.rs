@@ -17,6 +17,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread,
+    time::{Duration, Instant},
 };
 use string_core::{
     data::{DataFolder, Document, SpotifyHistory},
@@ -158,6 +159,8 @@ struct Imported {
     summary: Summary,
     /// No `spotify.json` before this import.
     first: bool,
+    /// Saved, but its copy in the day's backups wasn't.
+    backup_failed: bool,
 }
 /// How an import or a removal ended.
 pub struct Outcome {
@@ -184,8 +187,13 @@ impl Job {
                 Err(TryRecvError::Empty) => return None,
                 Ok(Event::Imported(Ok(i))) => {
                     let s = &i.summary;
-                    let message =
+                    let mut message =
                         import_message(i.first, s.added, s.seconds, i.layer.matched_share());
+                    if i.backup_failed {
+                        message.push_str(&format!(
+                            " · The daily backup of {FILE} couldn't be written"
+                        ));
+                    }
                     break (message, false, Some(i.summary), Some(i.layer));
                 }
                 Ok(Event::Imported(Err(why)) | Event::Removed(Err(why))) => {
@@ -273,7 +281,7 @@ fn import(
     let first = !doc.exists();
     progress(0, sources.len());
     let summary = export::import(&sources, &mut doc.value, progress).map_err(|e| e.to_string())?;
-    doc.save().map_err(|e| {
+    let saved = doc.save().map_err(|e| {
         format!(
             "Couldn't save {FILE} ({}), so nothing was imported.",
             reason(&e)
@@ -283,6 +291,7 @@ fn import(
         layer: SpotifyLayer::matched(doc, songs),
         summary,
         first,
+        backup_failed: saved.backup_error.is_some(),
     })
 }
 /// Moves `spotify.json` into the backup folder as `spotify-removed-<stamp>.json`.
@@ -343,7 +352,7 @@ pub(crate) fn import_message(first: bool, added: u64, seconds: f64, share: f64) 
     let s = if added == 1 { "" } else { "s" };
     if first {
         format!(
-            "Added {} play{s} ({} h) from Spotify · {}% are songs in your library",
+            "Added {} play{s} ({} h) from Spotify · {}% of that time is songs in your library",
             grouped(added),
             hours(seconds),
             percent(share)
@@ -356,9 +365,9 @@ pub(crate) fn import_message(first: bool, added: u64, seconds: f64, share: f64) 
 /* ---------- drops ---------- */
 
 /// Where dropped files go. Songs, and anything that is neither songs nor a Spotify history, go to the library as
-/// before; a history goes to the import on Stats, and elsewhere a history alone gets a word about Stats. Telling them
-/// apart opens zips and walks folders, so it runs on a thread of its own; the library's share goes on to the library's
-/// add worker from there, in the order dropped.
+/// before; a history goes to the import on Stats (with anything there that can't be read), and elsewhere a history
+/// alone gets a word about Stats. Telling them apart opens zips and walks folders, so it runs on a thread of its own;
+/// the library's share goes on to the library's add worker from there, in the order dropped.
 pub struct Drops {
     classify: Arc<Mutex<Box<Check>>>,
     worker: Option<(Sender<Sorting>, Receiver<Sorted>)>,
@@ -375,7 +384,7 @@ struct Sorting {
     library: add_work::Input,
 }
 struct Sorted {
-    /// What to import: the paths that hold a history, when dropped on Stats.
+    /// What to import: the paths that hold a history or can't be read, when dropped on Stats.
     history: Vec<PathBuf>,
     /// A history alone was dropped on another page.
     elsewhere: bool,
@@ -394,8 +403,8 @@ fn look(path: &Path) -> Holds {
         .is_some_and(|n| is_song_name(&n.to_string_lossy()))
     {
         return Holds {
-            history: false,
             music: true,
+            ..Holds::default()
         };
     }
     export::holds(path)
@@ -471,14 +480,20 @@ impl Drops {
                         // A check that panics leaves the path to the library, as before.
                         let holds =
                             catch_unwind(AssertUnwindSafe(|| check(&path))).unwrap_or_default();
-                        match (holds.history, holds.music) {
-                            (true, true) if job.on_stats => {
+                        // What can't be read goes to the import too, which refuses it by name: imported without
+                        // it, the history would move past the plays it may hold.
+                        let import = holds.history || holds.unreadable;
+                        if job.on_stats {
+                            if import {
                                 sorted.history.push(path.clone());
+                            }
+                            if holds.music || !import {
                                 library.push(path);
                             }
-                            (true, false) if job.on_stats => sorted.history.push(path),
-                            (true, false) => sorted.elsewhere = true,
-                            _ => library.push(path),
+                        } else if holds.history && !holds.music {
+                            sorted.elsewhere = true;
+                        } else {
+                            library.push(path);
                         }
                     }
                     drop(check);
@@ -500,6 +515,16 @@ impl Drops {
     /// A drop is still being sorted: its songs aren't with the library yet.
     pub(crate) fn sorting(&self) -> bool {
         self.sorting.load(Ordering::SeqCst) > 0
+    }
+    /// Waits until no drop is being sorted, or until `deadline`; whether none is.
+    pub(crate) fn wait_sorted(&self, deadline: Instant) -> bool {
+        while self.sorting() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        true
     }
     /// Takes in sorted drops: a history dropped on Stats starts the import, one dropped elsewhere says where it goes.
     pub(crate) fn poll(&mut self, s: &mut Session, toast: &mut Toast) {
@@ -736,7 +761,7 @@ mod tests {
         assert_eq!(s.remove_spotify(), Err(BUSY.into()));
         assert_eq!(
             settle(&mut s),
-            "Added 2 plays (< 1 h) from Spotify · 0% are songs in your library"
+            "Added 2 plays (< 1 h) from Spotify · 0% of that time is songs in your library"
         );
         assert!(!s.spotify_busy());
         assert_eq!(s.spotify_summary().unwrap().plays, 2);
@@ -752,7 +777,7 @@ mod tests {
     fn the_import_toast_says_what_came_in() {
         assert_eq!(
             import_message(true, 166_474, 4212. * 3600., 0.61),
-            "Added 166,474 plays (4,212 h) from Spotify · 61% are songs in your library"
+            "Added 166,474 plays (4,212 h) from Spotify · 61% of that time is songs in your library"
         );
         assert_eq!(
             import_message(false, 1204, 9000., 0.5),
@@ -761,8 +786,48 @@ mod tests {
         assert_eq!(import_message(false, 1, 90., 0.), "Added 1 new play");
         assert_eq!(
             import_message(true, 1, 90., 1.),
-            "Added 1 play (< 1 h) from Spotify · 100% are songs in your library"
+            "Added 1 play (< 1 h) from Spotify · 100% of that time is songs in your library"
         );
+    }
+
+    #[test]
+    fn a_daily_backup_that_cant_be_written_is_said_after_the_import() {
+        let dir = tempfile::tempdir().unwrap();
+        // A file where the backup folder goes: the history is saved, its daily backup copy can't be.
+        fs::write(dir.path().join("backup"), b"in the way").unwrap();
+        let mut s = open(dir.path());
+        s.import_spotify(vec![export(dir.path())]).unwrap();
+        let said = settle(&mut s);
+        assert!(said.starts_with("Added 2 plays ("), "{said}");
+        assert!(
+            said.ends_with(" · The daily backup of spotify.json couldn't be written"),
+            "{said}"
+        );
+        assert!(!said.contains(&*dir.path().to_string_lossy()), "{said}");
+        assert!(!s.spotify_outcome.as_ref().unwrap().failed);
+        assert!(dir.path().join("spotify.json").exists());
+        assert_eq!(s.spotify_summary().unwrap().plays, 2);
+    }
+
+    #[test]
+    fn a_damaged_import_record_refuses_the_import_and_stays_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = open(dir.path());
+        s.import_spotify(vec![export(dir.path())]).unwrap();
+        settle(&mut s);
+        let file = dir.path().join("spotify.json");
+        let mut doc: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        doc.as_object_mut().unwrap().remove("spotify");
+        let damaged = serde_json::to_vec(&doc).unwrap();
+        fs::write(&file, &damaged).unwrap();
+        let mut s = open(dir.path());
+        s.import_spotify(vec![export(dir.path())]).unwrap();
+        assert_eq!(
+            settle(&mut s),
+            "Your saved Spotify history's import record is damaged, so nothing was imported."
+        );
+        assert!(s.spotify_outcome.as_ref().unwrap().failed);
+        assert_eq!(fs::read(&file).unwrap(), damaged);
     }
 
     #[test]

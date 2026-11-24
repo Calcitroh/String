@@ -121,6 +121,10 @@ fn traversable(name: &str) -> bool {
             "node_modules" | "system volume information" | "__macosx"
         )
 }
+/// Whether a scan goes into a subfolder of this name, found in a folder `depth` folders below the one scanned.
+pub fn scan_enters(name: &str, depth: u8) -> bool {
+    depth < MAX_DEPTH && traversable(&name.to_lowercase())
+}
 
 struct Found {
     path: String,

@@ -77,7 +77,7 @@ fn spotify_history_round_trips_its_meta() {
     doc.value.0.set_top_field("future", json!({"keep": true}));
     doc.save().unwrap();
     let back = folder.read::<SpotifyHistory>().unwrap();
-    assert_eq!(back.value.meta(), meta);
+    assert_eq!(back.value.meta(), Some(meta));
     assert_eq!(back.value.0.top_field("future"), Some(&json!({"keep": true})));
 }
 
@@ -147,4 +147,59 @@ fn remap_sums_colliding_tracks_and_rebuilds_artists() {
     assert_eq!(r.artists[0], ("Artist A".to_string(), 150.));
     assert_eq!(layer.tracks().count(), before.tracks().count());
     assert_eq!(layer.days()[&day(2020, 3, 1)].t.len(), 3);
+}
+
+/// Opens `path` the way another program holding it does: nobody else can read it until the handle closes.
+#[cfg(windows)]
+fn locked(path: &std::path::Path) -> fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn a_spotify_file_that_cant_be_copied_leaves_the_other_opening_copies() {
+    let dir = tempdir().unwrap();
+    let backup = dir.path().join("backup");
+    let folder = DataFolder::new(dir.path(), &backup);
+    fs::write(dir.path().join("state.json"), b"{\"v\":1}").unwrap();
+    fs::write(dir.path().join("listening.json"), b"{\"v\":1}").unwrap();
+    fs::write(dir.path().join("spotify.json"), b"{\"v\":1}").unwrap();
+    let lock = locked(&dir.path().join("spotify.json"));
+    let err = folder.keep_opening_copy().unwrap_err().to_string();
+    assert!(err.contains("spotify.json"), "{err}");
+    for other in ["state.json", "listening.json", "library.json"] {
+        assert!(!err.contains(other), "{err}");
+    }
+    let kept = backup
+        .join("opened")
+        .join(Local::now().date_naive().to_string());
+    assert_eq!(fs::read(kept.join("state.json")).unwrap(), b"{\"v\":1}");
+    assert_eq!(fs::read(kept.join("listening.json")).unwrap(), b"{\"v\":1}");
+    assert!(!kept.join("spotify.json").exists());
+    drop(lock);
+
+    // The first save of the day makes the opening copy too: a locked spotify.json doesn't cost it its daily backup.
+    let dir = tempdir().unwrap();
+    let backup = dir.path().join("backup");
+    let folder = DataFolder::new(dir.path(), &backup);
+    fs::create_dir_all(&backup).unwrap();
+    let date = Local::now().date_naive();
+    fs::write(backup.join(format!("state-{date}.json")), b"{\"v\":1}").unwrap();
+    fs::write(dir.path().join("spotify.json"), b"{\"v\":1}").unwrap();
+    let _lock = locked(&dir.path().join("spotify.json"));
+    let mut state = folder.read::<string_core::state::State>().unwrap();
+    let saved = state.save().unwrap();
+    assert!(saved.backup_error.is_none(), "{:?}", saved.backup_error);
+    assert!(
+        backup
+            .join("opened")
+            .join(date.to_string())
+            .join(format!("state-{date}.json"))
+            .exists()
+    );
 }

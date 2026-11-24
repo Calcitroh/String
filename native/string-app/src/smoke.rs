@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock, PoisonError},
     time::{Duration, Instant},
 };
 use windows::Win32::{
@@ -27,6 +27,14 @@ static OUT: OnceLock<PathBuf> = OnceLock::new();
 /// The self-test's `--out` folder, for a case that writes files of its own.
 pub fn out() -> Option<&'static Path> {
     OUT.get().map(PathBuf::as_path)
+}
+static FAILED: Mutex<Option<String>> = Mutex::new(None);
+/// Fails the case being waited for with `why`: for a case whose own work went wrong, which waiting can't mend.
+pub fn fail(why: String) {
+    *FAILED.lock().unwrap_or_else(PoisonError::into_inner) = Some(why);
+}
+pub(crate) fn take_failure() -> Option<String> {
+    FAILED.lock().unwrap_or_else(PoisonError::into_inner).take()
 }
 fn library(v: &mut View<'_>) {
     v.go(Route::Home);
@@ -306,7 +314,11 @@ impl Smoke {
             }
             Step::Ready => {
                 let c = self.cases[self.index];
-                if (c.ready)(v) && self.since.elapsed() > Duration::from_millis(150) {
+                let ready = (c.ready)(v);
+                if let Some(why) = take_failure() {
+                    return Err(format!("Smoke case {} failed: {why}", c.name));
+                }
+                if ready && self.since.elapsed() > Duration::from_millis(150) {
                     let name = if v.s.models.songs.is_empty() {
                         "02-welcome"
                     } else {

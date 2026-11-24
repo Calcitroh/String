@@ -22,6 +22,11 @@ use std::{
 };
 use string_audio::{Player, Spectrum};
 const ADD_CLOSE_WAIT: Duration = Duration::from_secs(1);
+/// Whether an add String has taken isn't finished: a drop still being sorted, or paths being checked. The sorter
+/// queues a drop's songs before it stops counting the drop, so asking it first never misses songs passing between.
+fn add_unfinished(sorting: impl FnOnce() -> bool, checking: impl FnOnce() -> bool) -> bool {
+    sorting() || checking()
+}
 struct Runtime {
     session: Shared,
     player: Player,
@@ -118,7 +123,7 @@ impl App {
     }
     /// An add that String has taken but not finished: paths being checked, or a drop still being sorted.
     fn adding(&self) -> bool {
-        self.adds.pending() || self.views.drops.sorting()
+        add_unfinished(|| self.views.drops.sorting(), || self.adds.pending())
     }
     fn save_feedback(platform: &Platform, views: &mut Views, store: &mut Storage) {
         for msg in store.feedback.logs.drain(..) {
@@ -135,8 +140,17 @@ impl App {
             .take()
             .unwrap_or_else(|| Instant::now() + ADD_CLOSE_WAIT);
         if let Some(rt) = &self.runtime {
-            while let Some(batch) = self.adds.next_at_exit(add_deadline) {
-                batch.apply(&mut rt.session.lock().unwrap(), &mut self.scan);
+            loop {
+                while let Some(batch) = self.adds.next_at_exit(add_deadline) {
+                    batch.apply(&mut rt.session.lock().unwrap(), &mut self.scan);
+                }
+                // A drop still being sorted queues its songs once sorted; no new drop starts now adds are closed.
+                if !self.views.drops.wait_sorted(add_deadline)
+                    || !self.adds.pending()
+                    || Instant::now() >= add_deadline
+                {
+                    break;
+                }
             }
         }
         let mut reasons = Vec::new();
@@ -280,7 +294,7 @@ impl eframe::App for App {
             crate::screens::dupes::settle(&mut v);
         }
         if let Some(deadline) = self.close_work_deadline {
-            let adding = self.adds.pending() || self.views.drops.sorting();
+            let adding = add_unfinished(|| self.views.drops.sorting(), || self.adds.pending());
             if crate::screens::dupes::recycling() || (adding && Instant::now() < deadline) {
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
@@ -634,8 +648,8 @@ mod add_close_tests {
             let _ = entered.send(());
             let _ = gate.recv_timeout(Duration::from_secs(5));
             string_extras::spotify::Holds {
-                history: false,
                 music: true,
+                ..Default::default()
             }
         });
         a.views.drops.attach(&ctx);
@@ -672,6 +686,51 @@ mod add_close_tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        let folder = storage::folder(dir.path(), true);
+        assert_eq!(
+            folder.open().unwrap().state.value.fields["files"],
+            serde_json::json!([song])
+        );
+    }
+
+    #[test]
+    fn the_close_check_asks_the_sorter_before_the_add_queue() {
+        // The sorter puts a drop's songs in the add queue, then stops counting the drop. Should that happen between
+        // the two questions, asking the queue first would hear "no" from both.
+        let moved = std::cell::Cell::new(false);
+        let sorting = || !moved.replace(true);
+        let checking = || moved.replace(true);
+        assert!(add_unfinished(sorting, checking));
+    }
+
+    #[test]
+    fn an_exit_without_close_frames_waits_for_a_drop_being_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let song = dir.path().join("song.wav");
+        std::fs::write(&song, []).unwrap();
+        let (entered, sorting) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let ctx = Context::default();
+        let mut a = app(dir.path(), Adds::new().unwrap());
+        a.open(&ctx);
+        a.views.drops = crate::integration::spotify::Drops::with_classifier(move |_| {
+            let _ = entered.send(());
+            let _ = gate.recv_timeout(Duration::from_secs(5));
+            string_extras::spotify::Holds {
+                music: true,
+                ..Default::default()
+            }
+        });
+        assert!(a.views.drops.send(vec![song.clone()], false, &a.adds.input));
+        sorting.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The sort ends well inside the time a close gives an add.
+        let sorter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = release.send(());
+        });
+        let flushed = a.flush();
+        sorter.join().unwrap();
+        assert!(flushed, "{}", a.close_reason);
         let folder = storage::folder(dir.path(), true);
         assert_eq!(
             folder.open().unwrap().state.value.fields["files"],

@@ -259,7 +259,7 @@ fn a_history_drop_on_stats_imports_and_music_still_goes_to_the_library() {
     assert_eq!(session.spotify_summary().map(|s| s.plays), Some(2));
     assert!(
         d.said.iter().any(|m| m.starts_with("Added 2 plays (")
-            && m.ends_with(") from Spotify · 0% are songs in your library")),
+            && m.ends_with(") from Spotify · 0% of that time is songs in your library")),
         "{:?}",
         d.said
     );
@@ -346,6 +346,7 @@ fn classifying_drops_never_blocks_the_ui_thread() {
         string_extras::spotify::Holds {
             history: zip,
             music: !zip,
+            ..Default::default()
         }
     });
     let mut d = Dropping::new(Adds::new().unwrap(), sorter);
@@ -426,4 +427,39 @@ fn a_folder_of_songs_holding_an_export_still_goes_to_the_library() {
         "{:?}",
         d.said
     );
+}
+
+#[test]
+fn a_broken_zip_dropped_on_stats_goes_to_the_import_which_names_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let folder = storage::folder(&temp.path().join("profile"), true);
+    let mut d = Dropping::new(Adds::new().unwrap(), Drops::default());
+    let (_store, mut session) = Storage::open(&folder, &d.ctx).unwrap();
+    let mut scan = Scanner::default();
+    // Newer plays in a folder, older ones in a zip that was cut short: importing the folder alone would move the
+    // cursor past the zip's plays for good.
+    let history = unzipped(temp.path());
+    let broken = temp.path().join("older.zip");
+    std::fs::write(&broken, b"PK\x03\x04 cut short").unwrap();
+    let refused = |said: &[String]| {
+        said.iter().any(|m| {
+            m.starts_with("Couldn't read older.zip (") && m.ends_with("), so nothing was imported.")
+        })
+    };
+    d.drop(&[history, broken.clone()], true);
+    d.finish(&mut session, &mut scan);
+    assert!(refused(&d.said), "{:?}", d.said);
+    assert!(!temp.path().join("profile/spotify.json").exists());
+
+    // Alone on Stats it goes to the import too.
+    d.said.clear();
+    d.drop(&[broken.clone()], true);
+    d.finish(&mut session, &mut scan);
+    assert!(refused(&d.said), "{:?}", d.said);
+
+    // Elsewhere it goes to the library, as before.
+    d.said.clear();
+    d.drop(&[broken], false);
+    d.finish(&mut session, &mut scan);
+    assert_eq!(d.said, ["Those aren't songs String can play"]);
 }
