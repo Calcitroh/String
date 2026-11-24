@@ -31,6 +31,8 @@ struct Candidate {
     track: Track,
     /// The whole credit, as `spelling`.
     credit: String,
+    /// The whole title as written, as `spelling`.
+    written: String,
     /// A credit that is one artist alone (no second name after `&`, `,`, `feat.` and the like).
     solo: bool,
     /// The album, as `spelling` ("" when unknown).
@@ -94,11 +96,13 @@ impl Matcher {
                 .entry((title, credit.clone()))
                 .or_default()
                 .push(i);
+            let written = spelling(&track.1);
             m.by_written
-                .entry((spelling(&track.1), credit.clone()))
+                .entry((written.clone(), credit.clone()))
                 .or_default()
                 .push(i);
             m.songs.push(Candidate {
+                written,
                 solo: normalize_text(&track.2) == main,
                 album: spelling(&album),
                 track,
@@ -125,17 +129,19 @@ impl Matcher {
         })
     }
 
-    /// Of `found`, the song with this whole credit on this album, else with this credit, else on this album, else
-    /// the first (copies of one song: library order decides).
-    fn best(&self, found: &[usize], credit: &str, album: &str) -> Option<&Track> {
-        let on_album = |c: &Candidate| !album.is_empty() && c.album == album;
-        let pick =
-            |test: &dyn Fn(&Candidate) -> bool| found.iter().find(|&&i| test(&self.songs[i]));
-        pick(&|c| c.credit == credit && on_album(c))
-            .or_else(|| pick(&|c| c.credit == credit))
-            .or_else(|| pick(&on_album))
-            .or(found.first())
-            .map(|&i| &self.songs[i].track)
+    /// Of `found`, the song that agrees most: the same whole credit first, then the same title as written ("(feat.
+    /// Cora)", not "(feat. Ben)"), then the same album; library order between copies that agree as much.
+    fn best(&self, found: &[usize], credit: &str, written: &str, album: &str) -> Option<&Track> {
+        let score = |c: &Candidate| {
+            4 * u8::from(c.credit == credit)
+                + 2 * u8::from(c.written == written)
+                + u8::from(!album.is_empty() && c.album == album)
+        };
+        found
+            .iter()
+            .enumerate()
+            .max_by_key(|&(n, &i)| (score(&self.songs[i]), std::cmp::Reverse(n)))
+            .map(|(_, &i)| &self.songs[i].track)
     }
 
     /// A play's library song: the one a song link names; else, for an artist link, the same title by the library
@@ -145,17 +151,19 @@ impl Matcher {
             && let Some(song) = self
                 .by_written
                 .get(to)
-                .and_then(|f| self.best(f, &to.1, &p.album))
+                .and_then(|f| self.best(f, &to.1, &to.0, &p.album))
         {
             return Some(song);
         }
+        // An artist link to a name the library has decides: the play is theirs or no one's. One to a name the
+        // library lacks is passed over.
         if let Some(credit) = links.artists.get(&p.credit)
-            && let Some(song) = self
+            && self.artists.contains_key(credit)
+        {
+            return self
                 .by_credit
                 .get(&(p.title.clone(), credit.clone()))
-                .and_then(|f| self.best(f, credit, &p.album))
-        {
-            return Some(song);
+                .and_then(|f| self.best(f, credit, &p.written, &p.album));
         }
         self.by_name(p)
     }
@@ -167,6 +175,10 @@ impl Matcher {
         // A play with no artist name is never matched by artist.
         if p.main.is_empty() {
             return None;
+        }
+        // The whole credit first: "River&Stone" is "River & Stone", whatever its spacing makes of the main artist.
+        if let Some(found) = self.by_credit.get(&(p.title.clone(), p.credit.clone())) {
+            return self.best(found, &p.credit, &p.written, &p.album);
         }
         let fits = |c: &Candidate| c.credit == p.credit || p.solo || c.solo;
         let found: Vec<usize> = self
@@ -182,14 +194,14 @@ impl Matcher {
             .filter(|&i| self.songs[i].credit == p.credit)
             .collect();
         if !exact.is_empty() {
-            return self.best(&exact, &p.credit, &p.album);
+            return self.best(&exact, &p.credit, &p.written, &p.album);
         }
         let credits: HashSet<&str> = found
             .iter()
             .map(|&i| self.songs[i].credit.as_str())
             .collect();
         if credits.len() <= 1 {
-            return self.best(&found, &p.credit, &p.album);
+            return self.best(&found, &p.credit, &p.written, &p.album);
         }
         let on_album: Vec<usize> = found
             .iter()
@@ -300,25 +312,23 @@ fn links(history: &Listening) -> Links {
     links
 }
 
-/// A name as written, for comparing whole names: `normalize_text`, but the marks that join or split names stay as
-/// words, so "River & Stone" is not "River Stone" and "Act I / II" is not "Act I + II".
+/// Marks that tell names apart: they join or split credits ("River & Stone" is not "River Stone", "A/B" is not "A
+/// B", "North+" is not "North Plus") or change a note ("C#" is not "C").
+const MARKS: &[char] = &['&', ',', '/', '+', ';', '#', '\u{266d}', '\u{266f}'];
+
+/// A name as written, for comparing whole names: `normalize_text`, but each of `MARKS` stays, as a word of its own
+/// whatever the spacing around it ("River&Stone" is "River & Stone").
 fn spelling(s: &str) -> String {
-    let mut words = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '&' => words.push_str(" and "),
-            ',' => words.push_str(" comma "),
-            '/' => words.push_str(" slash "),
-            '+' => words.push_str(" plus "),
-            ';' => words.push_str(" semicolon "),
-            _ => words.push(c),
-        }
-    }
-    normalize_text(&words)
+    fold(s, true)
 }
 
 /// Lower case, common accents folded, punctuation and repeated spaces collapsed.
 fn normalize_text(s: &str) -> String {
+    fold(s, false)
+}
+
+/// `normalize_text`, keeping `MARKS` as words when `marks` is true.
+fn fold(s: &str, marks: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut space = false;
     for c in s.chars().flat_map(char::to_lowercase) {
@@ -341,7 +351,14 @@ fn normalize_text(s: &str) -> String {
             }
             _ => "",
         };
-        if !folded.is_empty() {
+        if marks && MARKS.contains(&c) {
+            if !space && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push(c);
+            out.push(' ');
+            space = true;
+        } else if !folded.is_empty() {
             out.push_str(folded);
             space = false;
         } else if c.is_alphanumeric() {
@@ -391,6 +408,7 @@ fn is_remaster_note(note: &str) -> bool {
 const VERSION_WORDS: &[&str] = &[
     "acapella",
     "acoustic",
+    "alternate",
     "demo",
     "dub",
     "edit",
@@ -402,6 +420,8 @@ const VERSION_WORDS: &[&str] = &[
     "orchestral",
     "remix",
     "reprise",
+    "take",
+    "unplugged",
     "version",
 ];
 
@@ -421,9 +441,8 @@ fn removable_group(text: &str) -> Option<(usize, usize)> {
         let version = inner
             .split(|c: char| !c.is_alphanumeric())
             .any(|w| VERSION_WORDS.contains(&w))
-            || [" - ", " – ", " — ", " / "]
-                .iter()
-                .any(|d| inner.contains(d));
+            || inner.contains(['\u{2013}', '\u{2014}', '/'])
+            || inner.contains(" - ");
         if (credit && !version) || is_remaster_note(inner) {
             return Some((start, start + len + 1));
         }
@@ -431,10 +450,11 @@ fn removable_group(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// The first credited artist, normalized: the part before `, `, ` & `, ` feat. `, ` ft. ` or ` x `.
+/// The first credited artist, normalized: the part before `,`, `&`, `/` (however spaced), ` feat. `, ` ft. ` or
+/// ` x `.
 pub fn main_artist(s: &str) -> String {
     let lower = s.to_lowercase();
-    let end = [", ", " & ", " feat. ", " ft. ", " x "]
+    let end = [",", "&", "/", " feat. ", " ft. ", " x "]
         .iter()
         .filter_map(|sep| lower.find(sep))
         .min()

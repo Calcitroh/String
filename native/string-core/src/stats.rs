@@ -461,7 +461,7 @@ impl Listening {
         // An imported play's album is the newest, like its names (imports go in the order songs were played), so a
         // renamed song never pairs its new title with the album it was first heard on. A play with no album keeps
         // the one already known, and other saved cells stay.
-        if let Some(album) = album.filter(|a| !a.is_empty()) {
+        if let Some(album) = album.filter(|a| !a.trim().is_empty()) {
             match saved.extra.first_mut() {
                 Some(first) => *first = Value::from(album),
                 None => saved.extra.push(Value::from(album)),

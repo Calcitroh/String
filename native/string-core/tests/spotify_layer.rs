@@ -35,6 +35,7 @@ fn a_play_without_an_album_keeps_the_album_already_known() {
     let t = track("spotify:track:x", "Band");
     assert!(layer.add_imported(&t, 30., at(day(2020, 3, 1)), "Live"));
     assert!(layer.add_imported(&t, 30., at(day(2020, 3, 2)), ""));
+    assert!(layer.add_imported(&t, 30., at(day(2020, 3, 3)), "  "));
     assert_eq!(layer.album("spotify:track:x"), Some("Live"));
 }
 

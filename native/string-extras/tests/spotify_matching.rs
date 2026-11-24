@@ -87,6 +87,8 @@ fn normalizes_feat_and_remaster_but_not_live_or_remix() {
         "Song (feat. X - Reprise)",
         "Song (feat. X - Karaoke)",
         "Song (feat. X – Dub)",
+        "Song (feat. X—Piano Take)",
+        "Song (feat. X/Unplugged)",
     ] {
         assert_ne!(normalize_title(other), song, "{other}");
     }
@@ -550,4 +552,106 @@ fn a_link_with_keys_it_doesnt_know_is_passed_over() {
     let (out, resolved) = m.resolve(&h);
     assert_eq!(resolved.matched_seconds, 0.);
     assert_eq!(artist_secs(&out, "Fan"), 90.);
+}
+
+#[test]
+fn an_artist_link_keeps_plays_under_its_artist_when_the_library_lacks_the_song() {
+    let m = Matcher::new([
+        song("jp/quay.flac", "Quay", "Nova JP"),
+        song("nova/home.flac", "Home", "Nova"),
+    ]);
+    let h = linked(
+        &[("1", "Home", "Nova", "Singles", 60.)],
+        serde_json::json!([artist_link("Nova", "Nova JP")]),
+    );
+    let (out, resolved) = m.resolve(&h);
+    assert_eq!(resolved.matched_seconds, 0.);
+    assert_eq!(secs_of(&out, "nova/home.flac"), 0.);
+    assert_eq!(artist_secs(&out, "Nova JP"), 60.);
+}
+
+#[test]
+fn marks_that_join_names_never_turn_into_words() {
+    let m = Matcher::new([
+        song("slash/home.flac", "Home", "Slash"),
+        song("plus/ode.flac", "Ode", "North Plus"),
+    ]);
+    let h = linked(
+        &[
+            ("1", "Unknown", "/", "Marks", 10.),
+            ("2", "Ode", "North+", "Marks", 20.),
+            ("3", "Ode", "North Plus", "Words", 30.),
+        ],
+        serde_json::json!([artist_link("North+", "Elsewhere")]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(artist_secs(&out, "Slash"), 0.);
+    assert_eq!(artist_secs(&out, "/"), 10.);
+    assert_eq!(secs_of(&out, "plus/ode.flac"), 30.);
+}
+
+#[test]
+fn a_credit_written_without_spaces_is_the_same_credit() {
+    let m = Matcher::new([
+        on_album("rs/home.flac", "Home", "River Stone", "Solo"),
+        on_album("duo/home.flac", "Home", "River & Stone", "Duets"),
+        song("ab/home.flac", "Home", "A B").into(),
+    ]);
+    let h = history_on(&[
+        ("1", "Home", "River&Stone", "Duets", 60.),
+        ("2", "Home", "A/B", "Marks", 30.),
+    ]);
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "duo/home.flac"), 60.);
+    assert_eq!(secs_of(&out, "rs/home.flac"), 0.);
+    assert_eq!(secs_of(&out, "ab/home.flac"), 0.);
+}
+
+#[test]
+fn the_written_title_tells_a_sharp_from_a_natural() {
+    for flip in [false, true] {
+        let mut library = vec![
+            on_album("p/c.flac", "Prelude in C Minor", "Pianist", "Preludes"),
+            on_album(
+                "p/c-sharp.flac",
+                "Prelude in C# Minor",
+                "Pianist",
+                "Preludes",
+            ),
+        ];
+        if flip {
+            library.reverse();
+        }
+        let m = Matcher::new(library);
+        let h = linked(
+            &[
+                ("1", "Prelude in C# Minor", "Pianist", "Preludes", 60.),
+                ("2", "Prelude (Cover)", "Fan", "Covers", 10.),
+            ],
+            serde_json::json!([
+                {"title": "Prelude (Cover)", "artist": "Fan", "as": {"title": "Prelude in C# Minor", "artist": "Pianist"}},
+            ]),
+        );
+        let (out, _) = m.resolve(&h);
+        assert_eq!(secs_of(&out, "p/c-sharp.flac"), 70., "{flip}");
+        assert_eq!(secs_of(&out, "p/c.flac"), 0., "{flip}");
+    }
+}
+
+#[test]
+fn the_written_title_picks_the_featured_recording() {
+    let m = Matcher::new([
+        on_album("mira/ben.flac", "Home (feat. Ben)", "Mira", "Duets"),
+        on_album("mira/cora.flac", "Home (feat. Cora)", "Mira", "Duets"),
+    ]);
+    let h = linked(
+        &[
+            ("1", "Home (feat. Cora)", "Mira", "Duets", 60.),
+            ("2", "Home (feat. Cora)", "ミラ", "Duets", 30.),
+        ],
+        serde_json::json!([artist_link("ミラ", "Mira")]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "mira/cora.flac"), 90.);
+    assert_eq!(secs_of(&out, "mira/ben.flac"), 0.);
 }
