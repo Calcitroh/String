@@ -118,7 +118,7 @@ fn finds_history_one_folder_up_and_in_nested_zip_paths() {
 }
 
 #[test]
-fn is_history_agrees_with_find_history() {
+fn holds_finds_history_as_find_history_does_and_songs_as_the_scan_does() {
     let tmp = tempdir().unwrap();
     let bytes = json_bytes(&two_plays());
     // A music folder: albums of songs and a playlist file, no history anywhere.
@@ -133,13 +133,18 @@ fn is_history_agrees_with_find_history() {
             fs::write(dir.join("tracks.json"), b"[]").unwrap();
         }
     }
-    // History four folders down is found (as `find_history` finds it); five folders down isn't.
+    // History four folders down is found (as `find_history` finds it); five folders down isn't, nor are songs.
     let near = tmp.path().join("a/b/c/d");
     let far = tmp.path().join("e/f/g/h/i");
     for dir in [&near, &far] {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join(AUDIO), &bytes).unwrap();
     }
+    fs::write(far.join("deep song.flac"), b"").unwrap();
+    let song = music.join("Artist 0/Album 0/00 song.mp3");
+    let loud = tmp.path().join("LOUD.FLAC");
+    fs::write(&loud, b"").unwrap();
+    let playlist = music.join("Artist 0/Album 0/tracks.json");
     // History beside songs, after the albums in the listing.
     let mixed = music.join("Artist 5/zz export");
     fs::create_dir_all(&mixed).unwrap();
@@ -152,22 +157,28 @@ fn is_history_agrees_with_find_history() {
     let broken = tmp.path().join("broken.zip");
     fs::write(&broken, b"not a zip").unwrap();
 
+    // (history, music)
     let cases = [
-        (music.join("Artist 0"), false),
-        (tmp.path().join("a"), true),
-        (tmp.path().join("e"), false),
-        (music.clone(), true),
-        (videos, false),
-        (broken.clone(), false),
-        (near.join(AUDIO), true),
-        (tmp.path().join("missing"), false),
+        (music.join("Artist 0"), (false, true)),
+        (tmp.path().join("a"), (true, false)),
+        (tmp.path().join("e"), (false, false)),
+        // Songs with an export among them: both.
+        (music.clone(), (true, true)),
+        (videos, (false, false)),
+        (broken.clone(), (false, false)),
+        (near.join(AUDIO), (true, false)),
+        (song, (false, true)),
+        (loud, (false, true)),
+        (playlist, (false, false)),
+        (tmp.path().join("missing"), (false, false)),
     ];
-    for (path, want) in cases {
-        assert_eq!(is_history(&path), want, "{path:?}");
+    for (path, (history, music)) in cases {
+        assert_eq!(holds(&path), Holds { history, music }, "{path:?}");
+        assert_eq!(is_history(&path), history, "{path:?}");
         if path != broken && path.exists() {
             assert_eq!(
                 !find_history(&[path.clone()]).unwrap().is_empty(),
-                want,
+                history,
                 "{path:?}"
             );
         }

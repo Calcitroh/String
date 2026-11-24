@@ -1331,8 +1331,8 @@ pub fn takes_keys(ctx: &Context) -> bool {
     }
     false
 }
-/// The drop zone while files are dragged over the window, and dropped files sent off to be sorted: a Spotify
-/// history to Stats (`on_stats`), the rest to the library.
+/// The drop zone while files are dragged over the window, and dropped files sent off to be sorted (see
+/// `spotify::Drops`); `App::logic` takes in where they went.
 fn drops(
     ctx: &Context,
     hi: Tint,
@@ -1431,7 +1431,6 @@ pub fn overlay(ui: &mut Ui, v: &mut View<'_>) {
         on_stats,
         &mut v.views.toast,
     );
-    v.views.drops.poll(v.s, &mut v.views.toast);
     drag_ghost(&ctx, v);
     show_menu(&ctx, v);
     show_dialog(&ctx, v);

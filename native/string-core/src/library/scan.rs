@@ -32,6 +32,10 @@ fn audio(name: &str) -> bool {
         )
     })
 }
+/// Whether a scan takes a file of this name as a song: by its extension, in any case.
+pub fn is_song_name(name: &str) -> bool {
+    audio(&name.to_lowercase())
+}
 fn cover(name: &str) -> bool {
     let Some((base, ext)) = name.rsplit_once('.') else {
         return false;

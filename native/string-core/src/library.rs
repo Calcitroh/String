@@ -1,6 +1,7 @@
 //! Scan selected roots and loose files; keep the sparse library.json cache used by the desktop app.
 
 mod scan;
+pub use scan::is_song_name;
 use crate::{
     Fields,
     state::State,

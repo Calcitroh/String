@@ -12,14 +12,18 @@ use std::{
     io::{self, Write},
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
 };
 use string_core::{
     data::{DataFolder, Document, SpotifyHistory},
+    library::is_song_name,
     stats::{Listening, Track},
 };
-use string_extras::spotify::{self as export, ImportError, Matcher, Resolved, Summary};
+use string_extras::spotify::{self as export, Holds, ImportError, Matcher, Resolved, Summary};
 
 /// Said when an import or a removal is asked for while one runs: the panel shows the one running.
 pub const BUSY: &str = "String is still busy with your Spotify history.";
@@ -252,8 +256,11 @@ fn import(
     songs: Vec<Track>,
     progress: &dyn Fn(usize, usize),
 ) -> Result<Imported, String> {
-    let sources = export::find_history(paths)
-        .map_err(|e| format!("Couldn't read {e}, so nothing was imported."))?;
+    let sources = export::find_history(paths).map_err(|e| {
+        let text = e.to_string();
+        let (file, why) = text.split_once(": ").unwrap_or((&text, "unreadable"));
+        format!("Couldn't read {file} ({why}), so nothing was imported.")
+    })?;
     if sources.is_empty() {
         return Err(ImportError::NoHistory.to_string());
     }
@@ -348,43 +355,58 @@ pub(crate) fn import_message(first: bool, added: u64, seconds: f64, share: f64) 
 
 /* ---------- drops ---------- */
 
-/// Where dropped files go: a Spotify history to the import, everything else to the library as before. Telling
-/// them apart opens zips and walks folders, so it runs on a thread of its own; the library's share goes on to the
-/// library's add worker from there, in the order dropped.
+/// Where dropped files go. Songs, and anything that is neither songs nor a Spotify history, go to the library as
+/// before; a history goes to the import on Stats, and elsewhere a history alone gets a word about Stats. Telling them
+/// apart opens zips and walks folders, so it runs on a thread of its own; the library's share goes on to the library's
+/// add worker from there, in the order dropped.
 pub struct Drops {
     classify: Arc<Mutex<Box<Check>>>,
     worker: Option<(Sender<Sorting>, Receiver<Sorted>)>,
     /// Drops sent and not yet taken in.
     pending: usize,
+    /// Drops the thread hasn't handed on yet: a close waits for them.
+    sorting: Arc<AtomicUsize>,
     wake: Option<Context>,
 }
-type Check = dyn Fn(&Path) -> bool + Send;
+type Check = dyn Fn(&Path) -> Holds + Send;
 struct Sorting {
     paths: Vec<PathBuf>,
     on_stats: bool,
     library: add_work::Input,
 }
 struct Sorted {
+    /// What to import: the paths that hold a history, when dropped on Stats.
     history: Vec<PathBuf>,
-    on_stats: bool,
-    /// The library couldn't take the rest.
+    /// A history alone was dropped on another page.
+    elsewhere: bool,
+    /// The library couldn't take its share.
     refused: bool,
 }
 impl Default for Drops {
     fn default() -> Self {
-        Self::with_classifier(holds_history)
+        Self::with_classifier(look)
     }
 }
-fn holds_history(path: &Path) -> bool {
+fn look(path: &Path) -> Holds {
     // A song file is never a history, so no disk access for it.
-    !crate::screens::settings::is_song_path(path) && export::is_history(path)
+    if path
+        .file_name()
+        .is_some_and(|n| is_song_name(&n.to_string_lossy()))
+    {
+        return Holds {
+            history: false,
+            music: true,
+        };
+    }
+    export::holds(path)
 }
 impl Drops {
-    pub(crate) fn with_classifier(classify: impl Fn(&Path) -> bool + Send + 'static) -> Self {
+    pub(crate) fn with_classifier(classify: impl Fn(&Path) -> Holds + Send + 'static) -> Self {
         Self {
             classify: Arc::new(Mutex::new(Box::new(classify))),
             worker: None,
             pending: 0,
+            sorting: Default::default(),
             wake: None,
         }
     }
@@ -401,6 +423,9 @@ impl Drops {
         on_stats: bool,
         library: &add_work::Input,
     ) -> bool {
+        if library.closed() {
+            return false;
+        }
         let mut job = Sorting {
             paths,
             on_stats,
@@ -410,6 +435,7 @@ impl Drops {
             self.worker = self.spawn().ok();
         }
         if let Some((tx, _)) = &self.worker {
+            self.sorting.fetch_add(1, Ordering::SeqCst);
             match tx.send(job) {
                 Ok(()) => {
                     self.pending += 1;
@@ -421,30 +447,43 @@ impl Drops {
         // Without the sorting thread, the drop goes to the library as it did before Stats took Spotify histories.
         self.worker = None;
         self.pending = 0;
+        self.sorting.store(0, Ordering::SeqCst);
         job.library.queue_drop(job.paths)
     }
     fn spawn(&self) -> io::Result<(Sender<Sorting>, Receiver<Sorted>)> {
         let (tx, inbox) = unbounded::<Sorting>();
         let (done, rx) = unbounded();
         let classify = self.classify.clone();
+        let sorting = self.sorting.clone();
         let wake = self.wake.clone();
         thread::Builder::new()
             .name("drop sorting".into())
             .spawn(move || {
                 for job in inbox {
                     let check = classify.lock().unwrap_or_else(PoisonError::into_inner);
-                    let (history, music): (Vec<_>, Vec<_>) =
-                        job.paths.into_iter().partition(|path| {
-                            // A check that panics leaves the path to the library, as before.
-                            catch_unwind(AssertUnwindSafe(|| check(path))).unwrap_or(false)
-                        });
-                    drop(check);
-                    let refused = !music.is_empty() && !job.library.queue_drop(music);
-                    let sorted = Sorted {
-                        history,
-                        on_stats: job.on_stats,
-                        refused,
+                    let mut sorted = Sorted {
+                        history: vec![],
+                        elsewhere: false,
+                        refused: false,
                     };
+                    let mut library = vec![];
+                    for path in job.paths {
+                        // A check that panics leaves the path to the library, as before.
+                        let holds =
+                            catch_unwind(AssertUnwindSafe(|| check(&path))).unwrap_or_default();
+                        match (holds.history, holds.music) {
+                            (true, true) if job.on_stats => {
+                                sorted.history.push(path.clone());
+                                library.push(path);
+                            }
+                            (true, false) if job.on_stats => sorted.history.push(path),
+                            (true, false) => sorted.elsewhere = true,
+                            _ => library.push(path),
+                        }
+                    }
+                    drop(check);
+                    sorted.refused = !library.is_empty() && !job.library.queue_sorted_drop(library);
+                    sorting.fetch_sub(1, Ordering::SeqCst);
                     if done.send(sorted).is_err() {
                         break;
                     }
@@ -458,6 +497,10 @@ impl Drops {
     pub(crate) fn pending(&self) -> bool {
         self.pending > 0
     }
+    /// A drop is still being sorted: its songs aren't with the library yet.
+    pub(crate) fn sorting(&self) -> bool {
+        self.sorting.load(Ordering::SeqCst) > 0
+    }
     /// Takes in sorted drops: a history dropped on Stats starts the import, one dropped elsewhere says where it goes.
     pub(crate) fn poll(&mut self, s: &mut Session, toast: &mut Toast) {
         while let Some((_, rx)) = &self.worker {
@@ -467,6 +510,7 @@ impl Drops {
                 Err(TryRecvError::Disconnected) => {
                     self.worker = None;
                     self.pending = 0;
+                    self.sorting.store(0, Ordering::SeqCst);
                     break;
                 }
             };
@@ -474,12 +518,12 @@ impl Drops {
             if sorted.refused {
                 toast.set("String could not take more songs.");
             }
-            if sorted.history.is_empty() {
-                continue;
-            }
-            if !sorted.on_stats {
+            if sorted.elsewhere {
                 toast.set(ELSEWHERE);
-            } else if let Err(why) = s.import_spotify(sorted.history) {
+            }
+            if !sorted.history.is_empty()
+                && let Err(why) = s.import_spotify(sorted.history)
+            {
                 toast.set(why);
             }
         }
@@ -563,7 +607,6 @@ mod tests {
     use chrono::NaiveDateTime;
     use std::{
         fs,
-        sync::atomic::Ordering,
         time::{Duration, Instant},
     };
 
@@ -592,6 +635,16 @@ mod tests {
     #[test]
     fn remove_sets_spotify_json_aside_and_stats_forget_it() {
         let dir = tempfile::tempdir().unwrap();
+        // The person's own listening, which neither the import nor Remove may touch.
+        let mut own = storage::folder(dir.path(), true)
+            .read::<Listening>()
+            .unwrap();
+        let song = Track("own".into(), "Own Song".into(), "Own Band".into());
+        own.value
+            .add(&song, 30., chrono::Local::now().naive_local());
+        own.save().unwrap();
+        let listening = dir.path().join("listening.json");
+        let before = fs::read(&listening).unwrap();
         let mut s = open(dir.path());
         s.import_spotify(vec![export(dir.path())]).unwrap();
         settle(&mut s);
@@ -628,6 +681,23 @@ mod tests {
         // An import afterwards starts again from nothing.
         s.import_spotify(vec![export(dir.path())]).unwrap();
         assert!(settle(&mut s).starts_with("Added 2 plays ("));
+        assert_eq!(fs::read(&listening).unwrap(), before);
+    }
+
+    #[test]
+    fn an_unreadable_export_is_named_and_nothing_is_imported() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip = dir.path().join("my_spotify_data.zip");
+        fs::write(&zip, b"not a zip").unwrap();
+        let mut s = open(dir.path());
+        s.import_spotify(vec![zip]).unwrap();
+        let said = settle(&mut s);
+        assert!(
+            said.starts_with("Couldn't read my_spotify_data.zip ("),
+            "{said}"
+        );
+        assert!(said.ends_with("), so nothing was imported."), "{said}");
+        assert!(!dir.path().join("spotify.json").exists());
     }
 
     #[test]

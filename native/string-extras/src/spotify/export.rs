@@ -7,7 +7,7 @@ use std::{
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
 };
-use string_core::{data::SpotifyHistory, stats::Track};
+use string_core::{data::SpotifyHistory, library::is_song_name, stats::Track};
 
 /// Where a history file lives: loose, or inside a zip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,25 +124,67 @@ fn zip_error(e: zip::result::ZipError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-/// Whether `path` is, or holds, a history file by `find_history`'s rules. It stops at the first one, and tells
-/// folders from files by the folder listing, so a big music folder is walked without opening each file. What can't
-/// be read counts as no history here; the import names it. Meant for a worker thread: it opens zips and walks folders.
+/// What a dropped path holds: a history file by `find_history`'s rules, and songs by the library scan's.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Holds {
+    pub history: bool,
+    pub music: bool,
+}
+
+/// Whether `path` is, or holds, a history file by `find_history`'s rules. It stops at the first one; see `holds`.
 pub fn is_history(path: &Path) -> bool {
+    look(
+        path,
+        Holds {
+            history: true,
+            music: false,
+        },
+    )
+    .history
+}
+/// Whether `path` is, or holds, a history file, and whether it is or holds songs, looking as deep as
+/// `find_history` does and stopping once both are known. It tells folders from files by the folder listing, so a
+/// big music folder is walked without opening each file. What can't be read counts as nothing here; the import or the
+/// scan names it. Meant for a worker thread: it opens zips and walks folders.
+pub fn holds(path: &Path) -> Holds {
+    look(
+        path,
+        Holds {
+            history: true,
+            music: true,
+        },
+    )
+}
+fn look(path: &Path, want: Holds) -> Holds {
+    let mut found = Holds::default();
     match fs::metadata(path) {
-        Ok(m) if m.is_dir() => folder_has_history(path, 1),
-        Ok(_) if is_zip(path) => zip_has_history(path),
-        Ok(_) => path
-            .file_name()
-            .is_some_and(|n| is_audio_name(&n.to_string_lossy())),
-        Err(_) => false,
+        Ok(m) if m.is_dir() => look_in(path, 1, want, &mut found),
+        Ok(_) if is_zip(path) => found.history = want.history && zip_has_history(path),
+        Ok(_) => {
+            if let Some(name) = path.file_name() {
+                note(&name.to_string_lossy(), want, &mut found);
+            }
+        }
+        Err(_) => {}
+    }
+    found
+}
+fn note(name: &str, want: Holds, found: &mut Holds) {
+    if want.history && is_audio_name(name) {
+        found.history = true;
+    } else if want.music && is_song_name(name) {
+        found.music = true;
     }
 }
-fn folder_has_history(dir: &Path, level: usize) -> bool {
+fn known(want: Holds, found: Holds) -> bool {
+    (found.history || !want.history) && (found.music || !want.music)
+}
+fn look_in(dir: &Path, level: usize, want: Holds, found: &mut Holds) {
     if level > DEPTH {
-        return false;
+        return;
     }
     let Ok(entries) = fs::read_dir(dir) else {
-        return false;
+        return;
     };
     let mut folders = vec![];
     for entry in entries.flatten() {
@@ -157,11 +199,19 @@ fn folder_has_history(dir: &Path, level: usize) -> bool {
         };
         if folder {
             folders.push(entry.path());
-        } else if is_audio_name(&entry.file_name().to_string_lossy()) {
-            return true;
+        } else {
+            note(&entry.file_name().to_string_lossy(), want, found);
+            if known(want, *found) {
+                return;
+            }
         }
     }
-    folders.iter().any(|f| folder_has_history(f, level + 1))
+    for folder in folders {
+        look_in(&folder, level + 1, want, found);
+        if known(want, *found) {
+            return;
+        }
+    }
 }
 fn zip_has_history(path: &Path) -> bool {
     let Ok(mut archive) = File::open(path)

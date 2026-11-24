@@ -104,6 +104,16 @@ fn export(dir: &Path) -> PathBuf {
     spotify::write_export(&path, &spotify::sample_files(2, &[])).unwrap();
     path
 }
+/// The same export unzipped into `dir`: `dir\my_spotify_data`.
+fn unzipped(dir: &Path) -> PathBuf {
+    let top = dir.join("my_spotify_data");
+    let inner = top.join("Spotify Extended Streaming History");
+    std::fs::create_dir_all(&inner).unwrap();
+    for (name, plays) in spotify::sample_files(2, &[]) {
+        std::fs::write(inner.join(name), serde_json::to_vec(&plays).unwrap()).unwrap();
+    }
+    top
+}
 
 #[test]
 fn hover_and_drop_keep_processing_frames_while_the_classifier_is_blocked() {
@@ -287,15 +297,9 @@ fn a_history_drop_elsewhere_adds_nothing_and_says_where_to_drop() {
     let (_store, mut session) = Storage::open(&folder, &d.ctx).unwrap();
     let zip = export(temp.path());
     // The same history unzipped: a folder, which the library would otherwise take as a music folder.
-    let unzipped = temp
-        .path()
-        .join("my_spotify_data/Spotify Extended Streaming History");
-    std::fs::create_dir_all(&unzipped).unwrap();
-    for (name, plays) in spotify::sample_files(2, &[]) {
-        std::fs::write(unzipped.join(name), serde_json::to_vec(&plays).unwrap()).unwrap();
-    }
+    let folder = unzipped(temp.path());
     let mut scan = Scanner::default();
-    d.drop(&[zip.clone(), temp.path().join("my_spotify_data")], false);
+    d.drop(&[zip.clone(), folder], false);
     d.finish(&mut session, &mut scan);
     assert_eq!(d.said, ["That's a Spotify history: drop it on Stats"]);
     for list in ["roots", "files"] {
@@ -338,7 +342,11 @@ fn classifying_drops_never_blocks_the_ui_thread() {
             .send((thread::current().id(), path.to_owned()))
             .unwrap();
         wait.recv_timeout(Duration::from_secs(5)).unwrap();
-        path.extension().is_some_and(|e| e == "zip")
+        let zip = path.extension().is_some_and(|e| e == "zip");
+        string_extras::spotify::Holds {
+            history: zip,
+            music: !zip,
+        }
     });
     let mut d = Dropping::new(Adds::new().unwrap(), sorter);
     let mut session = Session::new(Default::default(), Default::default(), Default::default());
@@ -376,6 +384,45 @@ fn classifying_drops_never_blocks_the_ui_thread() {
     assert!(
         d.said
             .contains(&"That's a Spotify history: drop it on Stats".to_string()),
+        "{:?}",
+        d.said
+    );
+}
+
+#[test]
+fn a_folder_of_songs_holding_an_export_still_goes_to_the_library() {
+    let temp = tempfile::tempdir().unwrap();
+    // Downloads: an album, and the export unzipped beside it.
+    let downloads = temp.path().join("Downloads");
+    std::fs::create_dir_all(downloads.join("Album")).unwrap();
+    std::fs::write(downloads.join("Album/one.flac"), []).unwrap();
+    unzipped(&downloads);
+    let mut d = Dropping::new(Adds::new().unwrap(), Drops::default());
+    let mut scan = Scanner::default();
+
+    // Elsewhere: its songs come in, and nothing is said about Stats.
+    let folder = storage::folder(&temp.path().join("one"), true);
+    let (_store, mut session) = Storage::open(&folder, &d.ctx).unwrap();
+    d.drop(&[downloads.clone()], false);
+    d.finish(&mut session, &mut scan);
+    assert_eq!(*session.field("roots"), json!([downloads]));
+    assert!(
+        !d.said.contains(&spotify::ELSEWHERE.to_string()),
+        "{:?}",
+        d.said
+    );
+    assert!(!temp.path().join("one/spotify.json").exists());
+
+    // On Stats: imported and added.
+    d.said.clear();
+    let folder = storage::folder(&temp.path().join("two"), true);
+    let (_store, mut session) = Storage::open(&folder, &d.ctx).unwrap();
+    d.drop(&[downloads.clone()], true);
+    d.finish(&mut session, &mut scan);
+    assert_eq!(*session.field("roots"), json!([downloads]));
+    assert_eq!(session.spotify_summary().map(|s| s.plays), Some(2));
+    assert!(
+        d.said.iter().any(|m| m.starts_with("Added 2 plays (")),
         "{:?}",
         d.said
     );

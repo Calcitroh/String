@@ -116,6 +116,10 @@ impl App {
             }
         }
     }
+    /// An add that String has taken but not finished: paths being checked, or a drop still being sorted.
+    fn adding(&self) -> bool {
+        self.adds.pending() || self.views.drops.sorting()
+    }
     fn save_feedback(platform: &Platform, views: &mut Views, store: &mut Storage) {
         for msg in store.feedback.logs.drain(..) {
             platform.log.write("save", &msg);
@@ -136,7 +140,7 @@ impl App {
             }
         }
         let mut reasons = Vec::new();
-        if self.adds.pending() {
+        if self.adding() {
             reasons.push(
                 if self.runtime.is_some() {
                     "String is still checking paths for a pending add."
@@ -214,7 +218,7 @@ impl eframe::App for App {
             // songs still moving to the Recycle Bin: wait for them, so the copies kept take over their likes,
             // plays and playlist places before the last save
             if crate::screens::dupes::recycling()
-                || (self.runtime.is_some() && self.adds.pending() && now < deadline)
+                || (self.runtime.is_some() && self.adding() && now < deadline)
             {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 ctx.request_repaint_after(Duration::from_millis(50));
@@ -251,6 +255,7 @@ impl eframe::App for App {
         // helper's songs come in while String is minimised.
         if !self.views.close_failed {
             // Hold unapplied results until the person decides whether to keep the profile open.
+            self.views.drops.poll(&mut s, &mut self.views.toast);
             self.adds
                 .poll(&mut s, &mut self.scan, &mut self.views.toast);
         }
@@ -275,9 +280,8 @@ impl eframe::App for App {
             crate::screens::dupes::settle(&mut v);
         }
         if let Some(deadline) = self.close_work_deadline {
-            if crate::screens::dupes::recycling()
-                || (self.adds.pending() && Instant::now() < deadline)
-            {
+            let adding = self.adds.pending() || self.views.drops.sorting();
+            if crate::screens::dupes::recycling() || (adding && Instant::now() < deadline) {
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
                 ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -349,10 +353,11 @@ impl eframe::App for App {
         if self.minimized && self.smoke.is_none() {
             return;
         }
+        let adding = self.adding();
         if self.views.close_failed
             && let Some(quit) = ui::confirm(
                 &ctx,
-                if self.adds.pending() {
+                if adding {
                     "String couldn’t finish the add"
                 } else {
                     "Your latest changes aren’t saved"
@@ -360,7 +365,7 @@ impl eframe::App for App {
                 &format!(
                     "{}\n\n{}",
                     self.close_reason,
-                    if self.adds.pending() {
+                    if adding {
                         "Keep String open to retry, or close and discard the pending add and any unsaved changes."
                     } else {
                         "Keep String open to retry saving, or close and discard the unsaved changes."
@@ -613,5 +618,64 @@ mod add_close_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(a.adds.pending() && !a.closing);
+    }
+
+    #[test]
+    fn a_close_waits_for_a_drop_still_being_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let song = dir.path().join("song.wav");
+        std::fs::write(&song, []).unwrap();
+        let (entered, sorting) = mpsc::channel();
+        let (release, gate) = mpsc::channel::<()>();
+        let ctx = Context::default();
+        let mut a = app(dir.path(), Adds::new().unwrap());
+        a.open(&ctx);
+        a.views.drops = crate::integration::spotify::Drops::with_classifier(move |_| {
+            let _ = entered.send(());
+            let _ = gate.recv_timeout(Duration::from_secs(5));
+            string_extras::spotify::Holds {
+                history: false,
+                music: true,
+            }
+        });
+        a.views.drops.attach(&ctx);
+        assert!(a.views.drops.send(vec![song.clone()], false, &a.adds.input));
+        sorting.recv_timeout(Duration::from_secs(2)).unwrap();
+        let start = Instant::now();
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut close = true;
+        let mut first = true;
+        while !a.closing {
+            let mut input = egui::RawInput::default();
+            if close {
+                input
+                    .viewports
+                    .get_mut(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .events
+                    .push(egui::ViewportEvent::Close);
+            }
+            let out = ctx.run_ui(input, |ui| eframe::App::logic(&mut a, ui.ctx(), &mut frame));
+            let commands = &out.viewport_output[&egui::ViewportId::ROOT].commands;
+            if std::mem::take(&mut first) {
+                assert!(
+                    !a.closing,
+                    "the close didn't wait for the drop being sorted"
+                );
+                assert!(commands.contains(&ViewportCommand::CancelClose));
+                release.send(()).unwrap();
+            }
+            close = commands.contains(&ViewportCommand::Close);
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the close never ended"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let folder = storage::folder(dir.path(), true);
+        assert_eq!(
+            folder.open().unwrap().state.value.fields["files"],
+            serde_json::json!([song])
+        );
     }
 }

@@ -98,12 +98,33 @@ impl Input {
         self.enqueue(Source::Picker, vec![path], bytes)
     }
     pub(crate) fn queue_drop(&self, paths: Vec<PathBuf>) -> bool {
-        let bytes = paths.iter().map(|p| path_charge(p)).sum();
-        self.enqueue(Source::Drop { skipped: 0 }, paths, bytes)
+        self.drop_paths(paths, false)
     }
-    fn enqueue(&self, mut source: Source, mut paths: Vec<PathBuf>, mut bytes: usize) -> bool {
+    /// The songs and folders of a drop taken before String started closing, sorted since: let in while closing
+    /// too, as they would have been had they come in at once.
+    pub(crate) fn queue_sorted_drop(&self, paths: Vec<PathBuf>) -> bool {
+        self.drop_paths(paths, true)
+    }
+    fn drop_paths(&self, paths: Vec<PathBuf>, while_closing: bool) -> bool {
+        let bytes = paths.iter().map(|p| path_charge(p)).sum();
+        self.enqueue_with(Source::Drop { skipped: 0 }, paths, bytes, while_closing)
+    }
+    /// String has started closing: it takes no new adds.
+    pub(crate) fn closed(&self) -> bool {
+        self.state.lock().unwrap().closed
+    }
+    fn enqueue(&self, source: Source, paths: Vec<PathBuf>, bytes: usize) -> bool {
+        self.enqueue_with(source, paths, bytes, false)
+    }
+    fn enqueue_with(
+        &self,
+        mut source: Source,
+        mut paths: Vec<PathBuf>,
+        mut bytes: usize,
+        while_closing: bool,
+    ) -> bool {
         let mut p = self.state.lock().unwrap();
-        if p.closed || paths.is_empty() {
+        if (p.closed && !while_closing) || paths.is_empty() {
             return false;
         }
         let free_paths = Instance::MAX_ADD_PATHS - p.paths;
