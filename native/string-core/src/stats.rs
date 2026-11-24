@@ -381,6 +381,43 @@ impl Listening {
         out.doc.extra = self.doc.extra.clone();
         out
     }
+    /// This layer with every track replaced by `f(track)`. Tracks that map to the same id are one track (the
+    /// first one's names and extra cells win; their seconds add up). Artists are the mapped tracks' artists, and
+    /// each day's `a` is rebuilt from its `t`, which is exact for an imported layer (a play's artist is its track's).
+    /// Seconds, hours, phone time and unknown fields are kept; `self` doesn't change.
+    pub fn remap(&self, mut f: impl FnMut(&Track) -> Track) -> Listening {
+        let mut out = Listening::default();
+        out.doc.v = self.doc.v;
+        out.doc.extra = self.doc.extra.clone();
+        out.doc.phone_import = self.doc.phone_import.clone();
+        out.phone = self.phone.clone();
+        let mut to_track = Vec::with_capacity(self.doc.tracks.len());
+        let mut to_artist = Vec::with_capacity(self.doc.tracks.len());
+        for saved in &self.doc.tracks {
+            let names = f(&saved.names);
+            let ti = *out.tracks.entry(names.0.clone()).or_insert_with(|| {
+                out.doc.tracks.push(SavedTrack { names: names.clone(), extra: saved.extra.clone() });
+                out.doc.tracks.len() - 1
+            });
+            let ai = *out.artists.entry(names.2.clone()).or_insert_with(|| {
+                out.doc.artists.push(names.2.clone());
+                out.doc.artists.len() - 1
+            });
+            to_track.push(ti);
+            to_artist.push(ai);
+        }
+        for (date, day) in &self.doc.days.dated {
+            let mut copy = Day { s: day.s, h: day.h, p: day.p, sp: day.sp, extra: day.extra.clone(), ..Day::default() };
+            for (&i, &secs) in &day.t {
+                let (Some(&ti), Some(&ai)) = (to_track.get(i), to_artist.get(i)) else { continue };
+                *copy.t.entry(ti).or_default() += secs;
+                *copy.a.entry(ai).or_default() += secs;
+            }
+            out.doc.days.dated.insert(*date, copy);
+        }
+        out.doc.days.other = self.doc.days.other.clone();
+        out
+    }
     fn record(
         &mut self,
         t: &Track,
