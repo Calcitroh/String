@@ -383,7 +383,8 @@ impl Listening {
     }
     /// This layer with every track replaced by `f(track)`. Tracks that map to the same id are one track (the
     /// first one's names and extra cells win; their seconds add up). Artists are the mapped tracks' artists, and
-    /// each day's `a` is rebuilt from its `t`, which is exact for an imported layer (a play's artist is its track's).
+    /// each day's `a` is rebuilt from its `t`, which is exact for an imported layer (a play's artist is its
+    /// track's).
     /// Seconds, hours, phone time and unknown fields are kept; `self` doesn't change.
     pub fn remap(&self, mut f: impl FnMut(&Track) -> Track) -> Listening {
         let mut out = Listening::default();
@@ -396,7 +397,10 @@ impl Listening {
         for saved in &self.doc.tracks {
             let names = f(&saved.names);
             let ti = *out.tracks.entry(names.0.clone()).or_insert_with(|| {
-                out.doc.tracks.push(SavedTrack { names: names.clone(), extra: saved.extra.clone() });
+                out.doc.tracks.push(SavedTrack {
+                    names: names.clone(),
+                    extra: saved.extra.clone(),
+                });
                 out.doc.tracks.len() - 1
             });
             let ai = *out.artists.entry(names.2.clone()).or_insert_with(|| {
@@ -407,9 +411,18 @@ impl Listening {
             to_artist.push(ai);
         }
         for (date, day) in &self.doc.days.dated {
-            let mut copy = Day { s: day.s, h: day.h, p: day.p, sp: day.sp, extra: day.extra.clone(), ..Day::default() };
+            let mut copy = Day {
+                s: day.s,
+                h: day.h,
+                p: day.p,
+                sp: day.sp,
+                extra: day.extra.clone(),
+                ..Day::default()
+            };
             for (&i, &secs) in &day.t {
-                let (Some(&ti), Some(&ai)) = (to_track.get(i), to_artist.get(i)) else { continue };
+                let (Some(&ti), Some(&ai)) = (to_track.get(i), to_artist.get(i)) else {
+                    continue;
+                };
                 *copy.t.entry(ti).or_default() += secs;
                 *copy.a.entry(ai).or_default() += secs;
             }

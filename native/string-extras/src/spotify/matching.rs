@@ -26,9 +26,10 @@ impl Matcher {
             artists
                 .entry(normalize_text(&song.2))
                 .or_insert_with(|| song.2.clone());
-            by_key
-                .entry((normalize_title(&song.1), main_artist(&song.2)))
-                .or_insert(song);
+            let title = normalize_title(&song.1);
+            if !title.is_empty() {
+                by_key.entry((title, main_artist(&song.2))).or_insert(song);
+            }
         }
         Matcher {
             songs: by_key,
@@ -39,7 +40,12 @@ impl Matcher {
     pub fn resolve(&self, history: &Listening) -> (Listening, Resolved) {
         let mut matched = HashSet::new();
         let out = history.remap(|t| {
-            if let Some(song) = self.songs.get(&(normalize_title(&t.1), main_artist(&t.2))) {
+            let title = normalize_title(&t.1);
+            // A title that is only punctuation or a credit would match any such song by the artist.
+            let found = (!title.is_empty())
+                .then(|| self.songs.get(&(title, main_artist(&t.2))))
+                .flatten();
+            if let Some(song) = found {
                 matched.insert(song.0.clone());
                 return song.clone();
             }
@@ -103,11 +109,28 @@ pub fn normalize_title(s: &str) -> String {
         text.replace_range(cut.0..cut.1, " ");
     }
     if let Some(dash) = text.rfind(" - ")
-        && text[dash..].contains("remaster")
+        && is_remaster_note(&text[dash + 3..])
     {
         text.truncate(dash);
     }
     normalize_text(&text)
+}
+
+/// "2011 Remaster", "Remastered Version", "The Digital Remaster 2009": only these words, so "Live, Remastered" stays.
+fn is_remaster_note(note: &str) -> bool {
+    let mut words = note
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty());
+    let mut remaster = false;
+    let ok = words.all(|w| match w {
+        "remaster" | "remastered" => {
+            remaster = true;
+            true
+        }
+        "version" | "edition" | "digital" | "the" => true,
+        _ => w.len() == 4 && w.bytes().all(|b| b.is_ascii_digit()),
+    });
+    ok && remaster
 }
 
 /// The byte range of the first bracketed group that is a credit or a remaster note.
@@ -121,7 +144,7 @@ fn removable_group(text: &str) -> Option<(usize, usize)> {
         let credit = ["feat.", "feat ", "ft.", "ft ", "featuring ", "with "]
             .iter()
             .any(|p| inner.starts_with(p));
-        if credit || inner.contains("remaster") {
+        if credit || is_remaster_note(inner) {
             return Some((start, start + len + 1));
         }
     }

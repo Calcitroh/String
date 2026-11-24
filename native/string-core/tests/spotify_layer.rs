@@ -35,12 +35,7 @@ fn pair() -> (Listening, Listening) {
     own.add(&track("a.mp3", "Band"), 30., at(day(2026, 11, 20)));
     let mut layer = Listening::default();
     layer.add_imported(&track("a.mp3", "Band"), 120., at(day(2026, 11, 20)), "");
-    layer.add_imported(
-        &track("spotify:track:x", "Other"),
-        30.,
-        at(day(2020, 3, 1)),
-        "Album",
-    );
+    layer.add_imported(&track("spotify:track:x", "Other"), 30., at(day(2020, 3, 1)), "Album");
     (own, layer)
 }
 
@@ -83,10 +78,7 @@ fn spotify_history_round_trips_its_meta() {
     doc.save().unwrap();
     let back = folder.read::<SpotifyHistory>().unwrap();
     assert_eq!(back.value.meta(), meta);
-    assert_eq!(
-        back.value.0.top_field("future"),
-        Some(&json!({"keep": true}))
-    );
+    assert_eq!(back.value.0.top_field("future"), Some(&json!({"keep": true})));
 }
 
 #[test]
@@ -114,9 +106,7 @@ fn the_opening_copy_includes_the_spotify_file() {
     let folder = DataFolder::new(dir.path(), &backup);
     fs::write(dir.path().join("spotify.json"), b"{\"v\":1}").unwrap();
     folder.keep_opening_copy().unwrap();
-    let kept = backup
-        .join("opened")
-        .join(Local::now().date_naive().to_string());
+    let kept = backup.join("opened").join(Local::now().date_naive().to_string());
     assert_eq!(fs::read(kept.join("spotify.json")).unwrap(), b"{\"v\":1}");
 }
 
@@ -130,10 +120,7 @@ fn set_aside_refusing_an_existing_target_leaves_both_files_alone() {
     let folder = DataFolder::new(dir.path(), &backup);
     let err = folder.set_aside::<SpotifyHistory>("2").unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-    assert_eq!(
-        fs::read(backup.join("spotify-removed-2.json")).unwrap(),
-        b"old"
-    );
+    assert_eq!(fs::read(backup.join("spotify-removed-2.json")).unwrap(), b"old");
     assert_eq!(fs::read(dir.path().join("spotify.json")).unwrap(), b"new");
 }
 

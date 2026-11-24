@@ -51,7 +51,13 @@ fn normalizes_feat_and_remaster_but_not_live_or_remix() {
     ] {
         assert_eq!(normalize_title(same), song, "{same}");
     }
-    for other in ["Song - Live", "Song (Remix)", "Song (Radio Edit)"] {
+    for other in [
+        "Song (Live, Remastered)",
+        "Song - Live / 2011 Remaster",
+        "Song - Live",
+        "Song (Remix)",
+        "Song (Radio Edit)",
+    ] {
         assert_ne!(normalize_title(other), song, "{other}");
     }
 }
@@ -124,4 +130,15 @@ fn a_song_added_later_matches_without_reimport() {
     let (after, r1) = Matcher::new([song("new.mp3", "Song", "Artist A")]).resolve(&h);
     assert_eq!(after.tracks().next().unwrap().0, "new.mp3");
     assert_eq!(r1.matched_seconds, 10.);
+}
+
+#[test]
+fn titles_that_normalize_to_nothing_never_match() {
+    let m = Matcher::new([
+        song("a.mp3", "!!!", "Artist A"),
+        song("b.mp3", "(feat. X)", "Artist A"),
+    ]);
+    let (out, resolved) = m.resolve(&history(&[spotify("1", "???", "Artist A", 10.)]));
+    assert_eq!(out.tracks().next().unwrap().0, "spotify:track:1");
+    assert_eq!(resolved.matched_seconds, 0.);
 }
