@@ -1,7 +1,7 @@
-use chrono::{DateTime, Local, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Timelike, Utc};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -174,17 +174,28 @@ fn converts_utc_to_local_time() {
     fs::write(&file, json_bytes(&rows)).unwrap();
     let mut h = SpotifyHistory::default();
     run(&[file], &mut h).unwrap();
-    let want: BTreeSet<NaiveDate> = stamps
-        .iter()
-        .map(|ts| {
-            DateTime::parse_from_rfc3339(ts)
-                .unwrap()
-                .with_timezone(&Local)
-                .date_naive()
-        })
-        .collect();
-    let got: BTreeSet<NaiveDate> = h.0.days().keys().copied().collect();
-    assert_eq!(got, want);
+    let mut want: BTreeMap<(NaiveDate, usize), f64> = BTreeMap::new();
+    for ts in stamps {
+        let local = DateTime::parse_from_rfc3339(ts)
+            .unwrap()
+            .with_timezone(&Local)
+            .naive_local();
+        *want
+            .entry((local.date(), local.hour() as usize))
+            .or_default() += 60.;
+    }
+    let days = h.0.days();
+    let got_days: BTreeSet<NaiveDate> = days.keys().copied().collect();
+    assert_eq!(got_days, want.keys().map(|k| k.0).collect());
+    for (date, day) in days {
+        let mut total = 0.;
+        for (hour, secs) in day.h.iter().enumerate() {
+            let expected = want.get(&(*date, hour)).copied().unwrap_or(0.);
+            assert!((secs - expected).abs() < 1e-6, "{date} {hour}h");
+            total += expected;
+        }
+        assert!((day.s - total).abs() < 1e-6, "{date}");
+    }
 }
 
 #[test]
@@ -330,4 +341,41 @@ fn imports_170k_plays_quickly() {
     assert_eq!(s.added, 12 * 14_167);
     assert!(took.as_secs_f64() < 15., "{took:?}");
     eprintln!("170k import took {took:?}");
+}
+
+#[test]
+fn the_same_file_reached_several_ways_counts_once() {
+    let tmp = tempdir().unwrap();
+    let bytes = json_bytes(&two_plays());
+    let folder = tmp.path().join("export");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join(AUDIO), &bytes).unwrap();
+    let zip = tmp.path().join("export.zip");
+    zip_of(&zip, &[(AUDIO, bytes)]);
+
+    let paths = [
+        folder.clone(),
+        folder.join(AUDIO),
+        folder.clone(),
+        zip.clone(),
+        zip,
+    ];
+    let found = find_history(&paths).unwrap();
+    assert_eq!(found.len(), 2); // the file once, the zip entry once
+    let mut h = SpotifyHistory::default();
+    let s = import(&found, &mut h, |_, _| {}).unwrap();
+    assert_eq!((s.added, s.skipped), (2, 0));
+    assert_eq!(h.meta().plays, 2);
+}
+
+#[test]
+fn a_corrupt_zip_next_to_a_good_folder_refuses_the_import() {
+    let tmp = tempdir().unwrap();
+    let folder = tmp.path().join("export");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join(AUDIO), json_bytes(&two_plays())).unwrap();
+    let zip = tmp.path().join("broken.zip");
+    fs::write(&zip, b"this is not a zip").unwrap();
+    let err = find_history(&[folder, zip]).unwrap_err();
+    assert!(err.to_string().contains("broken.zip"), "{err}");
 }

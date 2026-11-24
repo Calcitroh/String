@@ -2,6 +2,7 @@
 use chrono::{DateTime, Local, Utc};
 use serde::Deserialize;
 use std::{
+    collections::HashSet,
     fs::{self, File},
     io::{self, BufReader, Read},
     path::{Path, PathBuf},
@@ -57,50 +58,53 @@ fn is_zip(path: &Path) -> bool {
 }
 
 /// The history files in `paths`: the paths themselves, folders up to four levels down, and every entry of a zip
-/// given directly. Sorted by file name. A path that cannot be read is an error only when nothing else was found.
+/// given directly. Sorted by file name, each file once however many ways it was reached. A path that cannot be
+/// read is an error naming it: skipping it quietly would move the cursor past plays it holds.
 pub fn find_history(paths: &[PathBuf]) -> io::Result<Vec<Source>> {
     let mut found = vec![];
-    let mut first_error = None;
+    let mut seen = HashSet::new();
     for path in paths {
-        if let Err(e) = collect(path, 1, &mut found) {
-            first_error.get_or_insert(e);
-        }
-    }
-    if found.is_empty()
-        && let Some(e) = first_error
-    {
-        return Err(e);
+        collect(path, 1, &mut found, &mut seen).map_err(|e| named(path, e))?;
     }
     found.sort_by_cached_key(|s| (s.file_name().to_lowercase(), format!("{s:?}")));
     Ok(found)
 }
-fn collect(path: &Path, level: usize, found: &mut Vec<Source>) -> io::Result<()> {
+fn named(path: &Path, e: io::Error) -> io::Error {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
+    io::Error::new(e.kind(), format!("{name}: {e}"))
+}
+fn collect(
+    path: &Path,
+    level: usize,
+    found: &mut Vec<Source>,
+    seen: &mut HashSet<(PathBuf, String)>,
+) -> io::Result<()> {
     if fs::metadata(path)?.is_dir() {
         if level > DEPTH {
             return Ok(());
         }
-        let mut first_error = None;
         for entry in fs::read_dir(path)? {
-            let result = entry.and_then(|e| collect(&e.path(), level + 1, found));
-            if let Err(e) = result {
-                first_error.get_or_insert(e);
-            }
+            let child = entry?.path();
+            collect(&child, level + 1, found, seen).map_err(|e| named(&child, e))?;
         }
-        // One unreadable child must not hide the rest; find_history decides from what was found overall.
-        return match first_error {
-            Some(e) if found.is_empty() => Err(e),
-            _ => Ok(()),
-        };
+        return Ok(());
     }
     if is_zip(path) && level == 1 {
         let mut archive =
             zip::ZipArchive::new(BufReader::new(File::open(path)?)).map_err(zip_error)?;
+        let real = fs::canonicalize(path)?;
         for i in 0..archive.len() {
             let entry = archive.by_index_raw(i).map_err(zip_error)?;
             let Ok(name) = entry.name().map(|n| n.into_owned()) else {
                 continue;
             };
-            if entry.is_file() && is_audio_name(name.rsplit(['/', '\\']).next().unwrap_or("")) {
+            if entry.is_file()
+                && is_audio_name(name.rsplit(['/', '\\']).next().unwrap_or(""))
+                && seen.insert((real.clone(), name.clone()))
+            {
                 found.push(Source::ZipEntry {
                     zip: path.to_owned(),
                     name,
@@ -110,6 +114,7 @@ fn collect(path: &Path, level: usize, found: &mut Vec<Source>) -> io::Result<()>
     } else if path
         .file_name()
         .is_some_and(|n| is_audio_name(&n.to_string_lossy()))
+        && seen.insert((fs::canonicalize(path)?, String::new()))
     {
         found.push(Source::File(path.to_owned()));
     }
@@ -184,6 +189,8 @@ pub fn import(
     let meta = into.meta();
     let mut plays = vec![];
     let mut skipped = 0u64;
+    // Exports overlap, and a file can be reached twice; a play is the same play when all three match.
+    let mut seen = HashSet::new();
     for (i, source) in sources.iter().enumerate() {
         for row in read_rows(source)? {
             let Some(at) = row
@@ -207,6 +214,9 @@ pub fn import(
                 || played <= 0.
             {
                 skipped += 1;
+                continue;
+            }
+            if !seen.insert((ms, uri.clone(), played as i64)) {
                 continue;
             }
             plays.push(Play {
