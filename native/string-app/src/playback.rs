@@ -1,5 +1,9 @@
-use crate::model::{Ids, Models, Song};
+use crate::{
+    integration::spotify::{self, SpotifyLayer},
+    model::{Ids, Models, Song},
+};
 use chrono::{Local, NaiveDate};
+use crossbeam_channel::{Receiver, TryRecvError};
 use egui::Context;
 use serde_json::{Value, json};
 use std::{
@@ -9,13 +13,13 @@ use std::{
 };
 use string_audio::{Config, Event, Host, LoopRange, Player, Status, Track};
 use string_core::{
-    data::{Document, SpotifyHistory},
+    data::{DataFolder, Document, SpotifyHistory},
     library::Library,
     queue::{AdvancePlan, NextAction, PlaybackOptions},
     state::State,
     stats::{Listening, Track as CountedTrack},
 };
-use string_extras::spotify::{Matcher, Resolved};
+use string_extras::spotify::Resolved;
 
 /// Queue controls used by both the live player and the in-memory playback tests.
 pub trait Transport {
@@ -95,8 +99,11 @@ pub struct Session {
     /// The imported Spotify history (`spotify.json`), or why it couldn't be read. Change both with `set_spotify`.
     pub spotify: Option<Document<SpotifyHistory>>,
     pub spotify_error: Option<String>,
-    /// The history matched to the current library: only Stats reads it, never `listening`.
+    /// The history matched to the library: only Stats reads it, never `listening`.
     spotify_view: Option<(Listening, Resolved)>,
+    /// The fingerprint of the songs `spotify_view` was matched to.
+    spotify_matched: u64,
+    spotify_loading: Option<Receiver<SpotifyLayer>>,
     /// Changes whenever `spotify_view` does, so Stats draws again.
     pub spotify_revision: u64,
 }
@@ -150,6 +157,8 @@ impl Session {
             spotify: None,
             spotify_error: None,
             spotify_view: None,
+            spotify_matched: 0,
+            spotify_loading: None,
             spotify_revision: 0,
         }
     }
@@ -162,34 +171,81 @@ impl Session {
         }
         self.invalidate_plan();
         self.generation += 1;
-        self.resolve_spotify();
+        if self.spotify.is_some() && self.spotify_matched != self.songs_fingerprint() {
+            let had = self.spotify_view.is_some();
+            self.resolve_spotify();
+            self.spotify_changed(had);
+        }
     }
-    pub fn set_spotify(&mut self, doc: Option<Document<SpotifyHistory>>, error: Option<String>) {
-        self.spotify = doc;
-        self.spotify_error = error;
-        self.resolve_spotify();
+    /// The songs Spotify plays are matched to: the library's in library order, hidden ones too, under the names
+    /// String's own plays record, so a matched Spotify play adds to the person's own plays of that song.
+    pub fn spotify_songs(&self) -> Vec<CountedTrack> {
+        self.library_songs()
+            .map(|s| CountedTrack(s.id.clone(), s.title.clone(), s.artist.clone()))
+            .collect()
+    }
+    fn library_songs(&self) -> impl Iterator<Item = &Song> {
+        self.library
+            .tracks
+            .iter()
+            .filter_map(|t| self.models.by_id.get(&t.id()))
+    }
+    fn songs_fingerprint(&self) -> u64 {
+        spotify::fingerprint_names(
+            self.library_songs()
+                .map(|s| [&*s.id, &*s.title, &*s.artist]),
+        )
+    }
+    /// Starts reading `spotify.json` on a worker; `poll_spotify` takes it in.
+    pub(crate) fn load_spotify(&mut self, folder: DataFolder, ctx: &Context) {
+        match spotify::load(folder, self.spotify_songs(), ctx) {
+            Ok(rx) => self.spotify_loading = Some(rx),
+            Err(e) => self.spotify_error = Some(format!("Couldn't read your Spotify history: {e}")),
+        }
+    }
+    pub fn spotify_loading(&self) -> bool {
+        self.spotify_loading.is_some()
+    }
+    /// Takes in the Spotify history once the worker has read it. Called every frame.
+    pub fn poll_spotify(&mut self) {
+        let Some(rx) = &self.spotify_loading else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(layer) => self.set_spotify(layer),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.set_spotify(SpotifyLayer {
+                error: Some("Couldn't read your Spotify history: the reader stopped".into()),
+                ..SpotifyLayer::default()
+            }),
+        }
+    }
+    /// Replaces the Spotify history, and any read still running. A view matched to other songs is matched again.
+    pub fn set_spotify(&mut self, layer: SpotifyLayer) {
+        let had = self.spotify_view.is_some();
+        self.spotify_loading = None;
+        self.spotify = layer.doc;
+        self.spotify_error = layer.error;
+        self.spotify_view = layer.view;
+        self.spotify_matched = layer.songs;
+        // A scan can finish while a worker matches.
+        if self.spotify.is_some() && self.spotify_matched != self.songs_fingerprint() {
+            self.resolve_spotify();
+        }
+        self.spotify_changed(had);
     }
     fn resolve_spotify(&mut self) {
-        let history = self
+        let songs = self.spotify_songs();
+        self.spotify_matched = spotify::fingerprint(&songs);
+        self.spotify_view = self
             .spotify
             .as_ref()
-            .map(|doc| &doc.value.0)
-            .filter(|h| h.first_day().is_some());
-        if history.is_none() && self.spotify_view.is_none() {
-            return;
+            .and_then(|doc| spotify::resolve(&doc.value.0, songs));
+    }
+    fn spotify_changed(&mut self, had: bool) {
+        if had || self.spotify_view.is_some() {
+            self.spotify_revision += 1;
         }
-        // Library order, hidden songs too, under the names String's own plays record, so a matched Spotify play
-        // adds to the person's own plays of that song.
-        let songs = self.library.tracks.iter().filter_map(|t| {
-            let s = self.models.by_id.get(&t.id())?;
-            Some(CountedTrack(
-                s.id.clone(),
-                s.title.clone(),
-                s.artist.clone(),
-            ))
-        });
-        self.spotify_view = history.map(|h| Matcher::new(songs).resolve(h));
-        self.spotify_revision += 1;
     }
     pub fn spotify_view(&self) -> Option<&Listening> {
         self.spotify_view.as_ref().map(|(view, _)| view)

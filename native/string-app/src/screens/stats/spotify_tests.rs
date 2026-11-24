@@ -1,5 +1,6 @@
 use super::*;
 use crate::{
+    integration::spotify::SpotifyLayer,
     playback::Session,
     storage::{self, Storage},
 };
@@ -49,6 +50,19 @@ fn history(today: NaiveDate) -> SpotifyHistory {
     h
 }
 
+/// Runs the session's frame update until the Spotify history read at open is in.
+fn loaded(s: &mut Session) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while s.spotify_loading() {
+        assert!(
+            Instant::now() < deadline,
+            "the Spotify history never came in"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+        s.poll_spotify();
+    }
+}
+
 #[test]
 fn stats_include_the_spotify_layer() {
     let dir = tempfile::tempdir().unwrap();
@@ -77,7 +91,7 @@ fn stats_include_the_spotify_layer() {
     layer.value = history(today);
     layer.save().unwrap();
     let revision = s.spotify_revision;
-    s.set_spotify(Some(layer), None);
+    s.set_spotify(SpotifyLayer::matched(layer, s.spotify_songs()));
     assert_ne!(s.spotify_revision, revision);
     let stats = StatsView::default();
 
@@ -144,7 +158,7 @@ fn stats_include_the_spotify_layer() {
     assert_eq!(all.tracks[2].key, Some(s.library.tracks[1].id()));
 
     let revision = s.spotify_revision;
-    s.set_spotify(None, None);
+    s.set_spotify(SpotifyLayer::default());
     assert_ne!(s.spotify_revision, revision);
     assert!(s.spotify_view().is_none() && s.spotify_summary().is_none());
     let day = Snapshot::read(&s, &stats, Day);
@@ -171,6 +185,7 @@ fn listening_json_is_untouched_by_the_layer() {
     let before = fs::read(&path).unwrap();
 
     let (mut store, mut s) = Storage::open(&folder, &egui::Context::default()).unwrap();
+    loaded(&mut s);
     assert!(s.spotify_view().is_some());
     let all = Snapshot::read(&s, &StatsView::default(), All);
     assert!(all.note.ends_with("from Spotify"));
@@ -192,15 +207,71 @@ fn an_unreadable_spotify_json_doesnt_stop_the_library_opening() {
     let spotify = dir.path().join("spotify.json");
     for broken in [&br#"{"v":1,"days":"#[..], br#"{"v":2,"tracks":[]}"#] {
         fs::write(&spotify, broken).unwrap();
-        let (_, s) = Storage::open(&folder, &egui::Context::default()).unwrap();
+        let (_store, mut s) = Storage::open(&folder, &egui::Context::default()).unwrap();
         assert_eq!(s.listening.days().len(), 1);
+        loaded(&mut s);
         assert!(s.spotify_error.is_some());
         assert!(s.spotify.is_none() && s.spotify_view().is_none());
         assert_eq!(fs::read(&spotify).unwrap(), broken);
     }
     fs::remove_file(&spotify).unwrap();
-    let (_, s) = Storage::open(&folder, &egui::Context::default()).unwrap();
+    let (_store, mut s) = Storage::open(&folder, &egui::Context::default()).unwrap();
+    loaded(&mut s);
     assert!(s.spotify_error.is_none() && s.spotify.is_none());
+}
+
+#[test]
+fn opening_reads_the_spotify_history_without_waiting_for_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = storage::folder(dir.path(), true);
+    let mut layer = folder.read::<SpotifyHistory>().unwrap();
+    layer.value = history(Local::now().date_naive());
+    layer.save().unwrap();
+    let (_store, mut s) = Storage::open(&folder, &egui::Context::default()).unwrap();
+    // Only the frame update takes the history in, so open has returned without it.
+    assert!(s.spotify_loading());
+    assert!(s.spotify.is_none() && s.spotify_view().is_none());
+    // A scan that finishes meanwhile adds a song the worker didn't match to.
+    s.library
+        .tracks
+        .push(song(r"C:\Music\Elsewhere.mp3", "Elsewhere", "Other"));
+    s.rebuild();
+    let revision = s.spotify_revision;
+    loaded(&mut s);
+    assert_ne!(s.spotify_revision, revision);
+    assert!(s.spotify_error.is_none());
+    assert_eq!(s.spotify_summary().unwrap().plays, 3);
+    let id = s.library.tracks[0].id();
+    assert!(s.spotify_view().unwrap().tracks().any(|t| t.0 == id));
+}
+
+#[test]
+fn a_rebuild_matches_again_only_when_song_names_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = storage::folder(dir.path(), true);
+    let mut library = Library::default();
+    library
+        .tracks
+        .push(song(r"C:\Music\Elsewhere.mp3", "Elsewhere (Demo)", "Other"));
+    let id = library.tracks[0].id();
+    let mut s = Session::new(Default::default(), Default::default(), library);
+    let mut layer = folder.read::<SpotifyHistory>().unwrap();
+    layer.value = history(Local::now().date_naive());
+    s.set_spotify(SpotifyLayer::matched(layer, s.spotify_songs()));
+    assert_eq!(s.spotify_summary().unwrap().matched_share, 0.);
+    let revision = s.spotify_revision;
+    // Hiding a song renames nothing, so the view stays.
+    s.set_field("hidden", serde_json::json!({ (id.clone()): 1 }));
+    s.rebuild();
+    assert_eq!(s.spotify_revision, revision);
+    // A title edit that makes a Spotify song match is matched again.
+    s.set_field(
+        "edits",
+        serde_json::json!({ (id.clone()): {"title": "Elsewhere"} }),
+    );
+    s.rebuild();
+    assert_ne!(s.spotify_revision, revision);
+    assert!((s.spotify_summary().unwrap().matched_share - 300. / 1540.).abs() < 1e-9);
 }
 
 #[test]
@@ -232,24 +303,28 @@ fn a_full_size_spotify_layer_opens_and_draws_quickly() {
     let mut s = Session::new(Default::default(), Default::default(), library);
 
     let t = Instant::now();
-    let layer = folder.read::<SpotifyHistory>().unwrap();
-    let read = t.elapsed();
-    s.set_spotify(Some(layer), None);
-    let resolve = t.elapsed() - read;
+    let songs = s.spotify_songs();
+    let listed = t.elapsed();
+    let t = Instant::now();
+    let layer = SpotifyLayer::read(&folder, songs);
+    let worker = t.elapsed();
+    let t = Instant::now();
+    s.set_spotify(layer);
+    let taken = t.elapsed();
     let t = Instant::now();
     let all = Snapshot::read(&s, &StatsView::default(), All);
     let snapshot = t.elapsed();
+    let revision = s.spotify_revision;
     let t = Instant::now();
     s.rebuild();
     let rebuild = t.elapsed();
     eprintln!(
-        "170k Spotify plays: read {read:?}, resolve {resolve:?}, All snapshot {snapshot:?}, rebuild {rebuild:?}"
+        "170k Spotify plays: song list {listed:?}, worker read + match {worker:?}, taking it in {taken:?}"
     );
+    eprintln!("All snapshot {snapshot:?}, rebuild with the same names {rebuild:?}");
+    assert_eq!(s.spotify_revision, revision);
     assert!(all.note.ends_with("from Spotify"));
     assert!((s.spotify_summary().unwrap().matched_share - 0.6).abs() < 0.01);
-    assert!(
-        read + resolve < Duration::from_secs(10),
-        "{read:?} + {resolve:?}"
-    );
+    assert!(worker < Duration::from_secs(10), "{worker:?}");
     assert!(snapshot < Duration::from_secs(5), "{snapshot:?}");
 }

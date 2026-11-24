@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 use string_core::{
-    data::{DataFolder, Document, Model, Profile, SpotifyHistory},
+    data::{DataFolder, Document, Model, Profile},
     library::Library,
     state::State,
     stats::Listening,
@@ -104,8 +104,6 @@ pub struct Storage {
 impl Storage {
     pub fn open(folder: &DataFolder, ctx: &Context) -> io::Result<(Self, Session)> {
         let mut profile: Profile = folder.open_for_scan()?;
-        // Only Stats uses the Spotify history, so a file that can't be read is reported there, not a failed open.
-        let spotify = folder.read::<SpotifyHistory>();
         // Copy the original bytes after a good load and before handing any caller a writer.
         let mut feedback = Feedback::default();
         if let Err(e) = folder.keep_opening_copy() {
@@ -118,13 +116,8 @@ impl Storage {
             profile.listening.value.clone(),
             profile.library.value.clone(),
         );
-        match spotify {
-            Ok(doc) => s.set_spotify(Some(doc).filter(Document::exists), None),
-            Err(e) => s.set_spotify(
-                None,
-                Some(format!("Couldn't read your Spotify history: {e}")),
-            ),
-        }
+        // Only Stats uses the Spotify history: it comes in later, and a file that can't be read is reported there.
+        s.load_spotify(folder.clone(), ctx);
         // The worker owns the original document fingerprints for the entire open session.
         let (tx, rx) = unbounded::<Job>();
         let ctx = ctx.clone();

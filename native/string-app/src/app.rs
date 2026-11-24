@@ -307,6 +307,7 @@ impl eframe::App for App {
             self.views.toast.set(msg);
         }
         rt.store.poll(&mut s);
+        s.poll_spotify();
         if self.views.stats.sync_phone(&self.platform.phone.users) {
             self.platform.phone.request();
         }
