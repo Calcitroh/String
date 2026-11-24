@@ -4,7 +4,7 @@ resolver = "3"
 members = ["string-core", "string-audio", "string-platform", "string-lyrics", "string-extras", "string-app", "string-http"]
 
 [workspace.package]
-version = "2.1.0"
+version = "2.1.1"
 edition = "2024"
 license = "MIT"
 publish = false
