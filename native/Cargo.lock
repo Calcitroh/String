@@ -4151,7 +4151,7 @@ checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
 
 [[package]]
 name = "string-app"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -4176,7 +4176,7 @@ dependencies = [
 
 [[package]]
 name = "string-audio"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cpal",
  "libloading",
@@ -4190,7 +4190,7 @@ dependencies = [
 
 [[package]]
 name = "string-core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "lofty",
@@ -4204,7 +4204,7 @@ dependencies = [
 
 [[package]]
 name = "string-extras"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64",
  "chrono",
@@ -4224,7 +4224,7 @@ dependencies = [
 
 [[package]]
 name = "string-http"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "regex-lite",
  "ureq",
@@ -4234,7 +4234,7 @@ dependencies = [
 
 [[package]]
 name = "string-lyrics"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "chrono",
  "serde",
@@ -4249,7 +4249,7 @@ dependencies = [
 
 [[package]]
 name = "string-platform"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "raw-window-handle",
  "serde",
