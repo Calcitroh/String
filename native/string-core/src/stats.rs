@@ -450,12 +450,21 @@ impl Listening {
             });
             self.doc.tracks.len() - 1
         });
-        let row = &mut self.doc.tracks[ti].names;
+        let saved = &mut self.doc.tracks[ti];
+        let row = &mut saved.names;
+        let renamed = (!t.1.is_empty() && t.1 != row.1) || (!t.2.is_empty() && t.2 != row.2);
         if !t.1.is_empty() && t.1 != row.1 {
             row.1.clone_from(&t.1);
         }
         if !t.2.is_empty() && t.2 != row.2 {
             row.2.clone_from(&t.2);
+        }
+        // An imported play's album goes with the names it brings, so a renamed song never pairs its new title with
+        // the album it was first heard on.
+        if let Some(album) = album
+            && (renamed || saved.extra.is_empty())
+        {
+            saved.extra = vec![Value::from(album)];
         }
         let ai = *self.artists.entry(t.2.clone()).or_insert_with(|| {
             self.doc.artists.push(t.2.clone());

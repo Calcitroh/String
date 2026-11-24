@@ -29,6 +29,18 @@ fn imported_plays_keep_their_album_and_allow_long_plays() {
     assert_eq!(layer.tracks().count(), 1);
 }
 
+#[test]
+fn a_renamed_song_keeps_its_names_and_album_from_the_same_play() {
+    let mut layer = Listening::default();
+    let old = Track("spotify:track:x".into(), "Old Name".into(), "Band".into());
+    let new = Track("spotify:track:x".into(), "New Name".into(), "Band".into());
+    assert!(layer.add_imported(&old, 10., at(day(2020, 3, 1)), "First Release"));
+    assert!(layer.add_imported(&new, 20., at(day(2020, 3, 2)), "New Release"));
+    let t = layer.tracks().next().unwrap();
+    assert_eq!(t.1, "New Name");
+    assert_eq!(layer.album("spotify:track:x"), Some("New Release"));
+}
+
 fn pair() -> (Listening, Listening) {
     let mut own = Listening::default();
     own.add(&track("a.mp3", "Band"), 30., at(day(2026, 11, 20)));
