@@ -1,5 +1,5 @@
 use crate::model::{Ids, Models, Song};
-use chrono::Local;
+use chrono::{Local, NaiveDate};
 use egui::Context;
 use serde_json::{Value, json};
 use std::{
@@ -9,11 +9,13 @@ use std::{
 };
 use string_audio::{Config, Event, Host, LoopRange, Player, Status, Track};
 use string_core::{
+    data::{Document, SpotifyHistory},
     library::Library,
     queue::{AdvancePlan, NextAction, PlaybackOptions},
     state::State,
     stats::{Listening, Track as CountedTrack},
 };
+use string_extras::spotify::{Matcher, Resolved};
 
 /// Queue controls used by both the live player and the in-memory playback tests.
 pub trait Transport {
@@ -90,6 +92,23 @@ pub struct Session {
     /// How many times song files were moved to the Recycle Bin: a scan that started before the last move found them
     /// still there, so its result is set aside and the scan runs again.
     pub removals: u64,
+    /// The imported Spotify history (`spotify.json`), or why it couldn't be read. Change both with `set_spotify`.
+    pub spotify: Option<Document<SpotifyHistory>>,
+    pub spotify_error: Option<String>,
+    /// The history matched to the current library: only Stats reads it, never `listening`.
+    spotify_view: Option<(Listening, Resolved)>,
+    /// Changes whenever `spotify_view` does, so Stats draws again.
+    pub spotify_revision: u64,
+}
+/// What the Stats panel says about the imported Spotify history.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpotifySummary {
+    pub first: NaiveDate,
+    pub last: NaiveDate,
+    pub seconds: f64,
+    /// The part of `seconds` that is songs in the library.
+    pub matched_share: f64,
+    pub plays: u64,
 }
 impl Session {
     pub fn new(mut state: State, listening: Listening, library: Library) -> Self {
@@ -128,6 +147,10 @@ impl Session {
             active_duration: None,
             resync: false,
             removals: 0,
+            spotify: None,
+            spotify_error: None,
+            spotify_view: None,
+            spotify_revision: 0,
         }
     }
     pub fn rebuild(&mut self) {
@@ -139,6 +162,60 @@ impl Session {
         }
         self.invalidate_plan();
         self.generation += 1;
+        self.resolve_spotify();
+    }
+    pub fn set_spotify(&mut self, doc: Option<Document<SpotifyHistory>>, error: Option<String>) {
+        self.spotify = doc;
+        self.spotify_error = error;
+        self.resolve_spotify();
+    }
+    fn resolve_spotify(&mut self) {
+        let history = self
+            .spotify
+            .as_ref()
+            .map(|doc| &doc.value.0)
+            .filter(|h| h.first_day().is_some());
+        if history.is_none() && self.spotify_view.is_none() {
+            return;
+        }
+        // Library order, hidden songs too, under the names String's own plays record, so a matched Spotify play
+        // adds to the person's own plays of that song.
+        let songs = self.library.tracks.iter().filter_map(|t| {
+            let s = self.models.by_id.get(&t.id())?;
+            Some(CountedTrack(
+                s.id.clone(),
+                s.title.clone(),
+                s.artist.clone(),
+            ))
+        });
+        self.spotify_view = history.map(|h| Matcher::new(songs).resolve(h));
+        self.spotify_revision += 1;
+    }
+    pub fn spotify_view(&self) -> Option<&Listening> {
+        self.spotify_view.as_ref().map(|(view, _)| view)
+    }
+    pub fn spotify_summary(&self) -> Option<SpotifySummary> {
+        let (view, resolved) = self.spotify_view.as_ref()?;
+        let mut heard = view
+            .days()
+            .iter()
+            .filter(|(_, d)| d.s > 0.)
+            .map(|(&day, _)| day);
+        let first = heard.next()?;
+        Some(SpotifySummary {
+            first,
+            last: heard.next_back().unwrap_or(first),
+            seconds: resolved.seconds,
+            matched_share: if resolved.seconds > 0. {
+                resolved.matched_seconds / resolved.seconds
+            } else {
+                0.
+            },
+            plays: self
+                .spotify
+                .as_ref()
+                .map_or(0, |doc| doc.value.meta().plays),
+        })
     }
     pub fn current(&self) -> Option<&Song> {
         if self.active_failed {

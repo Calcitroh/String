@@ -1,8 +1,11 @@
 mod chart;
 pub(crate) mod smoke;
+#[cfg(test)]
+mod spotify_tests;
 
 use crate::{
     model::{CoverSource, norm},
+    playback::Session,
     route::Route,
     theme::*,
     ui::{self, area, covers::Size},
@@ -211,10 +214,13 @@ struct Rank {
     seconds: f64,
     cover: Arc<CoverSource>,
     key: Option<String>,
+    /// Said on hover when a song can't be played from here.
+    missing: &'static str,
 }
 struct Snapshot {
     drawn: Instant,
     kind: PeriodKind,
+    spotify_revision: u64,
     subtitle: String,
     has_history: bool,
     tiles: Vec<(String, String)>,
@@ -236,8 +242,9 @@ fn total(model: &Listening, from: chrono::NaiveDate, to: chrono::NaiveDate) -> f
     model.days().range(from..=to).map(|(_, d)| d.s).sum()
 }
 impl Snapshot {
-    fn read(v: &View<'_>, kind: PeriodKind) -> Self {
-        let model = &v.s.listening;
+    fn read(s: &Session, view: &StatsView, kind: PeriodKind) -> Self {
+        let merged = s.spotify_view().map(|layer| s.listening.merged(layer));
+        let model = merged.as_ref().unwrap_or(&s.listening);
         let now = Local::now().naive_local();
         let week = week_start();
         let period = |k| model.period(k, now, week).expect("current calendar period");
@@ -273,6 +280,12 @@ impl Snapshot {
                 duration(range.phone, false)
             ));
         }
+        if range.spotify > 0. {
+            note.push_str(&format!(
+                " · {} from Spotify",
+                duration(range.spotify, false)
+            ));
+        }
         let buckets = p
             .units
             .iter()
@@ -280,7 +293,7 @@ impl Snapshot {
             .enumerate()
             .map(|(i, (u, s))| bucket(kind, u, i, s))
             .collect();
-        let models = &v.s.models;
+        let models = &s.models;
         let artists = range
             .artists
             .into_iter()
@@ -304,6 +317,7 @@ impl Snapshot {
                     seconds,
                     cover,
                     key,
+                    missing: "",
                 }
             })
             .collect();
@@ -331,6 +345,12 @@ impl Snapshot {
                     cover: song
                         .map(|s| s.cover.clone())
                         .unwrap_or_else(|| fallback_art(t.0.clone())),
+                    // An unmatched Spotify song keeps its Spotify id; it was never in the library.
+                    missing: if t.0.starts_with("spotify:") {
+                        "Not in your library"
+                    } else {
+                        "Not in your library any more"
+                    },
                 }
             })
             .collect();
@@ -344,6 +364,7 @@ impl Snapshot {
         Self {
             drawn: Instant::now(),
             kind,
+            spotify_revision: s.spotify_revision,
             subtitle,
             has_history: first.is_some(),
             tiles,
@@ -353,7 +374,7 @@ impl Snapshot {
             current: p.current,
             artists,
             tracks,
-            phone: PhoneSummary::read(v),
+            phone: PhoneSummary::read(s, view),
         }
     }
 }
@@ -382,13 +403,12 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
         .find(|(_, k, _, _)| v.s.field("statsKind") == *k)
         .unwrap_or(&KINDS[1]);
     let hover = ui.rect_contains_pointer(ui.max_rect()) || egui::Popup::is_any_open(ui.ctx());
-    if v.views
-        .stats
-        .snapshot
-        .as_ref()
-        .is_none_or(|s| s.kind != kind || (!hover && s.drawn.elapsed() >= REFRESH))
-    {
-        v.views.stats.snapshot = Some(Arc::new(Snapshot::read(v, kind)));
+    if v.views.stats.snapshot.as_ref().is_none_or(|s| {
+        s.kind != kind
+            || s.spotify_revision != v.s.spotify_revision
+            || (!hover && s.drawn.elapsed() >= REFRESH)
+    }) {
+        v.views.stats.snapshot = Some(Arc::new(Snapshot::read(v.s, &v.views.stats, kind)));
     }
     let s = v.views.stats.snapshot.as_ref().unwrap().clone();
     if !hover {
@@ -679,8 +699,8 @@ fn rank_row(ui: &mut Ui, v: &mut View<'_>, i: usize, item: &Rank, max: f64) -> b
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
     } else {
-        if item.artist.is_some() {
-            response.on_hover_text("Not in your library any more");
+        if !item.missing.is_empty() {
+            response.on_hover_text(item.missing);
         }
         false
     }
@@ -713,14 +733,14 @@ struct PhoneSummary {
     users: Vec<(String, String)>,
 }
 impl PhoneSummary {
-    fn read(v: &View<'_>) -> Self {
-        let phone = v.s.field("phone");
+    fn read(s: &Session, view: &StatsView) -> Self {
+        let phone = s.field("phone");
         let read_failed = phone["error"].as_str().is_some_and(|s| !s.is_empty());
         let note = phone_note(phone);
         Self {
             show_status: phone["found"] == true || read_failed,
             note,
-            users: v.views.stats.phone_users.clone(),
+            users: view.phone_users.clone(),
         }
     }
 }
