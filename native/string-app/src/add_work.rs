@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use string_platform::instance::Instance;
 
@@ -333,6 +333,29 @@ impl Adds {
             toast.set(message);
         }
     }
+    /// Applies the adds taken before closing until none is `unfinished` (asked after each look at the queue) or
+    /// `deadline`; `wait` waits, until the time it's given, for work not queued yet. Then, without waiting, whatever
+    /// is ready by then: a batch can become ready between the last look at the queue and the look at the clock.
+    pub fn finish_at_exit(
+        &mut self,
+        deadline: Instant,
+        unfinished: impl Fn(&Self) -> bool,
+        mut wait: impl FnMut(Instant),
+        mut apply: impl FnMut(Batch),
+    ) {
+        loop {
+            while let Some(batch) = self.next_at_exit(deadline) {
+                apply(batch);
+            }
+            if !unfinished(self) || Instant::now() >= deadline {
+                break;
+            }
+            wait((Instant::now() + Duration::from_millis(5)).min(deadline));
+        }
+        for batch in self.ready.try_iter() {
+            apply(batch);
+        }
+    }
     pub fn next_at_exit(&mut self, deadline: Instant) -> Option<Batch> {
         self.startup.take().or_else(|| {
             if !self.pending() {
@@ -349,7 +372,6 @@ impl Adds {
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::time::Duration;
     use string_core::library::track_id;
 
     fn named_add(s: &mut Session, paths: Vec<PathBuf>) {
@@ -569,6 +591,49 @@ mod tests {
                 directory: false
             }]
         );
+    }
+
+    #[test]
+    fn an_exit_takes_in_a_batch_that_became_ready_just_before_the_deadline() {
+        let ctx = egui::Context::default();
+        let (woken, ready) = mpsc::channel();
+        ctx.set_request_repaint_callback(move |_| {
+            let _ = woken.send(());
+        });
+        let mut adds = Adds::with_classifier(|paths| {
+            paths
+                .into_iter()
+                .map(|path| Location {
+                    path,
+                    directory: false,
+                })
+                .collect()
+        })
+        .unwrap();
+        adds.attach(&ctx);
+        adds.set_closed(true);
+        let input = adds.input.clone();
+        let song = PathBuf::from(r"C:\Music\late.wav");
+        let queued = std::cell::Cell::new(false);
+        let mut applied = vec![];
+        // The time is up when the exit looks at the clock.
+        let deadline = Instant::now();
+        adds.finish_at_exit(
+            deadline,
+            |adds| {
+                // Between the exit's look at an empty queue and its look at the clock, a sorted drop's song is
+                // checked and ready to apply.
+                if !queued.replace(true) {
+                    assert!(input.queue_sorted_drop(vec![song.clone()]));
+                    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
+                adds.pending()
+            },
+            |_| {},
+            |batch| applied.extend(batch.locations.iter().map(|l| l.path.clone())),
+        );
+        assert_eq!(applied, [song]);
+        assert!(!adds.pending());
     }
 
     #[test]

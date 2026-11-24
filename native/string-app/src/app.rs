@@ -140,20 +140,17 @@ impl App {
             .take()
             .unwrap_or_else(|| Instant::now() + ADD_CLOSE_WAIT);
         if let Some(rt) = &self.runtime {
-            loop {
-                while let Some(batch) = self.adds.next_at_exit(add_deadline) {
-                    batch.apply(&mut rt.session.lock().unwrap(), &mut self.scan);
-                }
-                if !add_unfinished(|| self.views.drops.sorting(), || self.adds.pending())
-                    || Instant::now() >= add_deadline
-                {
-                    break;
-                }
-                // A drop still being sorted queues its songs once sorted (no new drop starts now adds are closed).
-                // Looking again soon takes in one sorted meanwhile, though another may still be sorting at the end.
-                let soon = Instant::now() + Duration::from_millis(5);
-                self.views.drops.wait_sorted(soon.min(add_deadline));
-            }
+            let (drops, scan) = (&self.views.drops, &mut self.scan);
+            // A drop still being sorted queues its songs once sorted (no new drop starts now adds are closed). Looking
+            // again soon takes in one sorted meanwhile, though another may still be sorting at the end.
+            self.adds.finish_at_exit(
+                add_deadline,
+                |adds| add_unfinished(|| drops.sorting(), || adds.pending()),
+                |until| drops.wait_sorted(until),
+                |batch| {
+                    batch.apply(&mut rt.session.lock().unwrap(), scan);
+                },
+            );
         }
         let mut reasons = Vec::new();
         if self.adding() {
