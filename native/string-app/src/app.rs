@@ -307,7 +307,9 @@ impl eframe::App for App {
             self.views.toast.set(msg);
         }
         rt.store.poll(&mut s);
-        s.poll_spotify();
+        if let Some(msg) = s.poll_spotify() {
+            self.views.toast.set(msg);
+        }
         if self.views.stats.sync_phone(&self.platform.phone.users) {
             self.platform.phone.request();
         }
@@ -395,9 +397,9 @@ impl eframe::App for App {
         }
         let rt = self.runtime.as_mut().unwrap();
         self.covers.poll(&ctx);
-        let paths = self.platform.picked_paths().unwrap_or_else(|e| {
+        let picked = self.platform.picked_paths().unwrap_or_else(|e| {
             self.views.toast.set(e.to_string());
-            Vec::new()
+            None
         });
         let mut s = rt.session.lock().unwrap();
         let st = rt.player.status();
@@ -430,8 +432,20 @@ impl eframe::App for App {
         if ctx.input(|i| !i.events.is_empty()) {
             self.transport_until = now + Duration::from_millis(350);
         }
-        for path in paths {
-            v.add_path(path);
+        match picked {
+            Some((picker, paths)) if picker.spotify() => {
+                if !paths.is_empty()
+                    && let Err(why) = v.s.import_spotify(paths)
+                {
+                    v.views.toast.set(why);
+                }
+            }
+            Some((_, paths)) => {
+                for path in paths {
+                    v.add_path(path);
+                }
+            }
+            None => {}
         }
         shell::shortcuts(ui, &mut v);
         shell::show(ui, &mut v);

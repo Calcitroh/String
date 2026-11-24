@@ -1,5 +1,6 @@
 mod chart;
 pub(crate) mod smoke;
+mod spotify_panel;
 #[cfg(test)]
 mod spotify_tests;
 
@@ -386,6 +387,8 @@ pub struct StatsView {
     phone_connected: bool,
     reveal_phone: bool,
     phone_visible: bool,
+    /// Asking before the Spotify history is taken out.
+    confirm_remove: bool,
 }
 impl StatsView {
     /// Exchange account choices and manual sync requests with the phone scheduler.
@@ -425,6 +428,8 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
             if !s.has_history {
                 ui.label(egui::RichText::new("Play something: the time you spend listening adds up here, with your top artists and songs").color(MUTED));
                 ui.add_space(18.);
+                spotify_panel::show(ui, v);
+                ui.add_space(18.);
                 phone(ui, v, &s.phone);
                 return;
             }
@@ -437,6 +442,8 @@ pub fn show(ui: &mut Ui, v: &mut View<'_>) {
                 }
                 if table { chart::table(ui, &s); } else { chart::bars(ui, &s, v.tint); }
             });
+            ui.add_space(18.);
+            spotify_panel::show(ui, v);
             ui.add_space(18.);
             let side_by_side = ui.available_width() >= 698.;
             let min_rows = if side_by_side { s.artists.len().max(s.tracks.len()) } else { 0 };

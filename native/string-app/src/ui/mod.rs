@@ -406,8 +406,9 @@ impl Toast {
                 self.current = None;
                 return;
             }
-            // above everything else, the icon credit's card included: a toast may say a save failed
-            egui::Area::new(Id::unique("toast"))
+            // above everything else, the icon credit's card included: a toast may say a save failed. An area keeps
+            // its first size, so each message gets its own and a long one isn't wrapped to a short one's width.
+            egui::Area::new(Id::unique(("toast", msg.as_str())))
                 .anchor(Align2::CENTER_BOTTOM, [0., -BAR - 10.])
                 .order(egui::Order::Tooltip)
                 .show(ctx, |ui| {

@@ -26,6 +26,8 @@ pub struct Views {
     pub selection: Selection,
     pub artist_popular_selection: Selection,
     pub toast: Toast,
+    /// Dropped files on their way to Stats or the library.
+    pub drops: crate::integration::spotify::Drops,
     pub adding_playlist: bool,
     pub playlist_name: String,
     pub root_input: String,

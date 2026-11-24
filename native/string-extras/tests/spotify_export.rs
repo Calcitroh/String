@@ -118,6 +118,63 @@ fn finds_history_one_folder_up_and_in_nested_zip_paths() {
 }
 
 #[test]
+fn is_history_agrees_with_find_history() {
+    let tmp = tempdir().unwrap();
+    let bytes = json_bytes(&two_plays());
+    // A music folder: albums of songs and a playlist file, no history anywhere.
+    let music = tmp.path().join("Music");
+    for artist in 0..6 {
+        for album in 0..3 {
+            let dir = music.join(format!("Artist {artist}/Album {album}"));
+            fs::create_dir_all(&dir).unwrap();
+            for n in 0..8 {
+                fs::write(dir.join(format!("{n:02} song.mp3")), b"").unwrap();
+            }
+            fs::write(dir.join("tracks.json"), b"[]").unwrap();
+        }
+    }
+    // History four folders down is found (as `find_history` finds it); five folders down isn't.
+    let near = tmp.path().join("a/b/c/d");
+    let far = tmp.path().join("e/f/g/h/i");
+    for dir in [&near, &far] {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(AUDIO), &bytes).unwrap();
+    }
+    // History beside songs, after the albums in the listing.
+    let mixed = music.join("Artist 5/zz export");
+    fs::create_dir_all(&mixed).unwrap();
+    fs::write(mixed.join(AUDIO), &bytes).unwrap();
+    let videos = tmp.path().join("videos.zip");
+    zip_of(
+        &videos,
+        &[("Streaming_History_Video_1.json", b"[]".to_vec())],
+    );
+    let broken = tmp.path().join("broken.zip");
+    fs::write(&broken, b"not a zip").unwrap();
+
+    let cases = [
+        (music.join("Artist 0"), false),
+        (tmp.path().join("a"), true),
+        (tmp.path().join("e"), false),
+        (music.clone(), true),
+        (videos, false),
+        (broken.clone(), false),
+        (near.join(AUDIO), true),
+        (tmp.path().join("missing"), false),
+    ];
+    for (path, want) in cases {
+        assert_eq!(is_history(&path), want, "{path:?}");
+        if path != broken && path.exists() {
+            assert_eq!(
+                !find_history(&[path.clone()]).unwrap().is_empty(),
+                want,
+                "{path:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn skips_video_podcast_and_audiobook_rows() {
     let tmp = tempdir().unwrap();
     let mut rows = two_plays();

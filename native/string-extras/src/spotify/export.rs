@@ -124,9 +124,60 @@ fn zip_error(e: zip::result::ZipError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
-/// Meant for a worker thread: it opens zips and walks folders.
+/// Whether `path` is, or holds, a history file by `find_history`'s rules. It stops at the first one, and tells
+/// folders from files by the folder listing, so a big music folder is walked without opening each file. What can't
+/// be read counts as no history here; the import names it. Meant for a worker thread: it opens zips and walks folders.
 pub fn is_history(path: &Path) -> bool {
-    find_history(&[path.to_owned()]).is_ok_and(|found| !found.is_empty())
+    match fs::metadata(path) {
+        Ok(m) if m.is_dir() => folder_has_history(path, 1),
+        Ok(_) if is_zip(path) => zip_has_history(path),
+        Ok(_) => path
+            .file_name()
+            .is_some_and(|n| is_audio_name(&n.to_string_lossy())),
+        Err(_) => false,
+    }
+}
+fn folder_has_history(dir: &Path, level: usize) -> bool {
+    if level > DEPTH {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    let mut folders = vec![];
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // A link is followed, as `find_history` follows it.
+        let folder = if kind.is_symlink() {
+            fs::metadata(entry.path()).is_ok_and(|m| m.is_dir())
+        } else {
+            kind.is_dir()
+        };
+        if folder {
+            folders.push(entry.path());
+        } else if is_audio_name(&entry.file_name().to_string_lossy()) {
+            return true;
+        }
+    }
+    folders.iter().any(|f| folder_has_history(f, level + 1))
+}
+fn zip_has_history(path: &Path) -> bool {
+    let Ok(mut archive) = File::open(path)
+        .map_err(zip::result::ZipError::Io)
+        .and_then(|f| zip::ZipArchive::new(BufReader::new(f)))
+    else {
+        return false;
+    };
+    (0..archive.len()).any(|i| {
+        archive.by_index_raw(i).is_ok_and(|entry| {
+            entry.is_file()
+                && entry
+                    .name()
+                    .is_ok_and(|n| is_audio_name(n.rsplit(['/', '\\']).next().unwrap_or("")))
+        })
+    })
 }
 
 /// Only what the app uses; serde skips every other field (addresses, countries, devices) without keeping it.

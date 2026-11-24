@@ -294,6 +294,15 @@ target\release\String.exe --smoke-test --data <a folder> --out <a folder>
 The self-test runs muted and off-screen with instance names of its own, and writes `results.json` and a screenshot
 per step; `--data` takes a copy of a real profile too. Without `--smoke-test`, `--data <folder>` opens String on that
 folder (its backups stay inside it), and it shares the single-instance names, so close any other String first.
+Its `stats-spotify` step imports the export `STRING_SMOKE_SPOTIFY_EXPORT` names (else a small made-up one, unless the
+profile already has a Spotify history) the way a drop on Stats does, and writes its numbers to `stats-spotify.json`.
+
+Stats can include a Spotify history (Spotify's "Extended streaming history" export) from `<data>\spotify.json`, a
+document of its own in `listening.json`'s shape: written only by an import, read on a worker at startup, never touched
+by 1.x. Stats' "Spotify history" panel takes the export dropped on the page or chosen there (a drop is sorted on a
+worker: a history to the import, music to the library); a newer export adds only later plays, and Remove sets the
+file aside in the backup folder. Plays are matched when Stats reads them, not stored: normalized title and main artist
+to a library song, artists merged by name, matched again when song names change.
 
 `pwsh -File tools\release-native.ps1 -Version 2.0.0-preview.1 [-Notes "..."] [-Publish]` makes
 `release\String-<version>.zip`: `String.exe`, `Read me first.txt` (from `tools\share\Preview read me.txt`) and

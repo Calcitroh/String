@@ -239,11 +239,14 @@ impl Platform {
     pub fn files(&self) -> Files {
         Files::new(self.hwnd, self.smoke)
     }
-    pub fn picked_paths(&mut self) -> io::Result<Vec<PathBuf>> {
-        match self.picker.take() {
-            Some(which) => self.files().pick(which),
-            None => Ok(Vec::new()),
-        }
+    /// The paths chosen in the picker asked for, and which picker it was; `None` when none was asked for.
+    pub fn picked_paths(
+        &mut self,
+    ) -> io::Result<Option<(crate::integration::files::LibraryPicker, Vec<PathBuf>)>> {
+        let Some(which) = self.picker.take() else {
+            return Ok(None);
+        };
+        Ok(Some((which, self.files().pick(which)?)))
     }
 
     /// The paths `--add` brought since the last call.

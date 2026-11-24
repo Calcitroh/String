@@ -10,7 +10,8 @@ use egui::Context;
 use serde_json::{Value, json};
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 use windows::Win32::{
@@ -21,6 +22,11 @@ pub struct Case {
     pub name: &'static str,
     pub prepare: fn(&mut View<'_>),
     pub ready: fn(&mut View<'_>) -> bool,
+}
+static OUT: OnceLock<PathBuf> = OnceLock::new();
+/// The self-test's `--out` folder, for a case that writes files of its own.
+pub fn out() -> Option<&'static Path> {
+    OUT.get().map(PathBuf::as_path)
 }
 fn library(v: &mut View<'_>) {
     v.go(Route::Home);
@@ -182,6 +188,7 @@ pub const CASES: &[Case] = &[
         prepare: lists::dropzone,
         ready: lists::ready,
     },
+    crate::screens::stats::smoke::SPOTIFY,
     Case {
         name: "02-now-playing",
         prepare: record,
@@ -221,6 +228,7 @@ pub struct Smoke {
 }
 impl Smoke {
     pub fn new(out: PathBuf) -> Self {
+        let _ = OUT.set(out.clone());
         let mut cases: Vec<_> = CASES.iter().collect();
         if std::env::var_os("STRING_SMOKE_LRCLIB_PORT").is_some()
             && std::env::var_os("STRING_SMOKE_OLLAMA_PORT").is_some()

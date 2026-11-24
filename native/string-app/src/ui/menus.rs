@@ -1331,7 +1331,17 @@ pub fn takes_keys(ctx: &Context) -> bool {
     }
     false
 }
-fn drops(ctx: &Context, hi: Tint, adds: &crate::add_work::Input, toast: &mut ui::Toast) {
+/// The drop zone while files are dragged over the window, and dropped files sent off to be sorted: a Spotify
+/// history to Stats (`on_stats`), the rest to the library.
+fn drops(
+    ctx: &Context,
+    hi: Tint,
+    adds: &crate::add_work::Input,
+    sorter: &mut crate::integration::spotify::Drops,
+    on_stats: bool,
+    toast: &mut ui::Toast,
+) {
+    sorter.attach(ctx);
     let (hovering, dropped) = ctx.input(|i| {
         (
             !i.raw.hovered_files.is_empty(),
@@ -1345,7 +1355,9 @@ fn drops(ctx: &Context, hi: Tint, adds: &crate::add_work::Input, toast: &mut ui:
     if hovering || state().drop_demo {
         let r = ctx.content_rect().shrink(10.);
         let p = ctx.layer_painter(egui::LayerId::new(Order::Tooltip, Id::unique("dropzone")));
-        p.rect_filled(r, 0, Color32::from_black_alpha(184));
+        // Lighter on Stats, where the Spotify panel lights up underneath.
+        let wash = if on_stats { 120 } else { 184 };
+        p.rect_filled(r, 0, Color32::from_black_alpha(wash));
         let c = [
             r.left_top(),
             r.right_top(),
@@ -1358,14 +1370,18 @@ fn drops(ctx: &Context, hi: Tint, adds: &crate::add_work::Input, toast: &mut ui:
             &p,
             r.center(),
             Align2::CENTER_CENTER,
-            "Drop folders or songs to add them",
+            if on_stats {
+                "Drop a Spotify export, or folders and songs to add them"
+            } else {
+                "Drop folders or songs to add them"
+            },
             "HUD",
             14.,
             0.3,
             hi.ink(1.),
         );
     }
-    if !dropped.is_empty() && !adds.queue_drop(dropped) {
+    if !dropped.is_empty() && !sorter.send(dropped, on_stats, adds) {
         toast.set("String could not take more songs.");
     }
 }
@@ -1406,7 +1422,16 @@ pub fn overlay(ui: &mut Ui, v: &mut View<'_>) {
                 .collect();
         new_playlist(v, ids, false);
     }
-    drops(&ctx, v.tint, v.adds, &mut v.views.toast);
+    let on_stats = v.views.history.current == Route::Stats && v.views.overlay.is_none();
+    drops(
+        &ctx,
+        v.tint,
+        v.adds,
+        &mut v.views.drops,
+        on_stats,
+        &mut v.views.toast,
+    );
+    v.views.drops.poll(v.s, &mut v.views.toast);
     drag_ghost(&ctx, v);
     show_menu(&ctx, v);
     show_dialog(&ctx, v);

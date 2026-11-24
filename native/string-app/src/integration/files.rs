@@ -10,11 +10,22 @@ use string_platform::{
 
 const SONG_FILTER: &str =
     "Songs|*.mp3;*.flac;*.m4a;*.m4b;*.aac;*.ogg;*.oga;*.opus;*.wav;*.weba;*.webm|All files|*.*";
+const SPOTIFY_FILTER: &str = "Spotify export|*.zip;*.json|All files|*.*";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum LibraryPicker {
     Folders,
     Songs,
+    /// A Spotify export for Stats: its zip or its JSON files.
+    SpotifyExport,
+    /// The export unzipped.
+    SpotifyFolder,
+}
+impl LibraryPicker {
+    /// What it picks goes to Stats' Spotify import, not the library.
+    pub fn spotify(self) -> bool {
+        matches!(self, Self::SpotifyExport | Self::SpotifyFolder)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -32,6 +43,8 @@ impl Files {
         let (title, filter) = match picker {
             LibraryPicker::Folders => ("Choose folders with your songs", None),
             LibraryPicker::Songs => ("Choose songs", Some(SONG_FILTER)),
+            LibraryPicker::SpotifyExport => ("Choose your Spotify export", Some(SPOTIFY_FILTER)),
+            LibraryPicker::SpotifyFolder => ("Choose your unzipped Spotify export", None),
         };
         let mut paths = self.choose(
             &Pick {
@@ -129,6 +142,7 @@ mod tests {
         let f = Files::new(None, true);
         assert!(f.pick(LibraryPicker::Folders).unwrap().is_empty());
         assert!(f.pick(LibraryPicker::Songs).unwrap().is_empty());
+        assert!(f.pick(LibraryPicker::SpotifyExport).unwrap().is_empty());
         assert!(f.open_web_link("https://example.com").is_ok());
         assert!(f.open_web_link("file:///example.exe").is_err());
         assert!(f.recycle(Path::new(r"C:\fixture\song.flac")).is_err());

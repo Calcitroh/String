@@ -1,6 +1,7 @@
 use super::*;
-use crate::smoke::Case;
+use crate::{integration::spotify, smoke::Case};
 use serde_json::json;
+use std::{path::PathBuf, sync::Mutex};
 use string_core::stats::Track;
 
 fn select(v: &mut View<'_>, kind: &str, table: bool) {
@@ -116,3 +117,100 @@ pub const CASES: &[Case] =
             },
         },
     ];
+
+/// Stats with a Spotify history, imported the way a drop on Stats is: the export `STRING_SMOKE_SPOTIFY_EXPORT`
+/// names, or a small made-up one when the profile has no history yet. Its numbers go to `stats-spotify.json`.
+pub const SPOTIFY: Case = Case {
+    name: "stats-spotify",
+    prepare: |v| {
+        crate::ui::menus::smoke::reset(v);
+        select(v, "week", false);
+        *RUN.lock().unwrap() = Run::Start;
+    },
+    ready: spotify_ready,
+};
+enum Run {
+    Start,
+    Sent(Instant),
+    Done,
+}
+static RUN: Mutex<Run> = Mutex::new(Run::Start);
+fn spotify_ready(v: &mut View<'_>) -> bool {
+    let mut run = RUN.lock().unwrap();
+    match *run {
+        Run::Start if !v.s.spotify_loading() => {
+            let export = std::env::var_os("STRING_SMOKE_SPOTIFY_EXPORT")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    (v.s.spotify.is_none() && v.s.spotify_error.is_none())
+                        .then(|| plant(v))
+                        .flatten()
+                });
+            let sent = export.is_some_and(|path| v.views.drops.send(vec![path], true, v.adds));
+            *run = if sent {
+                Run::Sent(Instant::now())
+            } else {
+                report(v, None);
+                Run::Done
+            };
+            false
+        }
+        Run::Sent(at) if !v.views.drops.pending() && !v.s.spotify_busy() => {
+            report(v, Some(at.elapsed()));
+            *run = Run::Done;
+            false
+        }
+        // Drawn with the history as it is now: imported, or the panel saying why not.
+        Run::Done => v
+            .views
+            .stats
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.spotify_revision == v.s.spotify_revision),
+        _ => false,
+    }
+}
+/// A made-up export under `--out`: fifty plays over the last few days, the first three of the library's first songs.
+fn plant(v: &View<'_>) -> Option<PathBuf> {
+    let like: Vec<_> =
+        v.s.models
+            .songs
+            .iter()
+            .take(3)
+            .map(|id| {
+                let song = &v.s.models.by_id[id];
+                (song.title.clone(), song.artist.clone())
+            })
+            .collect();
+    let dir = crate::smoke::out()?.join("spotify-export");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("my_spotify_data.zip");
+    spotify::write_export(&path, &spotify::sample_files(50, &like)).ok()?;
+    Some(path)
+}
+/// Numbers only: no song names, no paths.
+fn report(v: &View<'_>, took: Option<Duration>) {
+    let Some(out) = crate::smoke::out() else {
+        return;
+    };
+    let outcome = v.s.spotify_outcome.as_ref();
+    let summary = outcome.and_then(|o| o.summary.as_ref());
+    let seconds = summary.map_or(0., |s| s.seconds);
+    let mut numbers = json!({
+        "added": summary.map_or(0, |s| s.added),
+        "seconds": seconds,
+        "hours": seconds / 3600.,
+        "matchedShare": v.s.spotify_summary().map_or(0., |s| s.matched_share),
+        "importMs": took.map_or(0, |t| t.as_millis() as u64),
+        "files": summary.map_or(0, |s| s.files),
+    });
+    if let Some(failed) = outcome.filter(|o| o.failed) {
+        numbers["error"] = failed.message.clone().into();
+    } else if took.is_some() && outcome.is_none() {
+        numbers["error"] = "No Spotify history was found there.".into();
+    }
+    let _ = std::fs::write(
+        out.join("stats-spotify.json"),
+        serde_json::to_vec_pretty(&numbers).unwrap_or_default(),
+    );
+}

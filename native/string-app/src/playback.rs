@@ -1,5 +1,5 @@
 use crate::{
-    integration::spotify::{self, SpotifyLayer},
+    integration::spotify::{self, Job, Outcome, SpotifyLayer},
     model::{Ids, Models, Song},
 };
 use chrono::{Local, NaiveDate};
@@ -8,6 +8,7 @@ use egui::Context;
 use serde_json::{Value, json};
 use std::{
     collections::{HashSet, VecDeque},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -106,6 +107,12 @@ pub struct Session {
     spotify_loading: Option<Receiver<SpotifyLayer>>,
     /// Changes whenever `spotify_view` does, so Stats draws again.
     pub spotify_revision: u64,
+    /// Where `spotify.json` lives and the window its workers wake: known once the startup read starts.
+    spotify_home: Option<(DataFolder, Context)>,
+    /// The import or removal running: one at a time.
+    spotify_job: Option<Job>,
+    /// How the last import or removal ended.
+    pub spotify_outcome: Option<Outcome>,
 }
 /// What the Stats panel says about the imported Spotify history.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -160,6 +167,9 @@ impl Session {
             spotify_matched: 0,
             spotify_loading: None,
             spotify_revision: 0,
+            spotify_home: None,
+            spotify_job: None,
+            spotify_outcome: None,
         }
     }
     pub fn rebuild(&mut self) {
@@ -198,36 +208,92 @@ impl Session {
     }
     /// Starts reading `spotify.json` on a worker; `poll_spotify` takes it in.
     pub(crate) fn load_spotify(&mut self, folder: DataFolder, ctx: &Context) {
+        self.spotify_home = Some((folder.clone(), ctx.clone()));
         match spotify::load(folder, self.spotify_songs(), ctx) {
             Ok(rx) => self.spotify_loading = Some(rx),
-            Err(e) => self.spotify_error = Some(format!("Couldn't read your Spotify history: {e}")),
+            Err(e) => {
+                self.spotify_error = Some(format!("Couldn't read your Spotify history ({e})."))
+            }
         }
+    }
+    #[cfg(test)]
+    pub(crate) fn watch_spotify_read(&mut self, rx: Receiver<SpotifyLayer>) {
+        self.spotify_loading = Some(rx);
     }
     pub fn spotify_loading(&self) -> bool {
         self.spotify_loading.is_some()
     }
-    /// Takes in the Spotify history once the worker has read it. Called every frame.
-    pub fn poll_spotify(&mut self) {
-        let Some(rx) = &self.spotify_loading else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(layer) => self.set_spotify(layer),
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => self.set_spotify(SpotifyLayer {
-                error: Some("Couldn't read your Spotify history: the reader stopped".into()),
-                ..SpotifyLayer::default()
-            }),
+    /// Takes in the Spotify history read at startup, and an import or removal that has ended. Called every frame;
+    /// returns what to tell the person about the import or removal.
+    pub fn poll_spotify(&mut self) -> Option<String> {
+        if let Some(rx) = &self.spotify_loading {
+            match rx.try_recv() {
+                Ok(layer) => self.set_spotify(layer),
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Disconnected) => {
+                    self.spotify_loading = None;
+                    // Only an empty panel takes the error: a history already shown stays.
+                    if self.spotify.is_none() {
+                        self.set_spotify(SpotifyLayer::failed(
+                            "Couldn't read your Spotify history: the reader stopped.".into(),
+                        ));
+                    }
+                }
+            }
         }
+        let (outcome, layer) = self.spotify_job.as_mut()?.poll()?;
+        self.spotify_job = None;
+        if let Some(layer) = layer {
+            self.set_spotify(layer);
+        }
+        let message = outcome.message.clone();
+        self.spotify_outcome = Some(outcome);
+        Some(message)
+    }
+    /// Starts importing the history in `paths`: an export's zip or folder, or its files. One import or removal
+    /// runs at a time; asked for while one runs, it says so instead.
+    pub fn import_spotify(&mut self, paths: Vec<PathBuf>) -> Result<(), String> {
+        let (folder, ctx) = self.spotify_home()?;
+        let job = spotify::start_import(folder, paths, self.spotify_songs(), &ctx)
+            .map_err(|e| format!("Couldn't start the import ({e})."))?;
+        self.spotify_job = Some(job);
+        self.spotify_outcome = None;
+        Ok(())
+    }
+    /// Starts moving `spotify.json` into the backup folder, so Stats counts only String's own listening again.
+    pub fn remove_spotify(&mut self) -> Result<(), String> {
+        let (folder, ctx) = self.spotify_home()?;
+        let stamp = Local::now().format("%Y-%m-%d %H%M%S").to_string();
+        let job = spotify::start_remove(folder, stamp, &ctx)
+            .map_err(|e| format!("Couldn't take your Spotify history out of Stats ({e})."))?;
+        self.spotify_job = Some(job);
+        self.spotify_outcome = None;
+        Ok(())
+    }
+    fn spotify_home(&self) -> Result<(DataFolder, Context), String> {
+        if self.spotify_job.is_some() {
+            return Err(spotify::BUSY.into());
+        }
+        self.spotify_home
+            .clone()
+            .ok_or_else(|| "This library has no place for a Spotify history.".into())
+    }
+    pub fn spotify_busy(&self) -> bool {
+        self.spotify_job.is_some()
+    }
+    pub fn spotify_job(&self) -> Option<&Job> {
+        self.spotify_job.as_ref()
     }
     /// Replaces the Spotify history, and any read still running. A view matched to other songs is matched again.
     pub fn set_spotify(&mut self, layer: SpotifyLayer) {
         let had = self.spotify_view.is_some();
         self.spotify_loading = None;
-        self.spotify = layer.doc;
-        self.spotify_error = layer.error;
-        self.spotify_view = layer.view;
-        self.spotify_matched = layer.songs;
+        (
+            self.spotify,
+            self.spotify_error,
+            self.spotify_view,
+            self.spotify_matched,
+        ) = layer.into_parts();
         // A scan can finish while a worker matches.
         if self.spotify.is_some() && self.spotify_matched != self.songs_fingerprint() {
             self.resolve_spotify();
