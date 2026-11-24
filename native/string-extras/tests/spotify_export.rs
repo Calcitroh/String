@@ -390,6 +390,31 @@ fn a_newer_export_keeps_links_set_by_hand() {
 }
 
 #[test]
+fn the_newest_play_names_a_song_whatever_order_the_files_list_it_in() {
+    let tmp = tempdir().unwrap();
+    let named = |ts: &str, title: &str, album: &str| {
+        json!({
+            "ts": ts,
+            "ms_played": 60_000,
+            "master_metadata_track_name": title,
+            "master_metadata_album_artist_name": "Artist A",
+            "master_metadata_album_album_name": album,
+            "spotify_track_uri": "spotify:track:renamed",
+        })
+    };
+    let rows = vec![
+        named("2021-05-02T10:00:00Z", "New Name", "New Release"),
+        named("2021-05-01T10:00:00Z", "Old Name", "First Release"),
+    ];
+    fs::write(tmp.path().join(AUDIO), json_bytes(&rows)).unwrap();
+    let mut h = SpotifyHistory::default();
+    run(&[tmp.path().join(AUDIO)], &mut h).unwrap();
+    let t = h.0.tracks().next().unwrap();
+    assert_eq!(t.1, "New Name");
+    assert_eq!(h.0.album("spotify:track:renamed"), Some("New Release"));
+}
+
+#[test]
 fn an_older_export_adds_nothing() {
     let tmp = tempdir().unwrap();
     let new = tmp.path().join("new");

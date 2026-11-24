@@ -305,23 +305,20 @@ by 1.x. Stats' "Spotify history" panel takes the export dropped on the page or c
 worker: a history to the import, music to the library); a newer export adds only later plays, and Remove sets the
 file aside in the backup folder. Plays are matched when Stats reads them, not stored, and again when song names or
 albums change (`string-extras\src\spotify\matching.rs`). A false join silently moves hours to the wrong song or
-artist, so automatic joins are narrow, and anything else is a link set by hand:
-- `spotify.json` may hold links set by hand, kept by imports like any top-level key:
-  `"sameAs": [{ "title", "artist", "as": { "title", "artist" } }]`. Each counts a song as the library song it names
-  (a re-upload, or a cover the person counts as the original), by whole credit on both ends, checked first. Linked
-  plays never count as proof below.
-- The same normalized title and main artist is that library song. Among copies, the one with the same whole credit
-  and album wins, else library order.
-- Spellings join only between names in different scripts (a name in Japanese, the library's in Latin letters, or the
-  other way round), on albums that can tell recordings apart (not generic like "Greatest Hits" or "Soundtrack",
-  not self-titled, not a single named after its song):
-  - **on one album:** two or more titles there by exactly one library artist prove that spelling is them on that
-    album, and its titles there match;
-  - **everywhere:** two or more titles shared on such albums, all by one library artist, with nothing pointing to
-    another, and the spelling isn't a library artist's own name. Then its other plays match by title under the
-    whole proven credit, and Stats shows the library's spelling.
-- Plays without an artist name never join an artist. Other plays keep Spotify's names, with an artist of the same
-  normalized name shown under the library's spelling.
+artist, and nothing in an export tells a name written in another script from a label's or a compilation's credit
+on the same soundtrack, so names that differ join only by links the person sets by hand:
+- The same normalized title and main artist is that library song, unless the play is a collaboration and every such
+  song is another one ("North & West" never lands on "North & South"). Among copies, the one with the same whole
+  credit and album wins, else library order. Plays without an artist name never join an artist.
+- `spotify.json` may hold links set by hand, kept by imports like any top-level key, both ends naming a whole credit
+  the library has exactly (a link to "North" never lands on "North & South"):
+  - `"sameAs": [{ "title", "artist", "as": { "title", "artist" } }]` counts a song as a library song (a re-upload,
+    or a cover the person counts as the original), checked first;
+  - `{ "artist", "as": { "artist" } }` in the same list counts every play credited so as the library artist's (a name
+    written in another script): its titles match theirs, and its other plays show under their spelling.
+- Other plays keep Spotify's names, with an artist of the same normalized name shown under the library's spelling.
+
+An import records plays in the order they were played, so a song Spotify renamed keeps its newest names and album.
 
 Top artists and Top songs show ten rows; Expand (`statsMoreArtists`, `statsMoreSongs`) shows up to fifty.
 

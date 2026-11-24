@@ -30,6 +30,26 @@ fn imported_plays_keep_their_album_and_allow_long_plays() {
 }
 
 #[test]
+fn a_newer_album_keeps_the_other_saved_cells() {
+    let tmp = tempdir().unwrap();
+    let folder = DataFolder::new(tmp.path(), tmp.path().join("backup"));
+    let doc = json!({
+        "v": 1,
+        "artists": ["Band"],
+        "tracks": [["spotify:track:x", "Song", "Band", "First Release", {"marker": 7}]],
+        "days": {},
+    });
+    fs::write(tmp.path().join("spotify.json"), serde_json::to_vec(&doc).unwrap()).unwrap();
+    let mut layer = folder.read::<SpotifyHistory>().unwrap();
+    let t = Track("spotify:track:x".into(), "Song".into(), "Band".into());
+    assert!(layer.value.0.add_imported(&t, 10., at(day(2020, 3, 2)), "Second Release"));
+    assert_eq!(layer.value.0.album("spotify:track:x"), Some("Second Release"));
+    layer.save().unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(tmp.path().join("spotify.json")).unwrap()).unwrap();
+    assert_eq!(saved["tracks"][0][4], json!({"marker": 7}));
+}
+
+#[test]
 fn a_renamed_song_keeps_its_names_and_album_from_the_same_play() {
     let mut layer = Listening::default();
     let old = Track("spotify:track:x".into(), "Old Name".into(), "Band".into());

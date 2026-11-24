@@ -421,6 +421,9 @@ pub fn import_within(
         through: meta.through,
         ..Summary::default()
     };
+    // In the order they were played, so a song Spotify renamed keeps its newest name and album whatever order the
+    // export's files list it in.
+    plays.sort_by_key(|play| play.ms);
     for play in &plays {
         if into
             .0
