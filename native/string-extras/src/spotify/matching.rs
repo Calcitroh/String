@@ -1,6 +1,10 @@
 //! Matching a Spotify history to the library's songs and artists. Nothing here is stored: Stats resolves again
 //! whenever the library changes, so a song added later picks up its old Spotify plays.
+//!
+//! A wrong match silently moves hours to the wrong song or artist, so matching is conservative: names must agree,
+//! anything ambiguous stays a Spotify song, and names that differ join only through links the person sets by hand.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use string_core::stats::{Listening, Track};
 
@@ -26,29 +30,51 @@ impl From<Track> for LibrarySong {
     }
 }
 
-/// One library song with the keys matching compares.
-struct Candidate {
-    track: Track,
+/// A credit's or a title's keys, the same for a library song and a Spotify play.
+struct Keys {
+    /// `normalize_title`: featured artists and remaster notes gone.
+    title: String,
+    /// The title as written, remaster notes gone, as `spelling` ("home feat cora", not "home feat ben").
+    written: String,
+    /// The guest a "(feat. …)" or "(with …)" names, normalized; empty when there is none.
+    guest: String,
+    /// `main_artist` of the credit.
+    main: String,
     /// The whole credit, as `spelling`.
     credit: String,
-    /// The whole title as written, as `spelling`.
-    written: String,
-    /// A credit that is one artist alone (no second name after `&`, `,`, `feat.` and the like).
+    /// The first of two or more names the credit joins ("north" for "North, West"); empty for one artist alone.
+    lead: String,
+    /// A credit that is one artist alone, with nothing that joins or marks names but a hyphen ("Jay-Z").
     solo: bool,
     /// The album, as `spelling` ("" when unknown).
     album: String,
 }
+impl Keys {
+    fn of(title: &str, artist: &str, album: &str) -> Keys {
+        let main = main_artist(artist);
+        let lead = lead_artist(artist);
+        let marked = artist.contains(|c: char| MARKS.contains(&c) && c != '-');
+        Keys {
+            title: normalize_title(title),
+            written: spelling(&without_remaster(title)),
+            guest: guest(title),
+            solo: !marked && lead.is_empty() && normalize_text(artist) == main,
+            credit: spelling(artist),
+            album: spelling(album),
+            main,
+            lead,
+        }
+    }
+    /// Two versions naming different guests are different recordings ("(feat. Ena)", "(feat. Yui)").
+    fn guests_differ(&self, other: &Keys) -> bool {
+        !self.guest.is_empty() && !other.guest.is_empty() && self.guest != other.guest
+    }
+}
 
-/// A Spotify song's keys. Only songs with a title that normalizes to something have them.
-struct Play {
-    /// `normalize_title`: featured artists and remaster notes gone.
-    title: String,
-    /// The whole title as written, as `spelling`, for song links.
-    written: String,
-    main: String,
-    credit: String,
-    solo: bool,
-    album: String,
+/// One library song with the keys matching compares.
+struct Candidate {
+    track: Track,
+    keys: Keys,
 }
 
 /// The library's songs indexed for matching, and its artist spellings.
@@ -76,84 +102,77 @@ impl Matcher {
         };
         for song in songs {
             let LibrarySong { track, album } = song.into();
-            let credit = spelling(&track.2);
-            if !credit.is_empty() {
+            let keys = Keys::of(&track.1, &track.2, &album);
+            if !keys.credit.is_empty() {
                 m.artists
-                    .entry(credit.clone())
+                    .entry(keys.credit.clone())
                     .or_insert_with(|| track.2.clone());
             }
-            let title = normalize_title(&track.1);
-            if title.is_empty() {
+            if keys.title.is_empty() {
                 continue;
             }
-            let main = main_artist(&track.2);
             let i = m.songs.len();
             m.by_artist
-                .entry((title.clone(), main.clone()))
+                .entry((keys.title.clone(), keys.main.clone()))
                 .or_default()
                 .push(i);
             m.by_credit
-                .entry((title, credit.clone()))
+                .entry((keys.title.clone(), keys.credit.clone()))
                 .or_default()
                 .push(i);
-            let written = spelling(&track.1);
             m.by_written
-                .entry((written.clone(), credit.clone()))
+                .entry((spelling(&track.1), keys.credit.clone()))
                 .or_default()
                 .push(i);
-            m.songs.push(Candidate {
-                written,
-                solo: normalize_text(&track.2) == main,
-                album: spelling(&album),
-                track,
-                credit,
-            });
+            m.songs.push(Candidate { track, keys });
         }
         m
     }
 
-    fn play(history: &Listening, t: &Track) -> Option<Play> {
-        let title = normalize_title(&t.1);
-        // A title that is only punctuation or a credit would match any such song by the artist.
-        if title.is_empty() {
-            return None;
-        }
-        let main = main_artist(&t.2);
-        Some(Play {
-            written: spelling(&t.1),
-            solo: normalize_text(&t.2) == main,
-            album: spelling(history.album(&t.0).unwrap_or("")),
-            credit: spelling(&t.2),
-            main,
-            title,
-        })
+    /// A Spotify song's keys, when its title normalizes to something: a title that is only punctuation or a credit
+    /// would match any such song by the artist.
+    fn play(history: &Listening, t: &Track) -> Option<Keys> {
+        let keys = Keys::of(&t.1, &t.2, history.album(&t.0).unwrap_or(""));
+        (!keys.title.is_empty()).then_some(keys)
     }
 
-    /// Of `found`, the song that agrees most: the same whole credit first, then the same title as written ("(feat.
-    /// Cora)", not "(feat. Ben)"), then the same album; library order between copies that agree as much.
-    fn best(&self, found: &[usize], credit: &str, written: &str, album: &str) -> Option<&Track> {
-        let score = |c: &Candidate| {
+    /// Of `found`, the song that agrees most with `p`: the same whole credit first, then the same album (the live
+    /// album's copy for a live play), then the same title as written ("(feat. Cora)" over "(feat. Ben)"); library
+    /// order between copies that agree as much. Songs naming another guest than the play are never chosen.
+    fn best(&self, found: &[usize], credit: &str, p: &Keys) -> Option<&Track> {
+        let score = |c: &Keys| {
             4 * u8::from(c.credit == credit)
-                + 2 * u8::from(c.written == written)
-                + u8::from(!album.is_empty() && c.album == album)
+                + 2 * u8::from(!p.album.is_empty() && c.album == p.album)
+                + u8::from(c.written == p.written)
         };
         found
             .iter()
             .enumerate()
-            .max_by_key(|&(n, &i)| (score(&self.songs[i]), std::cmp::Reverse(n)))
+            .filter(|&(_, &i)| !self.songs[i].keys.guests_differ(p))
+            .max_by_key(|&(n, &i)| (score(&self.songs[i].keys), Reverse(n)))
             .map(|(_, &i)| &self.songs[i].track)
     }
 
     /// A play's library song: the one a song link names; else, for an artist link, the same title by the library
-    /// artist it names; else the same title by the same main artist (see `by_name`).
-    fn find(&self, p: &Play, links: &Links) -> Option<&Track> {
-        if let Some(to) = links.songs.get(&(p.written.clone(), p.credit.clone()))
-            && let Some(song) = self
-                .by_written
-                .get(to)
-                .and_then(|f| self.best(f, &to.1, &to.0, &p.album))
+    /// artist it names; else the same title by the same artist (see `by_name`).
+    fn find(&self, p: &Keys, played: &str, links: &Links) -> Option<&Track> {
+        if let Some(to) = links.songs.get(&(spelling(played), p.credit.clone()))
+            && let Some(found) = self.by_written.get(to)
         {
-            return Some(song);
+            // A song link is the person's own decision: the song it names, on the play's album if it has copies.
+            let named = Keys {
+                title: String::new(),
+                written: to.0.clone(),
+                guest: String::new(),
+                main: String::new(),
+                credit: to.1.clone(),
+                lead: String::new(),
+                solo: false,
+                album: p.album.clone(),
+            };
+            if let Some(song) = self.best(found, &to.1, &named) {
+                return Some(song);
+            }
         }
         // An artist link to a name the library has decides: the play is theirs or no one's. One to a name the
         // library lacks is passed over.
@@ -163,56 +182,53 @@ impl Matcher {
             return self
                 .by_credit
                 .get(&(p.title.clone(), credit.clone()))
-                .and_then(|f| self.best(f, credit, &p.written, &p.album));
+                .and_then(|f| self.best(f, credit, p));
         }
         self.by_name(p)
     }
 
-    /// The same title by the same main artist. A play credited to a collaboration takes its own credit or its lead
-    /// artist alone, never another collaboration ("North & West" is not "North & South"). When the songs left are
-    /// by more than one other credit, the album must choose, or nothing matches.
-    fn by_name(&self, p: &Play) -> Option<&Track> {
+    /// The same title by the same artist: the whole credit first, then the main artist. A play credited to two or
+    /// more names takes its own credit or its lead artist alone, never another credit ("North & West" is not
+    /// "North & South", "North+" is not "North"). When the songs left are by more than one credit, the album must
+    /// choose, or nothing matches.
+    fn by_name(&self, p: &Keys) -> Option<&Track> {
         // A play with no artist name is never matched by artist.
+        if p.credit.is_empty() {
+            return None;
+        }
+        if let Some(found) = self.by_credit.get(&(p.title.clone(), p.credit.clone())) {
+            return self.best(found, &p.credit, p);
+        }
         if p.main.is_empty() {
             return None;
         }
-        // The whole credit first: "River&Stone" is "River & Stone", whatever its spacing makes of the main artist.
-        if let Some(found) = self.by_credit.get(&(p.title.clone(), p.credit.clone())) {
-            return self.best(found, &p.credit, &p.written, &p.album);
-        }
-        let fits = |c: &Candidate| c.credit == p.credit || p.solo || c.solo;
+        let fits = |c: &Keys| {
+            p.solo || (c.solo && !p.lead.is_empty() && normalize_text(&c.credit) == p.lead)
+        };
         let found: Vec<usize> = self
             .by_artist
             .get(&(p.title.clone(), p.main.clone()))?
             .iter()
             .copied()
-            .filter(|&i| fits(&self.songs[i]))
+            .filter(|&i| fits(&self.songs[i].keys) && !self.songs[i].keys.guests_differ(p))
             .collect();
-        let exact: Vec<usize> = found
-            .iter()
-            .copied()
-            .filter(|&i| self.songs[i].credit == p.credit)
-            .collect();
-        if !exact.is_empty() {
-            return self.best(&exact, &p.credit, &p.written, &p.album);
-        }
-        let credits: HashSet<&str> = found
-            .iter()
-            .map(|&i| self.songs[i].credit.as_str())
-            .collect();
-        if credits.len() <= 1 {
-            return self.best(&found, &p.credit, &p.written, &p.album);
+        let credits = |set: &[usize]| -> HashSet<&str> {
+            set.iter()
+                .map(|&i| self.songs[i].keys.credit.as_str())
+                .collect()
+        };
+        if credits(&found).len() <= 1 {
+            return self.best(&found, &p.credit, p);
         }
         let on_album: Vec<usize> = found
             .iter()
             .copied()
-            .filter(|&i| !p.album.is_empty() && self.songs[i].album == p.album)
+            .filter(|&i| !p.album.is_empty() && self.songs[i].keys.album == p.album)
             .collect();
-        let credits: HashSet<&str> = on_album
-            .iter()
-            .map(|&i| self.songs[i].credit.as_str())
-            .collect();
-        (credits.len() == 1).then(|| &self.songs[on_album[0]].track)
+        if credits(&on_album).len() == 1 {
+            return self.best(&on_album, &p.credit, p);
+        }
+        None
     }
 
     pub fn resolve(&self, history: &Listening) -> (Listening, Resolved) {
@@ -220,7 +236,7 @@ impl Matcher {
         let mut matched = HashSet::new();
         let out = history.remap(|t| {
             let p = Self::play(history, t);
-            if let Some(song) = p.as_ref().and_then(|p| self.find(p, &links)) {
+            if let Some(song) = p.as_ref().and_then(|p| self.find(p, &t.1, &links)) {
                 matched.insert(song.0.clone());
                 return song.clone();
             }
@@ -312,23 +328,26 @@ fn links(history: &Listening) -> Links {
     links
 }
 
-/// Marks that tell names apart: they join or split credits ("River & Stone" is not "River Stone", "A/B" is not "A
-/// B", "North+" is not "North Plus") or change a note ("C#" is not "C").
-const MARKS: &[char] = &['&', ',', '/', '+', ';', '#', '\u{266d}', '\u{266f}'];
+/// Marks that tell names apart when whole names are compared: they join or split credits ("River & Stone" is not
+/// "River Stone", "North+" is not "North Plus", "North-X-West" is not "North x West") or change a note ("C#" is not
+/// "C").
+const MARKS: &[char] = &['&', ',', '/', '+', ';', '-', '#', '\u{266d}', '\u{266f}'];
+/// Marks a title keeps even where featured artists and punctuation fold away: "Prelude in C#" is not "Prelude in C".
+const NOTE_MARKS: &[char] = &['#', '\u{266d}', '\u{266f}'];
 
 /// A name as written, for comparing whole names: `normalize_text`, but each of `MARKS` stays, as a word of its own
 /// whatever the spacing around it ("River&Stone" is "River & Stone").
 fn spelling(s: &str) -> String {
-    fold(s, true)
+    fold(s, MARKS)
 }
 
 /// Lower case, common accents folded, punctuation and repeated spaces collapsed.
 fn normalize_text(s: &str) -> String {
-    fold(s, false)
+    fold(s, &[])
 }
 
-/// `normalize_text`, keeping `MARKS` as words when `marks` is true.
-fn fold(s: &str, marks: bool) -> String {
+/// `normalize_text`, keeping each of `marks` as a word of its own. A sharp sign is "#".
+fn fold(s: &str, marks: &[char]) -> String {
     let mut out = String::with_capacity(s.len());
     let mut space = false;
     for c in s.chars().flat_map(char::to_lowercase) {
@@ -351,11 +370,11 @@ fn fold(s: &str, marks: bool) -> String {
             }
             _ => "",
         };
-        if marks && MARKS.contains(&c) {
+        if marks.contains(&c) {
             if !space && !out.is_empty() {
                 out.push(' ');
             }
-            out.push(c);
+            out.push(if c == '\u{266f}' { '#' } else { c });
             out.push(' ');
             space = true;
         } else if !folded.is_empty() {
@@ -373,18 +392,46 @@ fn fold(s: &str, marks: bool) -> String {
     out
 }
 
-/// A title without its featured artists and remaster notes. Live, remix and edit marks stay: other recordings.
+/// A title without its featured artists and remaster notes. Live, remix and edit marks stay: other recordings. So do
+/// sharps and flats.
 pub fn normalize_title(s: &str) -> String {
     let mut text = s.to_lowercase();
-    while let Some(cut) = removable_group(&text) {
+    while let Some(cut) = removable_group(&text, true) {
         text.replace_range(cut.0..cut.1, " ");
     }
-    if let Some(dash) = text.rfind(" - ")
-        && is_remaster_note(&text[dash + 3..])
-    {
-        text.truncate(dash);
+    fold(&strip_remaster_suffix(&text), NOTE_MARKS)
+}
+
+/// A title as written without its remaster notes ("Home (feat. Cora) - 2011 Remaster" is "Home (feat. Cora)").
+fn without_remaster(s: &str) -> String {
+    let mut text = s.to_lowercase();
+    while let Some(cut) = removable_group(&text, false) {
+        text.replace_range(cut.0..cut.1, " ");
     }
-    normalize_text(&text)
+    strip_remaster_suffix(&text).to_string()
+}
+
+fn strip_remaster_suffix(text: &str) -> &str {
+    match text.rfind(" - ") {
+        Some(dash) if is_remaster_note(&text[dash + 3..]) => &text[..dash],
+        _ => text,
+    }
+}
+
+/// The guest a "(feat. …)" or "(with …)" group names, normalized; "" when there is none.
+fn guest(title: &str) -> String {
+    let text = title.to_lowercase();
+    for (start, open) in text.char_indices().filter(|(_, c)| matches!(c, '(' | '[')) {
+        let close = if open == '(' { ')' } else { ']' };
+        let Some(len) = text[start..].find(close) else {
+            continue;
+        };
+        let inner = text[start + 1..start + len].trim();
+        if let Some(name) = CREDITS.iter().find_map(|p| inner.strip_prefix(p)) {
+            return normalize_text(name);
+        }
+    }
+    String::new()
 }
 
 /// "2011 Remaster", "Remastered Version", "The Digital Remaster 2009": only these words, so "Live, Remastered" stays.
@@ -404,11 +451,13 @@ fn is_remaster_note(note: &str) -> bool {
     ok && remaster
 }
 
+/// How a featured-artist group begins.
+const CREDITS: &[&str] = &["feat.", "feat ", "ft.", "ft ", "featuring ", "with "];
+
 /// Words that make a recording another one: a credit group holding one stays in the title.
 const VERSION_WORDS: &[&str] = &[
     "acapella",
     "acoustic",
-    "alternate",
     "demo",
     "dub",
     "edit",
@@ -420,23 +469,20 @@ const VERSION_WORDS: &[&str] = &[
     "orchestral",
     "remix",
     "reprise",
-    "take",
     "unplugged",
     "version",
 ];
 
-/// The byte range of the first bracketed group that is a credit or a remaster note.
-fn removable_group(text: &str) -> Option<(usize, usize)> {
+/// The byte range of the first bracketed group that is a remaster note, or (with `credits`) a featured artist.
+fn removable_group(text: &str, credits: bool) -> Option<(usize, usize)> {
     for (start, open) in text.char_indices().filter(|(_, c)| matches!(c, '(' | '[')) {
         let close = if open == '(' { ')' } else { ']' };
         let Some(len) = text[start..].find(close) else {
             continue;
         };
         let inner = text[start + 1..start + len].trim();
-        let credit = ["feat.", "feat ", "ft.", "ft ", "featuring ", "with "]
-            .iter()
-            .any(|p| inner.starts_with(p));
-        // "(feat. Ena - Live)", "(with Ena, Remix)", "(feat. Ena – Reprise)": a version mark, or anything after a
+        let credit = credits && CREDITS.iter().any(|p| inner.starts_with(p));
+        // "(feat. Ena - Live)", "(with Ena, Remix)", "(feat. Ena—Reprise)": a version mark, or anything after a long
         // dash or a slash, keeps the group: it's another recording.
         let version = inner
             .split(|c: char| !c.is_alphanumeric())
@@ -450,14 +496,40 @@ fn removable_group(text: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// The first credited artist, normalized: the part before `,`, `&`, `/` (however spaced), ` feat. `, ` ft. ` or
-/// ` x `.
+/// The first credited artist, normalized: the part before `, `, ` & `, ` feat. `, ` ft. ` or ` x `. A name with
+/// such a mark inside it ("Glass/House", "North+") stays whole.
 pub fn main_artist(s: &str) -> String {
     let lower = s.to_lowercase();
-    let end = [",", "&", "/", " feat. ", " ft. ", " x "]
+    let end = [", ", " & ", " feat. ", " ft. ", " x "]
         .iter()
         .filter_map(|sep| lower.find(sep))
         .min()
         .unwrap_or(lower.len());
     normalize_text(&lower[..end])
+}
+
+/// The first of two or more names a credit joins, normalized: "north" for "North, West", "North & West", "North
+/// feat. West" or "North/West"; "" for one artist alone, and for a mark with nothing on one side ("North+", "&Nova").
+fn lead_artist(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let cut = [
+        ",", "&", "/", ";", "+", " feat. ", " feat ", " ft. ", " x ", " with ",
+    ]
+    .iter()
+    .filter_map(|sep| lower.find(sep).map(|at| (at, sep.len())))
+    .min();
+    match cut {
+        Some((at, len)) => {
+            let (first, rest) = (
+                normalize_text(&lower[..at]),
+                normalize_text(&lower[at + len..]),
+            );
+            if first.is_empty() || rest.is_empty() {
+                String::new()
+            } else {
+                first
+            }
+        }
+        None => String::new(),
+    }
 }

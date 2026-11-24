@@ -655,3 +655,154 @@ fn the_written_title_picks_the_featured_recording() {
     assert_eq!(secs_of(&out, "mira/cora.flac"), 90.);
     assert_eq!(secs_of(&out, "mira/ben.flac"), 0.);
 }
+
+#[test]
+fn a_band_with_a_mark_in_its_name_never_lends_its_plays_to_a_member() {
+    let m = Matcher::new([
+        song("gh/pier.flac", "Pier", "Glass/House"),
+        song("glass/signal.flac", "Signal", "Glass"),
+        song("nw/signal.flac", "Signal", "North/West"),
+        song("north/home.flac", "Home", "North"),
+    ]);
+    let h = history_on(&[
+        ("1", "Signal", "Glass/House", "Other", 60.),
+        ("2", "Home", "North/West", "Other", 30.),
+        ("3", "Home", "North+", "Other", 20.),
+    ]);
+    let (out, resolved) = m.resolve(&h);
+    assert_eq!(resolved.matched_seconds, 0.);
+    assert_eq!(secs_of(&out, "glass/signal.flac"), 0.);
+    assert_eq!(secs_of(&out, "north/home.flac"), 0.);
+}
+
+#[test]
+fn a_credit_beginning_with_a_mark_still_matches_itself() {
+    let m = Matcher::new([
+        song("lights/home.flac", "Home", "&Lights"),
+        song("line/home.flac", "Home", "//Line"),
+    ]);
+    let h = history_on(&[
+        ("1", "Home", "&Lights", "Album", 60.),
+        ("2", "Home", "//Line", "Album", 30.),
+    ]);
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "lights/home.flac"), 60.);
+    assert_eq!(secs_of(&out, "line/home.flac"), 30.);
+}
+
+#[test]
+fn a_hyphenated_band_is_not_a_collaboration_with_the_same_words() {
+    for flip in [false, true] {
+        let mut library = vec![
+            on_album("band/signal.flac", "Signal", "North-X-West", "Stage"),
+            on_album("duo/signal.flac", "Signal", "North x West", "Stage"),
+        ];
+        if flip {
+            library.reverse();
+        }
+        let m = Matcher::new(library);
+        let h = history_on(&[
+            ("1", "Signal", "North-X-West", "Stage", 60.),
+            ("2", "Signal", "North x West", "Stage", 30.),
+        ]);
+        let (out, _) = m.resolve(&h);
+        assert_eq!(secs_of(&out, "band/signal.flac"), 60., "{flip}");
+        assert_eq!(secs_of(&out, "duo/signal.flac"), 30., "{flip}");
+    }
+}
+
+#[test]
+fn the_album_outranks_a_title_that_differs_by_a_note() {
+    let m = Matcher::new([
+        on_album(
+            "live/home.flac",
+            "Home - 2011 Remaster",
+            "North",
+            "Live at the Pier",
+        ),
+        on_album("studio/home.flac", "Home", "North", "Studio Days"),
+        on_album(
+            "mio/concert.flac",
+            "Home (feat. Ena)",
+            "Mio",
+            "Live at Harbor",
+        ),
+        on_album("mio/studio.flac", "Home", "Mio", "Studio Days"),
+    ]);
+    let h = history_on(&[
+        ("1", "Home", "North", "Live at the Pier", 60.),
+        ("2", "Home", "Mio", "Live at Harbor", 30.),
+    ]);
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "live/home.flac"), 60.);
+    assert_eq!(secs_of(&out, "mio/concert.flac"), 30.);
+}
+
+#[test]
+fn a_remaster_note_hides_neither_a_sharp_nor_a_guest() {
+    let m = Matcher::new([
+        on_album("p/c.flac", "Etude in C", "Pianist", "Etudes"),
+        on_album("p/c-sharp.flac", "Etude in C#", "Pianist", "Etudes"),
+        on_album("mira/ben.flac", "Home (feat. Ben)", "Mira", "Duets"),
+        on_album("mira/cora.flac", "Home (feat. Cora)", "Mira", "Duets"),
+    ]);
+    let h = history_on(&[
+        ("1", "Etude in C# - 2011 Remaster", "Pianist", "Etudes", 60.),
+        (
+            "2",
+            "Home (feat. Cora) - 2011 Remaster",
+            "Mira",
+            "Duets",
+            30.,
+        ),
+        ("3", "Etude in C\u{266f}", "Pianist", "Etudes", 5.),
+    ]);
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "p/c-sharp.flac"), 65.);
+    assert_eq!(secs_of(&out, "mira/cora.flac"), 30.);
+}
+
+#[test]
+fn a_collaboration_the_album_chose_still_picks_the_named_guest() {
+    let m = Matcher::new([
+        on_album("rin/ena.flac", "Home (feat. Ena)", "Mio & Rin", "Duets"),
+        on_album("rin/yui.flac", "Home (feat. Yui)", "Mio & Rin", "Duets"),
+        on_album("sol/home.flac", "Home", "Mio & Sol", "Other Duets"),
+    ]);
+    let (out, _) = m.resolve(&history_on(&[(
+        "1",
+        "Home (feat. Yui)",
+        "Mio",
+        "Duets",
+        60.,
+    )]));
+    assert_eq!(secs_of(&out, "rin/yui.flac"), 60.);
+}
+
+#[test]
+fn a_play_naming_another_guest_never_takes_a_guests_version() {
+    let m = Matcher::new([on_album("mio/ena.flac", "Home (feat. Ena)", "Mio", "Duets")]);
+    let h = linked(
+        &[
+            ("1", "Home (feat. Yui)", "Mio", "Duets", 60.),
+            ("2", "Home (feat. Yui)", "ミオ", "Duets", 30.),
+            ("3", "Home", "Mio", "Duets", 10.),
+        ],
+        serde_json::json!([artist_link("ミオ", "Mio")]),
+    );
+    let (out, _) = m.resolve(&h);
+    assert_eq!(secs_of(&out, "mio/ena.flac"), 10.);
+}
+
+#[test]
+fn a_guest_whose_name_is_a_common_word_still_folds_away() {
+    let m = Matcher::new([song("lib/home.flac", "Home", "North")]);
+    let (out, _) = m.resolve(&history_on(&[(
+        "1",
+        "Home (feat. Take Two)",
+        "North",
+        "Album",
+        60.,
+    )]));
+    assert_eq!(secs_of(&out, "lib/home.flac"), 60.);
+}

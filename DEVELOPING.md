@@ -307,11 +307,13 @@ file aside in the backup folder. Plays are matched when Stats reads them, not st
 albums change (`string-extras\src\spotify\matching.rs`). A false join silently moves hours to the wrong song or
 artist, and nothing in an export tells a name written in another script from a label's or a compilation's credit
 on the same soundtrack, so names that differ join only by links the person sets by hand:
-- The same normalized title and main artist is that library song. A play credited to a collaboration takes its own
-  credit or its lead artist alone, never another collaboration ("North & West" never lands on "North & South");
-  when the songs left are by more than one other credit, the album must choose or nothing matches. Among copies,
-  the one with the same whole credit and album wins, else library order. Plays without an artist name never join an
-  artist.
+- The same normalized title by the same whole credit is that library song, else by the same main artist (the part
+  before a spaced `, `, ` & `, ` feat. `, ` x `, so "Glass/House" stays whole). A play credited to two or more names
+  takes its own credit or its lead artist alone, never another credit ("North & West" never lands on "North &
+  South", "North+" never on "North"); when the songs left are by more than one credit, the album must choose or
+  nothing matches. A song naming another guest ("(feat. Ena)" for a "(feat. Yui)" play) never matches. Among copies
+  the same whole credit wins, then the same album, then the same title as written, then library order. Titles keep
+  sharps and flats ("C#" is not "C"). Plays without an artist name never join an artist.
 - `spotify.json` may hold links set by hand, kept by imports like any top-level key. Both ends name whole titles and
   credits as written (case, accents and spacing aside, so "River & Stone" is not "River Stone" and a link for
   "Home (feat. Ena)" leaves "Home (feat. Yui)" alone), and the library must have the named credit exactly; a link
