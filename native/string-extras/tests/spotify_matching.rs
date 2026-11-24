@@ -915,6 +915,8 @@ fn a_long_dash_in_an_album_is_a_hyphen() {
     let h = linked(
         &[
             ("1", "Home", "Mio", "Live \u{2013} North", 60.),
+            ("3", "Home", "Mio", "Live \u{2011} North", 15.),
+            ("4", "Home", "Mio", "Live \u{2212} North", 5.),
             ("2", "Home (Encore)", "Fan", "Live \u{2014} North", 30.),
         ],
         serde_json::json!([
@@ -922,7 +924,7 @@ fn a_long_dash_in_an_album_is_a_hyphen() {
         ]),
     );
     let (out, _) = m.resolve(&h);
-    assert_eq!(secs_of(&out, "live/north.flac"), 90.);
+    assert_eq!(secs_of(&out, "live/north.flac"), 110.);
 }
 
 #[test]

@@ -387,7 +387,7 @@ fn fold(s: &str, marks: &[char]) -> String {
             _ => "",
         };
         let c = match c {
-            '\u{2013}' | '\u{2014}' if marks.contains(&'-') => '-',
+            '\u{2010}'..='\u{2015}' | '\u{2212}' if marks.contains(&'-') => '-',
             c => c,
         };
         if marks.contains(&c) {
