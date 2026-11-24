@@ -12,6 +12,10 @@ $run = Join-Path $root "test-runs\update-20-$id"
 function Check([bool]$pass, [string]$message) {
     if (-not $pass) { throw $message }
 }
+# The native release under test: the version the workspace builds (native\Cargo.toml).
+$nativeVersion = [regex]::Match([IO.File]::ReadAllText((Join-Path $root 'native\Cargo.toml')),
+    '(?m)^version = "([0-9]+\.[0-9]+\.[0-9]+)"').Groups[1].Value
+Check ([bool]$nativeVersion) 'No version in native\Cargo.toml'
 # The manual ZIP installer must import a script block made from verified bytes.
 function CheckHelperImport {
     $installer = Join-Path $root 'tools\share\install.ps1'
@@ -110,7 +114,7 @@ $saved = Join-Path $run 'String-1.3.1.zip'
 Copy-Item -LiteralPath $LegacyZip -Destination $saved
 if (Test-Path -LiteralPath "$LegacyZip.sig") { Copy-Item -LiteralPath "$LegacyZip.sig" -Destination "$saved.sig" }
 if (-not $NativeZip) {
-    Build 'release-native.ps1' @('-Full', '-Version', '2.0.0')
+    Build 'release-native.ps1' @('-Full', '-Version', $nativeVersion)
     $NativeZip = Join-Path $root 'release\String.zip'
 }
 
@@ -180,9 +184,11 @@ function CheckInstall([string]$zone, [string]$version) {
     Check ([IO.File]::ReadAllText((Join-Path $to 'setup\installed.txt')) -ieq $to) "Wrong install marker in $to"
     $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
     Check (($info.ProductVersion -split '\+')[0] -ceq $version) "Wrong exe product version: $($info.ProductVersion)"
-    if ($version -eq '2.0.0') {
-        Check ($info.FileVersion -ceq $version -and $info.ProductMajorPart -eq 2 -and $info.ProductMinorPart -eq 0 -and
-            $info.ProductBuildPart -eq 0 -and $info.ProductPrivatePart -eq 0) 'Wrong native VERSIONINFO'
+    if ($version -ceq $nativeVersion) {
+        $parts = [version]$version
+        Check ($info.FileVersion -ceq $version -and $info.ProductMajorPart -eq $parts.Major -and
+            $info.ProductMinorPart -eq $parts.Minor -and $info.ProductBuildPart -eq $parts.Build -and
+            $info.ProductPrivatePart -eq 0) 'Wrong native VERSIONINFO'
     }
     $shell = New-Object -ComObject WScript.Shell
     foreach ($dir in 'Menu', 'Desktop') {
@@ -251,7 +257,7 @@ function CheckPreflight([string]$installer, [string]$zone, [string]$kind) {
 $old = Join-Path $run '1.x'
 $new = Join-Path $run '2.0'
 Extract $saved '1.3.1' $old
-Extract $NativeZip '2.0.0' $new
+Extract $NativeZip $nativeVersion $new
 $installer = Join-Path $new 'app\setup\install.ps1'
 $imports = Get-Content -LiteralPath (Join-Path $new 'app\setup\imports.txt')
 Check (($imports -match '^icuuc\.dll .*\bunorm2_normalize\b') -and
@@ -262,7 +268,7 @@ try {
     }
     $clean = Join-Path $run 'Clean install'
     Setup $installer $clean
-    CheckInstall $clean '2.0.0'
+    CheckInstall $clean $nativeVersion
     Setup (Join-Path $clean 'Player\setup\uninstall.ps1') $clean -Remove
     Check (-not (Test-Path -LiteralPath (Join-Path $clean 'Player'))) 'Clean uninstall left program files'
     "Clean native install and uninstall passed."
@@ -312,7 +318,7 @@ try {
     [IO.File]::WriteAllText((Join-Path $to 'my notes.txt'), 'Kept across the move.')
 
     Setup $installer $zone
-    CheckInstall $zone '2.0.0'
+    CheckInstall $zone $nativeVersion
     SameFiles $before (Snapshot $data) 'migrated profile'
     $shipped = Snapshot (Join-Path $new 'app')
     $installed = Snapshot $to
@@ -365,7 +371,7 @@ try {
     foreach ($path in 'Player\String.exe', 'Menu\String.lnk', 'Desktop\String.lnk') {
         Check (-not (Test-Path -LiteralPath (Join-Path $zone $path))) "Uninstall left $path"
     }
-    "1.3.1 to 2.0.0 passed. Smoke report: $out\results.json"
+    "1.3.1 to $nativeVersion passed. Smoke report: $out\results.json"
 } finally {
     if (Test-Path -LiteralPath $testKey) { Remove-Item -LiteralPath $testKey -Recurse -Force }
 }
